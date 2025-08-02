@@ -66,6 +66,16 @@ func Async(sequential bool) SubscribeOption {
 
 // Subscribe registers a handler for events of type T
 func Subscribe[T any](bus *EventBus, handler Handler[T], opts ...SubscribeOption) error {
+	// Validate bus
+	if bus == nil {
+		return fmt.Errorf("eventbus: bus cannot be nil")
+	}
+
+	// Validate handler
+	if handler == nil {
+		return fmt.Errorf("eventbus: handler cannot be nil")
+	}
+
 	eventType := reflect.TypeOf((*T)(nil)).Elem()
 
 	h := &internalHandler{
@@ -74,8 +84,11 @@ func Subscribe[T any](bus *EventBus, handler Handler[T], opts ...SubscribeOption
 		eventType:   eventType,
 	}
 
-	// Apply options
+	// Apply options with validation
 	for _, opt := range opts {
+		if opt == nil {
+			return fmt.Errorf("eventbus: subscribe option cannot be nil")
+		}
 		opt(h)
 	}
 
@@ -88,6 +101,16 @@ func Subscribe[T any](bus *EventBus, handler Handler[T], opts ...SubscribeOption
 
 // SubscribeContext registers a context-aware handler for events of type T
 func SubscribeContext[T any](bus *EventBus, handler ContextHandler[T], opts ...SubscribeOption) error {
+	// Validate bus
+	if bus == nil {
+		return fmt.Errorf("eventbus: bus cannot be nil")
+	}
+
+	// Validate handler
+	if handler == nil {
+		return fmt.Errorf("eventbus: handler cannot be nil")
+	}
+
 	eventType := reflect.TypeOf((*T)(nil)).Elem()
 
 	h := &internalHandler{
@@ -97,8 +120,11 @@ func SubscribeContext[T any](bus *EventBus, handler ContextHandler[T], opts ...S
 		acceptsContext: true,
 	}
 
-	// Apply options
+	// Apply options with validation
 	for _, opt := range opts {
+		if opt == nil {
+			return fmt.Errorf("eventbus: subscribe option cannot be nil")
+		}
 		opt(h)
 	}
 

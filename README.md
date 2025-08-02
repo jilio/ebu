@@ -55,13 +55,19 @@ func main() {
     bus := eventbus.New()
     
     // Subscribe to events with type-safe handlers
-    eventbus.Subscribe(bus, func(event UserLoginEvent) {
+    err := eventbus.Subscribe(bus, func(event UserLoginEvent) {
         fmt.Printf("User %s logged in at %v\n", event.UserID, event.Timestamp)
     })
+    if err != nil {
+        panic(err)
+    }
     
-    eventbus.Subscribe(bus, func(event OrderCreatedEvent) {
+    err = eventbus.Subscribe(bus, func(event OrderCreatedEvent) {
         fmt.Printf("Order %s created for $%.2f\n", event.OrderID, event.Amount)
     })
+    if err != nil {
+        panic(err)
+    }
     
     // Publish events - compile-time type safety!
     eventbus.Publish(bus, UserLoginEvent{
@@ -91,11 +97,14 @@ func main() {
     bus := eventbus.New()
     
     // Async handler for sending emails
-    eventbus.SubscribeAsync(bus, func(event EmailNotification) {
+    err := eventbus.Subscribe(bus, func(event EmailNotification) {
         // Simulate email sending
         time.Sleep(100 * time.Millisecond)
         fmt.Printf("Email sent to %s: %s\n", event.To, event.Subject)
-    }, false) // false = parallel processing
+    }, eventbus.Async(false)) // false = parallel processing
+    if err != nil {
+        panic(err)
+    }
     
     // Publish multiple notifications
     for i := 0; i < 5; i++ {
@@ -120,9 +129,12 @@ func main() {
     bus := eventbus.New()
     
     // This handler will only be called once
-    eventbus.SubscribeOnce(bus, func(event AppStartedEvent) {
+    err := eventbus.Subscribe(bus, func(event AppStartedEvent) {
         fmt.Println("App initialization completed!")
-    })
+    }, eventbus.Once())
+    if err != nil {
+        panic(err)
+    }
     
     // First publish - handler will be called
     eventbus.Publish(bus, AppStartedEvent{})
@@ -144,11 +156,14 @@ func main() {
     bus := eventbus.New()
     
     // Sequential async handler - events processed one at a time
-    eventbus.SubscribeAsync(bus, func(event PaymentEvent) {
+    err := eventbus.Subscribe(bus, func(event PaymentEvent) {
         fmt.Printf("Processing payment %s...\n", event.ID)
         time.Sleep(200 * time.Millisecond) // Simulate processing
         fmt.Printf("Payment %s completed\n", event.ID)
-    }, true) // true = sequential processing
+    }, eventbus.Async(true)) // true = sequential processing
+    if err != nil {
+        panic(err)
+    }
     
     // Publish multiple payments
     eventbus.Publish(bus, PaymentEvent{ID: "PAY-001", Amount: 100.00})
@@ -176,7 +191,10 @@ func main() {
     }
     
     // Subscribe the handler
-    eventbus.Subscribe(bus, metricHandler)
+    err := eventbus.Subscribe(bus, metricHandler)
+    if err != nil {
+        panic(err)
+    }
     
     // Check if there are subscribers
     if eventbus.HasSubscribers[MetricEvent](bus) {
@@ -184,7 +202,10 @@ func main() {
     }
     
     // Unsubscribe the handler
-    eventbus.Unsubscribe(bus, metricHandler)
+    err = eventbus.Unsubscribe(bus, metricHandler)
+    if err != nil {
+        panic(err)
+    }
     
     // This won't be handled
     eventbus.Publish(bus, MetricEvent{Name: "memory_usage", Value: 62.3})
@@ -196,6 +217,13 @@ func main() {
 ebu provides context-aware variants of all subscription functions, allowing you to pass context for cancellation, deadlines, and request-scoped values.
 
 ```go
+import (
+    "context"
+    "fmt"
+    
+    eventbus "github.com/jilio/ebu"
+)
+
 type RequestEvent struct {
     Path   string
     Method string
@@ -205,11 +233,14 @@ func main() {
     bus := eventbus.New()
     
     // Context-aware handler for distributed tracing
-    eventbus.SubscribeWithContext(bus, func(ctx context.Context, event RequestEvent) {
+    err := eventbus.SubscribeContext(bus, func(ctx context.Context, event RequestEvent) {
         // Extract trace ID from context
         traceID := ctx.Value("traceID")
         fmt.Printf("[%s] Processing %s %s\n", traceID, event.Method, event.Path)
     })
+    if err != nil {
+        panic(err)
+    }
     
     // Publish with context
     ctx := context.WithValue(context.Background(), "traceID", "abc-123")
@@ -229,6 +260,14 @@ Context cancellation works at multiple levels in ebu:
 3. **Handler awareness**: Context-aware handlers can respond to cancellation
 
 ```go
+import (
+    "context"
+    "fmt"
+    "time"
+    
+    eventbus "github.com/jilio/ebu"
+)
+
 type LongRunningTask struct {
     ID   string
     Data []byte
@@ -238,12 +277,15 @@ func main() {
     bus := eventbus.New()
     
     // Handler 1: Will be skipped if context is already cancelled
-    eventbus.Subscribe(bus, func(event LongRunningTask) {
+    err := eventbus.Subscribe(bus, func(event LongRunningTask) {
         fmt.Printf("Processing task %s\n", event.ID)
     })
+    if err != nil {
+        panic(err)
+    }
     
     // Handler 2: Context-aware handler that respects cancellation
-    eventbus.SubscribeContext(bus, func(ctx context.Context, event LongRunningTask) {
+    err = eventbus.SubscribeContext(bus, func(ctx context.Context, event LongRunningTask) {
         for i := 0; i < 10; i++ {
             select {
             case <-ctx.Done():
@@ -255,11 +297,17 @@ func main() {
         }
         fmt.Printf("Task %s completed\n", event.ID)
     }, eventbus.Async(false))
+    if err != nil {
+        panic(err)
+    }
     
     // Handler 3: Will not execute if context was cancelled before reaching it
-    eventbus.Subscribe(bus, func(event LongRunningTask) {
+    err = eventbus.Subscribe(bus, func(event LongRunningTask) {
         fmt.Printf("Post-processing task %s\n", event.ID)
     })
+    if err != nil {
+        panic(err)
+    }
     
     // Example 1: Cancel during execution
     ctx, cancel := context.WithCancel(context.Background())
@@ -285,6 +333,18 @@ func main() {
 ebu isolates handlers from each other - if one handler panics, other handlers continue to execute normally:
 
 ```go
+import (
+    "fmt"
+    "reflect"
+    
+    eventbus "github.com/jilio/ebu"
+)
+
+type UserEvent struct {
+    UserID string
+    Action string
+}
+
 func main() {
     bus := eventbus.New()
     
@@ -295,19 +355,28 @@ func main() {
     })
     
     // Handler 1: Normal handler
-    eventbus.Subscribe(bus, func(event UserEvent) {
+    err := eventbus.Subscribe(bus, func(event UserEvent) {
         fmt.Printf("Handler 1 processing user %s\n", event.UserID)
     })
+    if err != nil {
+        panic(err)
+    }
     
     // Handler 2: This handler will panic
-    eventbus.Subscribe(bus, func(event UserEvent) {
+    err = eventbus.Subscribe(bus, func(event UserEvent) {
         panic("something went wrong!")
     })
+    if err != nil {
+        panic(err)
+    }
     
     // Handler 3: Will still execute despite handler 2's panic
-    eventbus.Subscribe(bus, func(event UserEvent) {
+    err = eventbus.Subscribe(bus, func(event UserEvent) {
         fmt.Printf("Handler 3 processing user %s\n", event.UserID)
     })
+    if err != nil {
+        panic(err)
+    }
     
     // Publish event
     eventbus.Publish(bus, UserEvent{UserID: "123", Action: "test"})
@@ -339,23 +408,35 @@ Subscribes a handler to events of type T with optional configuration.
 
 ```go
 // Simple subscription
-eventbus.Subscribe(bus, func(event UserLoginEvent) {
+err := eventbus.Subscribe(bus, func(event UserLoginEvent) {
     // Handle user login
 })
+if err != nil {
+    // Handle error
+}
 
 // With options
-eventbus.Subscribe(bus, func(event EmailEvent) {
+err = eventbus.Subscribe(bus, func(event EmailEvent) {
     // Process email
 }, eventbus.Once())
+if err != nil {
+    // Handle error
+}
 
-eventbus.Subscribe(bus, func(event OrderEvent) {
+err = eventbus.Subscribe(bus, func(event OrderEvent) {
     // Process order asynchronously
 }, eventbus.Async(false))
+if err != nil {
+    // Handle error
+}
 
 // Combine options
-eventbus.Subscribe(bus, func(event InitEvent) {
+err = eventbus.Subscribe(bus, func(event InitEvent) {
     // One-time async initialization
 }, eventbus.Async(true), eventbus.Once())
+if err != nil {
+    // Handle error
+}
 ```
 
 #### `SubscribeContext[T any](bus *EventBus, handler ContextHandler[T], opts ...SubscribeOption) error`
@@ -364,14 +445,20 @@ Subscribes a context-aware handler to events of type T.
 
 ```go
 // Simple context subscription
-eventbus.SubscribeContext(bus, func(ctx context.Context, event PaymentEvent) {
+err := eventbus.SubscribeContext(bus, func(ctx context.Context, event PaymentEvent) {
     // Handle payment with context
 })
+if err != nil {
+    // Handle error
+}
 
 // With options
-eventbus.SubscribeContext(bus, func(ctx context.Context, event JobEvent) {
+err = eventbus.SubscribeContext(bus, func(ctx context.Context, event JobEvent) {
     // Process job asynchronously with context
 }, eventbus.Async(true))
+if err != nil {
+    // Handle error
+}
 ```
 
 #### `Publish[T any](bus *EventBus, event T)`
@@ -391,9 +478,15 @@ Removes a specific handler.
 
 ```go
 handler := func(event UserEvent) { ... }
-eventbus.Subscribe(bus, handler)
+err := eventbus.Subscribe(bus, handler)
+if err != nil {
+    // Handle error
+}
 // Later...
-eventbus.Unsubscribe(bus, handler)
+err = eventbus.Unsubscribe(bus, handler)
+if err != nil {
+    // Handle error
+}
 ```
 
 #### `HasSubscribers[T any](bus *EventBus) bool`
@@ -448,9 +541,12 @@ bus.SetPanicHandler(func(event any, handlerType reflect.Type, panicValue any) {
 Configures the handler to be called only once.
 
 ```go
-eventbus.Subscribe(bus, func(event WelcomeEvent) {
+err := eventbus.Subscribe(bus, func(event WelcomeEvent) {
     fmt.Println("Welcome! This message appears only once.")
 }, eventbus.Once())
+if err != nil {
+    // Handle error
+}
 ```
 
 #### `Async(sequential bool) SubscribeOption`
@@ -459,14 +555,20 @@ Configures the handler to run asynchronously. If sequential is true, multiple ev
 
 ```go
 // Parallel processing (good for I/O-bound tasks)
-eventbus.Subscribe(bus, func(event EmailEvent) {
+err := eventbus.Subscribe(bus, func(event EmailEvent) {
     sendEmail(event) // Each email sent in parallel
 }, eventbus.Async(false))
+if err != nil {
+    // Handle error
+}
 
 // Sequential processing (preserves order, prevents concurrency issues)
-eventbus.Subscribe(bus, func(event DatabaseEvent) {
+err = eventbus.Subscribe(bus, func(event DatabaseEvent) {
     updateDatabase(event) // Updates happen one at a time
 }, eventbus.Async(true))
+if err != nil {
+    // Handle error
+}
 ```
 
 ### Publishing Events
