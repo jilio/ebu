@@ -56,13 +56,17 @@ func TestMultipleEventTypes(t *testing.T) {
 	userReceived := false
 	orderReceived := false
 
-	Subscribe(bus, func(event UserEvent) {
+	if err := Subscribe(bus, func(event UserEvent) {
 		userReceived = true
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
-	Subscribe(bus, func(event OrderEvent) {
+	if err := Subscribe(bus, func(event OrderEvent) {
 		orderReceived = true
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	Publish(bus, UserEvent{UserID: "123", Action: "login"})
 	Publish(bus, OrderEvent{OrderID: "456", Amount: 99.99})
@@ -79,9 +83,11 @@ func TestSubscribeOnce(t *testing.T) {
 	bus := New()
 	var callCount int32
 
-	Subscribe(bus, func(event UserEvent) {
+	if err := Subscribe(bus, func(event UserEvent) {
 		atomic.AddInt32(&callCount, 1)
-	}, Once())
+	}, Once()); err != nil {
+		t.Fatal(err)
+	}
 
 	Publish(bus, UserEvent{UserID: "123", Action: "login"})
 	Publish(bus, UserEvent{UserID: "456", Action: "logout"})
@@ -99,7 +105,9 @@ func TestUnsubscribe(t *testing.T) {
 		called = true
 	}
 
-	Subscribe(bus, handler)
+	if err := Subscribe(bus, handler); err != nil {
+		t.Fatal(err)
+	}
 	Unsubscribe[UserEvent](bus, handler)
 
 	Publish(bus, UserEvent{UserID: "123", Action: "login"})
@@ -114,11 +122,13 @@ func TestAsyncSubscribe(t *testing.T) {
 	var callCount int32
 	done := make(chan bool, 1)
 
-	Subscribe(bus, func(event UserEvent) {
+	if err := Subscribe(bus, func(event UserEvent) {
 		atomic.AddInt32(&callCount, 1)
 		time.Sleep(10 * time.Millisecond)
 		done <- true
-	}, Async(false))
+	}, Async(false)); err != nil {
+		t.Fatal(err)
+	}
 
 	Publish(bus, UserEvent{UserID: "123", Action: "login"})
 
@@ -141,10 +151,12 @@ func TestHasSubscribers(t *testing.T) {
 		t.Error("HasSubscribers returned true for empty bus")
 	}
 
-	Subscribe(bus, func(event UserEvent) {
+	if err := Subscribe(bus, func(event UserEvent) {
 		// Empty handler - we only need to verify subscription exists,
 		// not test handler functionality
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	if !HasSubscribers[UserEvent](bus) {
 		t.Error("HasSubscribers returned false when handler exists")
@@ -159,9 +171,11 @@ func TestClear(t *testing.T) {
 	bus := New()
 	called := false
 
-	Subscribe(bus, func(event UserEvent) {
+	if err := Subscribe(bus, func(event UserEvent) {
 		called = true
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	Clear[UserEvent](bus)
 	Publish(bus, UserEvent{UserID: "123", Action: "login"})
@@ -176,10 +190,12 @@ func TestSubscribeOnceAsync(t *testing.T) {
 	var callCount int32
 	done := make(chan bool, 1)
 
-	Subscribe(bus, func(event UserEvent) {
+	if err := Subscribe(bus, func(event UserEvent) {
 		atomic.AddInt32(&callCount, 1)
 		done <- true
-	}, Async(false), Once())
+	}, Async(false), Once()); err != nil {
+		t.Fatal(err)
+	}
 
 	Publish(bus, UserEvent{UserID: "123", Action: "login"})
 	Publish(bus, UserEvent{UserID: "456", Action: "logout"})
@@ -207,7 +223,9 @@ func TestUnsubscribeErrors(t *testing.T) {
 	}
 
 	// Test unsubscribe with wrong handler
-	Subscribe(bus, func(event UserEvent) {})
+	if err := Subscribe(bus, func(event UserEvent) {}); err != nil {
+		t.Fatal(err)
+	}
 	err = Unsubscribe[UserEvent](bus, handler)
 	if err == nil {
 		t.Error("Expected error when unsubscribing different handler")
@@ -219,12 +237,16 @@ func TestClearAll(t *testing.T) {
 	userCalled := false
 	orderCalled := false
 
-	Subscribe(bus, func(event UserEvent) {
+	if err := Subscribe(bus, func(event UserEvent) {
 		userCalled = true
-	})
-	Subscribe(bus, func(event OrderEvent) {
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Subscribe(bus, func(event OrderEvent) {
 		orderCalled = true
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	bus.ClearAll()
 
@@ -246,12 +268,14 @@ func TestAsyncSequential(t *testing.T) {
 
 	// Subscribe with sequential = true
 	// This ensures multiple events to the same handler run serially
-	Subscribe(bus, func(event UserEvent) {
+	if err := Subscribe(bus, func(event UserEvent) {
 		current := atomic.AddInt32(&count, 1)
 		ch <- int(current)
 		time.Sleep(10 * time.Millisecond) // Simulate work
 		ch <- int(current + 10)
-	}, Async(true))
+	}, Async(true)); err != nil {
+		t.Fatal(err)
+	}
 
 	// Publish multiple events
 	for range 3 {
@@ -379,17 +403,21 @@ func TestMixedHandlersWithAndWithoutContext(t *testing.T) {
 	contextHandlerCalled := false
 
 	// Regular handler
-	Subscribe(bus, func(event UserEvent) {
+	if err := Subscribe(bus, func(event UserEvent) {
 		regularHandlerCalled = true
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	// Context handler
-	SubscribeContext(bus, func(ctx context.Context, event UserEvent) {
+	if err := SubscribeContext(bus, func(ctx context.Context, event UserEvent) {
 		contextHandlerCalled = true
 		if ctx.Value("test") != "value" {
 			t.Error("Context value not received")
 		}
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	// Publish with context
 	ctx := context.WithValue(context.Background(), "test", "value")
@@ -486,16 +514,20 @@ func TestContextPropagationInNestedPublish(t *testing.T) {
 	var outerCtxValue, innerCtxValue string
 
 	// Outer handler that publishes another event
-	SubscribeContext(bus, func(ctx context.Context, event UserEvent) {
+	if err := SubscribeContext(bus, func(ctx context.Context, event UserEvent) {
 		outerCtxValue = ctx.Value("trace").(string)
 		// Publish nested event with same context
 		PublishContext(bus, ctx, OrderEvent{OrderID: "nested", Amount: 100})
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	// Inner handler
-	SubscribeContext(bus, func(ctx context.Context, event OrderEvent) {
+	if err := SubscribeContext(bus, func(ctx context.Context, event OrderEvent) {
 		innerCtxValue = ctx.Value("trace").(string)
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	// Publish with trace context
 	ctx := context.WithValue(context.Background(), "trace", "trace-123")
@@ -516,19 +548,25 @@ func TestPanicRecovery(t *testing.T) {
 	var firstHandlerCalled, thirdHandlerCalled bool
 
 	// First handler - should execute
-	Subscribe(bus, func(event UserEvent) {
+	if err := Subscribe(bus, func(event UserEvent) {
 		firstHandlerCalled = true
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	// Second handler - will panic
-	Subscribe(bus, func(event UserEvent) {
+	if err := Subscribe(bus, func(event UserEvent) {
 		panic("test panic")
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	// Third handler - should still execute despite panic in second
-	Subscribe(bus, func(event UserEvent) {
+	if err := Subscribe(bus, func(event UserEvent) {
 		thirdHandlerCalled = true
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	// Publish event
 	Publish(bus, UserEvent{UserID: "123", Action: "test"})
@@ -547,17 +585,23 @@ func TestPanicRecoveryAsync(t *testing.T) {
 	handlersCalled := make(chan int, 3)
 
 	// Three async handlers
-	Subscribe(bus, func(event UserEvent) {
+	if err := Subscribe(bus, func(event UserEvent) {
 		handlersCalled <- 1
-	}, Async(false))
+	}, Async(false)); err != nil {
+		t.Fatal(err)
+	}
 
-	Subscribe(bus, func(event UserEvent) {
+	if err := Subscribe(bus, func(event UserEvent) {
 		panic("async panic")
-	}, Async(false))
+	}, Async(false)); err != nil {
+		t.Fatal(err)
+	}
 
-	Subscribe(bus, func(event UserEvent) {
+	if err := Subscribe(bus, func(event UserEvent) {
 		handlersCalled <- 3
-	}, Async(false))
+	}, Async(false)); err != nil {
+		t.Fatal(err)
+	}
 
 	// Publish and wait
 	Publish(bus, UserEvent{UserID: "123", Action: "test"})
@@ -587,9 +631,11 @@ func TestSetPanicHandler(t *testing.T) {
 	})
 
 	// Handler that will panic
-	Subscribe(bus, func(event UserEvent) {
+	if err := Subscribe(bus, func(event UserEvent) {
 		panic("test panic with handler")
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	// Publish event
 	Publish(bus, UserEvent{UserID: "123", Action: "test"})
@@ -618,9 +664,11 @@ func TestPanicHandlerWithAsync(t *testing.T) {
 	})
 
 	// Async handler that panics
-	Subscribe(bus, func(event OrderEvent) {
+	if err := Subscribe(bus, func(event OrderEvent) {
 		panic("async panic with handler")
-	}, Async(false))
+	}, Async(false)); err != nil {
+		t.Fatal(err)
+	}
 
 	// Publish and wait
 	Publish(bus, OrderEvent{OrderID: "999", Amount: 100})
@@ -642,12 +690,14 @@ func TestOnceHandlerRaceCondition(t *testing.T) {
 	var callCount int32
 
 	// Subscribe a once handler
-	Subscribe(bus, func(event UserEvent) {
+	if err := Subscribe(bus, func(event UserEvent) {
 		// Increment counter
 		atomic.AddInt32(&callCount, 1)
 		// Simulate some work
 		time.Sleep(10 * time.Millisecond)
-	}, Once())
+	}, Once()); err != nil {
+		t.Fatal(err)
+	}
 
 	// Launch multiple goroutines that publish the same event concurrently
 	var wg sync.WaitGroup
@@ -677,10 +727,12 @@ func TestOnceHandlerRaceWithAsync(t *testing.T) {
 	var callCount int32
 
 	// Subscribe an async once handler
-	Subscribe(bus, func(event OrderEvent) {
+	if err := Subscribe(bus, func(event OrderEvent) {
 		atomic.AddInt32(&callCount, 1)
 		time.Sleep(20 * time.Millisecond) // Longer delay to increase race window
-	}, Once(), Async(false))
+	}, Once(), Async(false)); err != nil {
+		t.Fatal(err)
+	}
 
 	// Concurrent publishers
 	var wg sync.WaitGroup
@@ -706,14 +758,18 @@ func TestOnceHandlerWithMixedHandlers(t *testing.T) {
 	var onceCount, regularCount int32
 
 	// Subscribe a once handler
-	Subscribe(bus, func(event UserEvent) {
+	if err := Subscribe(bus, func(event UserEvent) {
 		atomic.AddInt32(&onceCount, 1)
-	}, Once())
+	}, Once()); err != nil {
+		t.Fatal(err)
+	}
 
 	// Subscribe a regular handler
-	Subscribe(bus, func(event UserEvent) {
+	if err := Subscribe(bus, func(event UserEvent) {
 		atomic.AddInt32(&regularCount, 1)
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	// Publish twice
 	Publish(bus, UserEvent{UserID: "1", Action: "test"})
@@ -733,9 +789,11 @@ func TestContextCancellationBeforeHandlers(t *testing.T) {
 	var handlerCalled bool
 
 	// Subscribe handler
-	Subscribe(bus, func(event UserEvent) {
+	if err := Subscribe(bus, func(event UserEvent) {
 		handlerCalled = true
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	// Create already cancelled context
 	ctx, cancel := context.WithCancel(context.Background())
@@ -758,13 +816,15 @@ func TestContextCancellationWithMultipleHandlers(t *testing.T) {
 	// Subscribe multiple handlers
 	for i := 1; i <= 5; i++ {
 		id := i
-		Subscribe(bus, func(event UserEvent) {
+		if err := Subscribe(bus, func(event UserEvent) {
 			// Simulate some work
 			time.Sleep(10 * time.Millisecond)
 			mu.Lock()
 			handlersCalled = append(handlersCalled, id)
 			mu.Unlock()
-		})
+		}); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	// Create context that will be cancelled
@@ -795,11 +855,13 @@ func TestContextCancellationDuringAsyncHandlers(t *testing.T) {
 
 	// Subscribe async handlers
 	for i := 0; i < 5; i++ {
-		Subscribe(bus, func(event OrderEvent) {
+		if err := Subscribe(bus, func(event OrderEvent) {
 			atomic.AddInt32(&started, 1)
 			time.Sleep(50 * time.Millisecond)
 			atomic.AddInt32(&completed, 1)
-		}, Async(false))
+		}, Async(false)); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	// Create context with timeout
@@ -828,7 +890,7 @@ func TestContextCancellationWithContextHandler(t *testing.T) {
 	var handlerStarted, contextCancelled bool
 
 	// Subscribe context-aware handler
-	SubscribeContext(bus, func(ctx context.Context, event UserEvent) {
+	if err := SubscribeContext(bus, func(ctx context.Context, event UserEvent) {
 		handlerStarted = true
 		select {
 		case <-ctx.Done():
@@ -836,7 +898,9 @@ func TestContextCancellationWithContextHandler(t *testing.T) {
 		case <-time.After(100 * time.Millisecond):
 			// Should not reach here
 		}
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	// Create context and cancel it after a short delay
 	ctx, cancel := context.WithCancel(context.Background())
@@ -865,9 +929,11 @@ func TestAsyncHandlerSkippedOnCancelledContext(t *testing.T) {
 	var handlerCalled int32
 
 	// Subscribe async handler
-	Subscribe(bus, func(event UserEvent) {
+	if err := Subscribe(bus, func(event UserEvent) {
 		atomic.AddInt32(&handlerCalled, 1)
-	}, Async(false))
+	}, Async(false)); err != nil {
+		t.Fatal(err)
+	}
 
 	// Create and immediately cancel context
 	ctx, cancel := context.WithCancel(context.Background())
@@ -892,13 +958,15 @@ func TestAsyncHandlerContextCancelledInGoroutine(t *testing.T) {
 	started := make(chan bool)
 
 	// Subscribe async handler with delay
-	Subscribe(bus, func(event UserEvent) {
+	if err := Subscribe(bus, func(event UserEvent) {
 		atomic.AddInt32(&goroutineStarted, 1)
 		started <- true
 		// Small delay to ensure context check happens after cancellation
 		time.Sleep(10 * time.Millisecond)
 		atomic.AddInt32(&handlerCalled, 1)
-	}, Async(false))
+	}, Async(false)); err != nil {
+		t.Fatal(err)
+	}
 
 	// Create context that we'll cancel after goroutine starts
 	ctx, cancel := context.WithCancel(context.Background())
@@ -933,7 +1001,7 @@ func TestAsyncHandlerWithPreCancelledContext(t *testing.T) {
 
 	// Subscribe multiple async handlers
 	for i := 0; i < 3; i++ {
-		Subscribe(bus, func(event OrderEvent) {
+		if err := Subscribe(bus, func(event OrderEvent) {
 			select {
 			case handlerStarted <- true:
 			default:
@@ -943,7 +1011,9 @@ func TestAsyncHandlerWithPreCancelledContext(t *testing.T) {
 			case handlerExecuted <- true:
 			default:
 			}
-		}, Async(false))
+		}, Async(false)); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	// Context that gets cancelled very quickly
@@ -992,7 +1062,7 @@ func TestAsyncSequentialHandlerWithCancelledContext(t *testing.T) {
 	waitForStart := make(chan bool)
 
 	// Use a custom wrapper to track goroutine execution
-	Subscribe(bus, func(event UserEvent) {
+	if err := Subscribe(bus, func(event UserEvent) {
 		// Signal that we're in the goroutine but before context check
 		select {
 		case goroutineReached <- true:
@@ -1007,7 +1077,9 @@ func TestAsyncSequentialHandlerWithCancelledContext(t *testing.T) {
 		case handlerCalled <- true:
 		default:
 		}
-	}, Async(true))
+	}, Async(true)); err != nil {
+		t.Fatal(err)
+	}
 
 	// Create and cancel context immediately
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1061,20 +1133,24 @@ func TestAsyncHandlerContextCancelledDuringExecution(t *testing.T) {
 
 	// First, we need a way to pause execution right before the context check
 	// We'll use runtime.Gosched() in the handler to allow context cancellation
-	Subscribe(bus, func(event UserEvent) {
+	if err := Subscribe(bus, func(event UserEvent) {
 		// Give other goroutines a chance to run
 		for i := 0; i < 100; i++ {
 			runtime.Gosched()
 		}
 		atomic.AddInt32(&handlerCalled, 1)
-	}, Async(false))
+	}, Async(false)); err != nil {
+		t.Fatal(err)
+	}
 
 	// Also subscribe a synchronous handler that will help with timing
-	Subscribe(bus, func(event UserEvent) {
+	if err := Subscribe(bus, func(event UserEvent) {
 		close(reachedCheck)
 		// Small delay to let async goroutine start
 		time.Sleep(1 * time.Millisecond)
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -1100,11 +1176,13 @@ func TestAsyncHandlerWithImmediatelyCancelledContext(t *testing.T) {
 
 	// Add many async handlers
 	for i := 0; i < numHandlers; i++ {
-		Subscribe(bus, func(event UserEvent) {
+		if err := Subscribe(bus, func(event UserEvent) {
 			// Yield to increase chance of context cancellation
 			runtime.Gosched()
 			atomic.AddInt32(&handlersExecuted, 1)
-		}, Async(false))
+		}, Async(false)); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	// Create context and cancel it immediately
@@ -1134,9 +1212,11 @@ func TestForceAsyncContextCheck(t *testing.T) {
 		handlerCalled := int32(0)
 
 		// Add an async handler
-		Subscribe(bus, func(event UserEvent) {
+		if err := Subscribe(bus, func(event UserEvent) {
 			atomic.AddInt32(&handlerCalled, 1)
-		}, Async(false))
+		}, Async(false)); err != nil {
+			t.Fatal(err)
+		}
 
 		// Create a context
 		ctx, cancel := context.WithCancel(context.Background())
@@ -1179,9 +1259,11 @@ func TestAsyncHandlerContextCancelledBeforeGoroutineStarts(t *testing.T) {
 
 	// Add multiple async handlers to increase goroutine creation time
 	for i := 0; i < 100; i++ {
-		Subscribe(bus, func(event OrderEvent) {
+		if err := Subscribe(bus, func(event OrderEvent) {
 			atomic.AddInt32(&handlerCalled, 1)
-		}, Async(false))
+		}, Async(false)); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	// Create and immediately cancel context
@@ -1217,7 +1299,7 @@ func TestAsyncHandlerCancelledContextDeterministic(t *testing.T) {
 	handlerCalled := int32(0)
 
 	// Add a handler that signals when it's in the goroutine
-	Subscribe(bus, func(event UserEvent) {
+	if err := Subscribe(bus, func(event UserEvent) {
 		// This code is inside the async goroutine
 		// Signal that we're here
 		close(goroutineStarted)
@@ -1228,7 +1310,9 @@ func TestAsyncHandlerCancelledContextDeterministic(t *testing.T) {
 		// If context was cancelled before the goroutine started, we won't get here
 		// But if we're already past the context check, this will execute
 		atomic.AddInt32(&handlerCalled, 1)
-	}, Async(false))
+	}, Async(false)); err != nil {
+		t.Fatal(err)
+	}
 
 	// Create a context
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1262,11 +1346,13 @@ func TestAsyncHandlerContextCheckWithDelay(t *testing.T) {
 		handlerExecuted := int32(0)
 
 		// Add async handler that has a small delay
-		Subscribe(bus, func(event UserEvent) {
+		if err := Subscribe(bus, func(event UserEvent) {
 			// Add a small delay to increase chances of context being cancelled
 			time.Sleep(time.Microsecond * 10)
 			atomic.AddInt32(&handlerExecuted, 1)
-		}, Async(false))
+		}, Async(false)); err != nil {
+			t.Fatal(err)
+		}
 
 		// Create and immediately cancel context
 		ctx, cancel := context.WithCancel(context.Background())
@@ -1300,10 +1386,12 @@ func TestAsyncHandlerContextCancelledGuaranteed(t *testing.T) {
 
 		// Add multiple async handlers
 		for i := 0; i < numHandlers; i++ {
-			Subscribe(bus, func(event UserEvent) {
+			if err := Subscribe(bus, func(event UserEvent) {
 				// If we get here, context check didn't prevent execution
 				atomic.AddInt32(&handlersSkipped, -1)
-			}, Async(false))
+			}, Async(false)); err != nil {
+				t.Fatal(err)
+			}
 		}
 
 		// Pre-cancelled context
@@ -1347,10 +1435,12 @@ func TestAsyncHandlerWithBlockedGoroutine(t *testing.T) {
 
 	// First, add many blocking handlers to consume goroutines
 	for i := 0; i < 50; i++ {
-		Subscribe(bus, func(event OrderEvent) {
+		if err := Subscribe(bus, func(event OrderEvent) {
 			readyChan <- struct{}{}
 			<-blockChan // Block until released
-		}, Async(false))
+		}, Async(false)); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	// Publish to start the blocking handlers
@@ -1362,10 +1452,12 @@ func TestAsyncHandlerWithBlockedGoroutine(t *testing.T) {
 	}
 
 	// Now add our test handler
-	Subscribe(bus, func(event UserEvent) {
+	if err := Subscribe(bus, func(event UserEvent) {
 		// This should be skipped due to context
 		atomic.AddInt32(&handlersBlocked, 1)
-	}, Async(false))
+	}, Async(false)); err != nil {
+		t.Fatal(err)
+	}
 
 	// Create cancelled context
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1399,9 +1491,11 @@ func TestEnsureAsyncContextCancellation(t *testing.T) {
 		handlerRan := false
 
 		// Subscribe async handler
-		Subscribe(bus, func(event UserEvent) {
+		if err := Subscribe(bus, func(event UserEvent) {
 			handlerRan = true
-		}, Async(false))
+		}, Async(false)); err != nil {
+			t.Fatal(err)
+		}
 
 		// Create context and cancel immediately
 		ctx, cancel := context.WithCancel(context.Background())
@@ -1443,9 +1537,11 @@ func TestEnsureAsyncContextCancellation(t *testing.T) {
 
 			// Add many handlers to increase chances
 			for k := 0; k < 20; k++ {
-				Subscribe(bus, func(event UserEvent) {
+				if err := Subscribe(bus, func(event UserEvent) {
 					atomic.AddInt32(&executed, 1)
-				}, Async(false))
+				}, Async(false)); err != nil {
+					t.Fatal(err)
+				}
 			}
 
 			// Cancel before publish
@@ -1479,11 +1575,13 @@ func TestOnceHandlerRemovalRaceCondition(t *testing.T) {
 		// Add multiple once handlers
 		numHandlers := 10
 		for i := 0; i < numHandlers; i++ {
-			Subscribe(bus, func(e UserEvent) {
+			if err := Subscribe(bus, func(e UserEvent) {
 				atomic.AddInt32(&executionCount, 1)
 				// Simulate some work
 				time.Sleep(time.Microsecond)
-			}, Once())
+			}, Once()); err != nil {
+				t.Fatal(err)
+			}
 		}
 		
 		// Publish events concurrently
@@ -1521,3 +1619,120 @@ func TestOnceHandlerRemovalRaceCondition(t *testing.T) {
 		}
 	}
 }
+
+func TestSubscribeValidation(t *testing.T) {
+	bus := New()
+
+	t.Run("nil bus", func(t *testing.T) {
+		err := Subscribe(nil, func(e UserEvent) {})
+		if err == nil {
+			t.Error("expected error for nil bus")
+		}
+		if err.Error() != "eventbus: bus cannot be nil" {
+			t.Errorf("unexpected error message: %v", err)
+		}
+	})
+
+	t.Run("nil handler", func(t *testing.T) {
+		var nilHandler Handler[UserEvent]
+		err := Subscribe(bus, nilHandler)
+		if err == nil {
+			t.Error("expected error for nil handler")
+		}
+		if err.Error() != "eventbus: handler cannot be nil" {
+			t.Errorf("unexpected error message: %v", err)
+		}
+	})
+
+	t.Run("nil option", func(t *testing.T) {
+		err := Subscribe(bus, func(e UserEvent) {}, nil, Once())
+		if err == nil {
+			t.Error("expected error for nil option")
+		}
+		if err.Error() != "eventbus: subscribe option cannot be nil" {
+			t.Errorf("unexpected error message: %v", err)
+		}
+	})
+
+	t.Run("valid subscription", func(t *testing.T) {
+		err := Subscribe(bus, func(e UserEvent) {})
+		if err != nil {
+			t.Errorf("unexpected error for valid subscription: %v", err)
+		}
+	})
+}
+
+func TestSubscribeContextValidation(t *testing.T) {
+	bus := New()
+
+	t.Run("nil bus", func(t *testing.T) {
+		err := SubscribeContext(nil, func(ctx context.Context, e UserEvent) {})
+		if err == nil {
+			t.Error("expected error for nil bus")
+		}
+		if err.Error() != "eventbus: bus cannot be nil" {
+			t.Errorf("unexpected error message: %v", err)
+		}
+	})
+
+	t.Run("nil handler", func(t *testing.T) {
+		var nilHandler ContextHandler[UserEvent]
+		err := SubscribeContext(bus, nilHandler)
+		if err == nil {
+			t.Error("expected error for nil handler")
+		}
+		if err.Error() != "eventbus: handler cannot be nil" {
+			t.Errorf("unexpected error message: %v", err)
+		}
+	})
+
+	t.Run("nil option", func(t *testing.T) {
+		err := SubscribeContext(bus, func(ctx context.Context, e UserEvent) {}, nil, Async(false))
+		if err == nil {
+			t.Error("expected error for nil option")
+		}
+		if err.Error() != "eventbus: subscribe option cannot be nil" {
+			t.Errorf("unexpected error message: %v", err)
+		}
+	})
+
+	t.Run("valid subscription", func(t *testing.T) {
+		err := SubscribeContext(bus, func(ctx context.Context, e UserEvent) {})
+		if err != nil {
+			t.Errorf("unexpected error for valid subscription: %v", err)
+		}
+	})
+}
+
+func TestNilHandlerNotStored(t *testing.T) {
+	// This test verifies that nil handlers are rejected and not stored in the bus
+	bus := New()
+
+	// Try to subscribe a nil handler
+	var nilHandler Handler[UserEvent]
+	err := Subscribe(bus, nilHandler)
+	if err == nil {
+		t.Fatal("expected error for nil handler")
+	}
+
+	// Verify no handlers were stored
+	if HasSubscribers[UserEvent](bus) {
+		t.Error("nil handler should not have been stored")
+	}
+
+	// Subscribe a valid handler
+	called := false
+	if err := Subscribe(bus, func(e UserEvent) {
+		called = true
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Publish and verify only the valid handler is called
+	Publish(bus, UserEvent{UserID: "test", Action: "test"})
+	
+	if !called {
+		t.Error("valid handler should have been called")
+	}
+}
+
