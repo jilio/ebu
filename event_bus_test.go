@@ -1462,3 +1462,62 @@ func TestEnsureAsyncContextCancellation(t *testing.T) {
 		}
 	}
 }
+
+func TestOnceHandlerRemovalRaceCondition(t *testing.T) {
+	// This test verifies that the race condition in once handler removal is fixed
+	// The race occurred when multiple goroutines tried to remove once handlers concurrently
+	bus := New()
+	
+	// We'll run this test multiple times to increase the chance of catching the race
+	for iteration := 0; iteration < 100; iteration++ {
+		// Clear the bus for each iteration
+		bus.ClearAll()
+		
+		// Track execution counts
+		executionCount := int32(0)
+		
+		// Add multiple once handlers
+		numHandlers := 10
+		for i := 0; i < numHandlers; i++ {
+			Subscribe(bus, func(e UserEvent) {
+				atomic.AddInt32(&executionCount, 1)
+				// Simulate some work
+				time.Sleep(time.Microsecond)
+			}, Once())
+		}
+		
+		// Publish events concurrently
+		var wg sync.WaitGroup
+		numPublishers := 5
+		wg.Add(numPublishers)
+		
+		for i := 0; i < numPublishers; i++ {
+			go func() {
+				defer wg.Done()
+				Publish(bus, UserEvent{UserID: "concurrent", Action: "test"})
+			}()
+		}
+		
+		// Wait for all publishers to complete
+		wg.Wait()
+		
+		// Verify that each once handler was executed exactly once
+		finalCount := atomic.LoadInt32(&executionCount)
+		if finalCount != int32(numHandlers) {
+			t.Errorf("Iteration %d: Expected %d executions, got %d", iteration, numHandlers, finalCount)
+		}
+		
+		// Verify that all once handlers were properly removed
+		if HasSubscribers[UserEvent](bus) {
+			t.Errorf("Iteration %d: Once handlers were not properly removed", iteration)
+		}
+		
+		// Publish again to ensure no handlers remain
+		executionCount = 0
+		Publish(bus, UserEvent{UserID: "verify", Action: "test"})
+		
+		if atomic.LoadInt32(&executionCount) != 0 {
+			t.Errorf("Iteration %d: Handlers executed after they should have been removed", iteration)
+		}
+	}
+}
