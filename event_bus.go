@@ -11,14 +11,8 @@ import (
 // Handler is a generic event handler function
 type Handler[T any] func(T)
 
-// AsyncHandler is a generic async event handler function
-type AsyncHandler[T any] func(T)
-
 // ContextHandler is a generic event handler function that accepts context
 type ContextHandler[T any] func(context.Context, T)
-
-// AsyncContextHandler is a generic async event handler function that accepts context
-type AsyncContextHandler[T any] func(context.Context, T)
 
 // SubscribeOption configures a subscription
 type SubscribeOption func(*internalHandler)
