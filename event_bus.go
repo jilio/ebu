@@ -33,7 +33,7 @@ type internalHandler struct {
 	sequential     bool
 	acceptsContext bool
 	mu             sync.Mutex
-	executed       int32 // For once handlers, atomically tracks if executed
+	executed       uint32 // For once handlers, atomically tracks if executed
 }
 
 // PanicHandler is called when a handler panics
@@ -161,9 +161,7 @@ func PublishContext[T any](bus *EventBus, ctx context.Context, event T) {
 	copy(handlersCopy, handlers)
 	bus.mu.RUnlock()
 
-	// Track handlers to remove (for once handlers)
-	var toRemove []*internalHandler
-
+	// Execute handlers
 	for _, h := range handlersCopy {
 		// Check if context is cancelled before processing
 		if ctx.Err() != nil {
@@ -172,12 +170,9 @@ func PublishContext[T any](bus *EventBus, ctx context.Context, event T) {
 		}
 
 		// For once handlers, check if already executed
-		if h.once {
-			if !atomic.CompareAndSwapInt32(&h.executed, 0, 1) {
-				// Already executed, skip
-				continue
-			}
-			toRemove = append(toRemove, h)
+		if h.once && !atomic.CompareAndSwapUint32(&h.executed, 0, 1) {
+			// Already executed, skip
+			continue
 		}
 
 		if h.async {
@@ -199,24 +194,31 @@ func PublishContext[T any](bus *EventBus, ctx context.Context, event T) {
 		}
 	}
 
-	// Remove once handlers
-	if len(toRemove) > 0 {
-		bus.mu.Lock()
-		defer bus.mu.Unlock()
+	// Remove executed once handlers
+	// We do this in a separate pass to avoid race conditions
+	bus.mu.Lock()
+	defer bus.mu.Unlock()
 
-		handlers = bus.handlers[eventType]
+	handlers = bus.handlers[eventType]
+	if len(handlers) == 0 {
+		return
+	}
+
+	// Check if any once handlers were executed and need removal
+	hasExecutedOnce := false
+	for _, h := range handlers {
+		if h.once && atomic.LoadUint32(&h.executed) == 1 {
+			hasExecutedOnce = true
+			break
+		}
+	}
+
+	if hasExecutedOnce {
 		// Create a new slice without the executed once handlers
 		newHandlers := make([]*internalHandler, 0, len(handlers))
 		for _, h := range handlers {
-			// Skip handlers that are in the toRemove list
-			shouldRemove := false
-			for _, removeHandler := range toRemove {
-				if h == removeHandler {
-					shouldRemove = true
-					break
-				}
-			}
-			if !shouldRemove {
+			// Keep handler if it's not a once handler OR if it's a once handler that hasn't been executed
+			if !h.once || atomic.LoadUint32(&h.executed) == 0 {
 				newHandlers = append(newHandlers, h)
 			}
 		}
