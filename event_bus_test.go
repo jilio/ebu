@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1733,5 +1734,291 @@ func TestNilHandlerNotStored(t *testing.T) {
 
 	if !called {
 		t.Error("valid handler should have been called")
+	}
+}
+
+func TestBeforePublishHook(t *testing.T) {
+	bus := New()
+	
+	var hookCalled bool
+	var capturedEventType reflect.Type
+	var capturedEvent any
+	
+	// Set before publish hook
+	bus.SetBeforePublishHook(func(eventType reflect.Type, event any) {
+		hookCalled = true
+		capturedEventType = eventType
+		capturedEvent = event
+	})
+	
+	// Publish an event
+	testEvent := UserEvent{UserID: "123", Action: "test"}
+	Publish(bus, testEvent)
+	
+	// Verify hook was called
+	if !hookCalled {
+		t.Error("beforePublish hook should have been called")
+	}
+	
+	if capturedEventType != reflect.TypeOf(testEvent) {
+		t.Errorf("expected event type %v, got %v", reflect.TypeOf(testEvent), capturedEventType)
+	}
+	
+	if capturedEvent != testEvent {
+		t.Errorf("expected event %v, got %v", testEvent, capturedEvent)
+	}
+}
+
+func TestAfterPublishHook(t *testing.T) {
+	bus := New()
+	
+	var hookCalled bool
+	var handlerCalled bool
+	
+	// Set after publish hook
+	bus.SetAfterPublishHook(func(eventType reflect.Type, event any) {
+		hookCalled = true
+		// Hook should be called after handler
+		if !handlerCalled {
+			t.Error("afterPublish hook called before handler")
+		}
+	})
+	
+	// Subscribe a handler
+	if err := Subscribe(bus, func(e UserEvent) {
+		handlerCalled = true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	
+	// Publish an event
+	Publish(bus, UserEvent{UserID: "123", Action: "test"})
+	
+	// Verify hook was called
+	if !hookCalled {
+		t.Error("afterPublish hook should have been called")
+	}
+}
+
+func TestHooksCalledEvenWithNoHandlers(t *testing.T) {
+	bus := New()
+	
+	var beforeCalled bool
+	var afterCalled bool
+	
+	// Set hooks
+	bus.SetBeforePublishHook(func(eventType reflect.Type, event any) {
+		beforeCalled = true
+	})
+	
+	bus.SetAfterPublishHook(func(eventType reflect.Type, event any) {
+		afterCalled = true
+	})
+	
+	// Publish event with no handlers
+	Publish(bus, UserEvent{UserID: "123", Action: "test"})
+	
+	// Both hooks should still be called
+	if !beforeCalled {
+		t.Error("beforePublish hook should be called even with no handlers")
+	}
+	
+	if !afterCalled {
+		t.Error("afterPublish hook should be called even with no handlers")
+	}
+}
+
+func TestHooksWithMultipleEventTypes(t *testing.T) {
+	bus := New()
+	
+	eventTypes := make([]string, 0)
+	
+	// Set hook that logs all event types
+	bus.SetBeforePublishHook(func(eventType reflect.Type, event any) {
+		eventTypes = append(eventTypes, eventType.Name())
+	})
+	
+	// Publish different event types
+	Publish(bus, UserEvent{UserID: "1", Action: "create"})
+	Publish(bus, OrderEvent{OrderID: "2", Amount: 100})
+	Publish(bus, UserEvent{UserID: "3", Action: "delete"})
+	
+	// Verify all events were captured
+	if len(eventTypes) != 3 {
+		t.Errorf("expected 3 events, got %d", len(eventTypes))
+	}
+	
+	if eventTypes[0] != "UserEvent" || eventTypes[1] != "OrderEvent" || eventTypes[2] != "UserEvent" {
+		t.Errorf("unexpected event types: %v", eventTypes)
+	}
+}
+
+func TestHooksWithAsyncHandlers(t *testing.T) {
+	bus := New()
+	
+	var beforeCalled bool
+	var afterCalled bool
+	handlerDone := make(chan bool)
+	
+	// Set hooks
+	bus.SetBeforePublishHook(func(eventType reflect.Type, event any) {
+		beforeCalled = true
+	})
+	
+	bus.SetAfterPublishHook(func(eventType reflect.Type, event any) {
+		afterCalled = true
+	})
+	
+	// Subscribe async handler
+	if err := Subscribe(bus, func(e UserEvent) {
+		time.Sleep(10 * time.Millisecond)
+		handlerDone <- true
+	}, Async(false)); err != nil {
+		t.Fatal(err)
+	}
+	
+	// Publish event
+	Publish(bus, UserEvent{UserID: "123", Action: "test"})
+	
+	// Hooks should be called immediately
+	if !beforeCalled {
+		t.Error("beforePublish hook should be called immediately")
+	}
+	
+	if !afterCalled {
+		t.Error("afterPublish hook should be called immediately (not wait for async)")
+	}
+	
+	// Wait for async handler
+	select {
+	case <-handlerDone:
+		// Good
+	case <-time.After(100 * time.Millisecond):
+		t.Error("async handler didn't complete")
+	}
+	
+	bus.WaitAsync()
+}
+
+func TestHookReplacement(t *testing.T) {
+	bus := New()
+	
+	counter := 0
+	
+	// Set initial hook
+	bus.SetBeforePublishHook(func(eventType reflect.Type, event any) {
+		counter = 1
+	})
+	
+	// Replace with new hook
+	bus.SetBeforePublishHook(func(eventType reflect.Type, event any) {
+		counter = 2
+	})
+	
+	// Publish event
+	Publish(bus, UserEvent{UserID: "123", Action: "test"})
+	
+	// Only new hook should be called
+	if counter != 2 {
+		t.Errorf("expected counter=2, got %d", counter)
+	}
+}
+
+func TestHooksWithContext(t *testing.T) {
+	bus := New()
+	
+	var hookEvent any
+	
+	// Set hook
+	bus.SetBeforePublishHook(func(eventType reflect.Type, event any) {
+		hookEvent = event
+	})
+	
+	// Subscribe context handler
+	if err := SubscribeContext(bus, func(ctx context.Context, e UserEvent) {
+		// Handler
+	}); err != nil {
+		t.Fatal(err)
+	}
+	
+	// Publish with context
+	ctx := context.WithValue(context.Background(), "key", "value")
+	PublishContext(bus, ctx, UserEvent{UserID: "123", Action: "test"})
+	
+	// Hook should receive the event
+	if hookEvent == nil {
+		t.Error("hook should have received the event")
+	}
+}
+
+func TestGlobalEventLogging(t *testing.T) {
+	// This demonstrates the primary use case: logging ALL events
+	bus := New()
+	
+	// Simulated log storage
+	var logs []string
+	
+	// Set up global logging hook
+	bus.SetBeforePublishHook(func(eventType reflect.Type, event any) {
+		logs = append(logs, fmt.Sprintf("[LOG] %s: %+v", eventType.Name(), event))
+	})
+	
+	// Multiple services subscribing to specific events
+	if err := Subscribe(bus, func(e UserEvent) {
+		// User service handler
+	}); err != nil {
+		t.Fatal(err)
+	}
+	
+	if err := Subscribe(bus, func(e OrderEvent) {
+		// Order service handler  
+	}); err != nil {
+		t.Fatal(err)
+	}
+	
+	// Publish various events
+	Publish(bus, UserEvent{UserID: "1", Action: "login"})
+	Publish(bus, OrderEvent{OrderID: "100", Amount: 50.0})
+	Publish(bus, UserEvent{UserID: "2", Action: "logout"})
+	
+	// Verify all events were logged
+	if len(logs) != 3 {
+		t.Errorf("expected 3 log entries, got %d", len(logs))
+	}
+	
+	// Verify log format
+	for _, log := range logs {
+		if !strings.HasPrefix(log, "[LOG]") {
+			t.Errorf("log entry doesn't have expected format: %s", log)
+		}
+	}
+}
+
+func TestAfterHookCalledWhenHandlersClearedDuringExecution(t *testing.T) {
+	// This tests the edge case where handlers list becomes empty during execution
+	// This happens when a handler clears all handlers while executing
+	bus := New()
+	
+	var afterHookCalled bool
+	
+	// Set after hook
+	bus.SetAfterPublishHook(func(eventType reflect.Type, event any) {
+		afterHookCalled = true
+	})
+	
+	// Subscribe a handler that clears all handlers
+	if err := Subscribe(bus, func(e UserEvent) {
+		// Clear all handlers while in handler
+		bus.ClearAll()
+	}); err != nil {
+		t.Fatal(err)
+	}
+	
+	// Publish event
+	Publish(bus, UserEvent{UserID: "test", Action: "clear"})
+	
+	// After hook should still be called
+	if !afterHookCalled {
+		t.Error("afterPublish hook should be called even when handlers are cleared during execution")
 	}
 }
