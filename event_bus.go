@@ -33,12 +33,17 @@ type internalHandler struct {
 // PanicHandler is called when a handler panics
 type PanicHandler func(event any, handlerType reflect.Type, panicValue any)
 
+// PublishHook is called when an event is published
+type PublishHook func(eventType reflect.Type, event any)
+
 // EventBus is a type-safe event bus that can handle multiple event types
 type EventBus struct {
-	handlers     map[reflect.Type][]*internalHandler
-	panicHandler PanicHandler
-	mu           sync.RWMutex
-	wg           sync.WaitGroup
+	handlers      map[reflect.Type][]*internalHandler
+	panicHandler  PanicHandler
+	beforePublish PublishHook
+	afterPublish  PublishHook
+	mu            sync.RWMutex
+	wg            sync.WaitGroup
 }
 
 // New creates a new EventBus
@@ -169,10 +174,28 @@ func Publish[T any](bus *EventBus, event T) {
 func PublishContext[T any](bus *EventBus, ctx context.Context, event T) {
 	eventType := reflect.TypeOf(event)
 
+	// Call beforePublish hook if set
+	bus.mu.RLock()
+	beforeHook := bus.beforePublish
+	bus.mu.RUnlock()
+	
+	if beforeHook != nil {
+		beforeHook(eventType, event)
+	}
+
 	bus.mu.RLock()
 	handlers, exists := bus.handlers[eventType]
 	if !exists {
 		bus.mu.RUnlock()
+		
+		// Still call afterPublish hook even if no handlers
+		bus.mu.RLock()
+		afterHook := bus.afterPublish
+		bus.mu.RUnlock()
+		
+		if afterHook != nil {
+			afterHook(eventType, event)
+		}
 		return
 	}
 
@@ -217,10 +240,18 @@ func PublishContext[T any](bus *EventBus, ctx context.Context, event T) {
 	// Remove executed once handlers
 	// We do this in a separate pass to avoid race conditions
 	bus.mu.Lock()
-	defer bus.mu.Unlock()
-
 	handlers = bus.handlers[eventType]
 	if len(handlers) == 0 {
+		bus.mu.Unlock()
+		
+		// Call afterPublish hook
+		bus.mu.RLock()
+		afterHook := bus.afterPublish
+		bus.mu.RUnlock()
+		
+		if afterHook != nil {
+			afterHook(eventType, event)
+		}
 		return
 	}
 
@@ -243,6 +274,16 @@ func PublishContext[T any](bus *EventBus, ctx context.Context, event T) {
 			}
 		}
 		bus.handlers[eventType] = newHandlers
+	}
+	bus.mu.Unlock()
+	
+	// Call afterPublish hook
+	bus.mu.RLock()
+	afterHook := bus.afterPublish
+	bus.mu.RUnlock()
+	
+	if afterHook != nil {
+		afterHook(eventType, event)
 	}
 }
 
@@ -307,4 +348,20 @@ func (bus *EventBus) SetPanicHandler(handler PanicHandler) {
 	defer bus.mu.Unlock()
 
 	bus.panicHandler = handler
+}
+
+// SetBeforePublishHook sets a hook to be called before handlers are executed
+func (bus *EventBus) SetBeforePublishHook(hook PublishHook) {
+	bus.mu.Lock()
+	defer bus.mu.Unlock()
+
+	bus.beforePublish = hook
+}
+
+// SetAfterPublishHook sets a hook to be called after all handlers have executed
+func (bus *EventBus) SetAfterPublishHook(hook PublishHook) {
+	bus.mu.Lock()
+	defer bus.mu.Unlock()
+
+	bus.afterPublish = hook
 }

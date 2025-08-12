@@ -391,6 +391,60 @@ func main() {
 
 Panic recovery works for both synchronous and asynchronous handlers, ensuring your application remains stable even when individual handlers fail.
 
+### Global Event Hooks
+
+Hooks allow you to intercept ALL events without subscribing to each type individually. This is perfect for cross-cutting concerns like logging, metrics, and tracing.
+
+```go
+import (
+    "log"
+    "reflect"
+    
+    eventbus "github.com/jilio/ebu"
+)
+
+func setupGlobalLogging(bus *eventbus.EventBus) {
+    // Called before any handlers execute
+    bus.SetBeforePublishHook(func(eventType reflect.Type, event any) {
+        log.Printf("[EVENT] Publishing %s: %+v", eventType.Name(), event)
+    })
+    
+    // Called after all handlers complete
+    bus.SetAfterPublishHook(func(eventType reflect.Type, event any) {
+        log.Printf("[EVENT] Completed %s", eventType.Name())
+    })
+}
+
+func main() {
+    bus := eventbus.New()
+    setupGlobalLogging(bus)
+    
+    // All events are now automatically logged
+    eventbus.Publish(bus, UserCreatedEvent{UserID: "123"})
+    eventbus.Publish(bus, OrderPlacedEvent{OrderID: "456"})
+    // No need to subscribe to each event type for logging!
+}
+```
+
+#### Use Cases for Hooks
+
+1. **Global Logging**: Log all events across your application
+2. **Metrics Collection**: Track event counts, latency, and patterns
+3. **Distributed Tracing**: Add trace IDs to all events
+4. **Event Store**: Persist all events for audit or event sourcing
+5. **Service Bridge**: Forward events between microservices
+6. **Rate Limiting**: Implement global rate limits
+7. **Circuit Breaking**: Detect and handle failure patterns
+
+#### Hook Behavior
+
+- Hooks are called synchronously before/after handler execution
+- `BeforePublishHook` is called before any handlers execute
+- `AfterPublishHook` is called after all sync handlers complete (doesn't wait for async)
+- Hooks are called even if there are no handlers for an event
+- Only one hook of each type can be set (setting a new one replaces the old)
+- Hooks receive the event type and event value, allowing for type-based routing
+
 ## API Reference
 
 ### Core Functions
@@ -532,6 +586,26 @@ Sets a custom function to be called when a handler panics. This is useful for lo
 bus.SetPanicHandler(func(event any, handlerType reflect.Type, panicValue any) {
     log.Printf("Handler panic: type=%v, panic=%v, event=%+v", 
         handlerType, panicValue, event)
+})
+```
+
+#### `SetBeforePublishHook(hook PublishHook)`
+
+Sets a hook to be called before any handlers are executed for an event. Useful for logging, metrics, or pre-processing.
+
+```go
+bus.SetBeforePublishHook(func(eventType reflect.Type, event any) {
+    log.Printf("Publishing event: %s", eventType.Name())
+})
+```
+
+#### `SetAfterPublishHook(hook PublishHook)`
+
+Sets a hook to be called after all synchronous handlers have completed. The hook is called immediately after sync handlers, not waiting for async handlers.
+
+```go
+bus.SetAfterPublishHook(func(eventType reflect.Type, event any) {
+    metrics.Increment("events." + eventType.Name())
 })
 ```
 
