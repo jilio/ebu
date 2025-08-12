@@ -178,7 +178,7 @@ func PublishContext[T any](bus *EventBus, ctx context.Context, event T) {
 	bus.mu.RLock()
 	beforeHook := bus.beforePublish
 	bus.mu.RUnlock()
-	
+
 	if beforeHook != nil {
 		beforeHook(eventType, event)
 	}
@@ -187,12 +187,12 @@ func PublishContext[T any](bus *EventBus, ctx context.Context, event T) {
 	handlers, exists := bus.handlers[eventType]
 	if !exists {
 		bus.mu.RUnlock()
-		
+
 		// Still call afterPublish hook even if no handlers
 		bus.mu.RLock()
 		afterHook := bus.afterPublish
 		bus.mu.RUnlock()
-		
+
 		if afterHook != nil {
 			afterHook(eventType, event)
 		}
@@ -243,12 +243,12 @@ func PublishContext[T any](bus *EventBus, ctx context.Context, event T) {
 	handlers = bus.handlers[eventType]
 	if len(handlers) == 0 {
 		bus.mu.Unlock()
-		
+
 		// Call afterPublish hook
 		bus.mu.RLock()
 		afterHook := bus.afterPublish
 		bus.mu.RUnlock()
-		
+
 		if afterHook != nil {
 			afterHook(eventType, event)
 		}
@@ -276,12 +276,12 @@ func PublishContext[T any](bus *EventBus, ctx context.Context, event T) {
 		bus.handlers[eventType] = newHandlers
 	}
 	bus.mu.Unlock()
-	
+
 	// Call afterPublish hook
 	bus.mu.RLock()
 	afterHook := bus.afterPublish
 	bus.mu.RUnlock()
-	
+
 	if afterHook != nil {
 		afterHook(eventType, event)
 	}
