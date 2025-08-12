@@ -1993,3 +1993,32 @@ func TestGlobalEventLogging(t *testing.T) {
 		}
 	}
 }
+
+func TestAfterHookCalledWhenHandlersClearedDuringExecution(t *testing.T) {
+	// This tests the edge case where handlers list becomes empty during execution
+	// This happens when a handler clears all handlers while executing
+	bus := New()
+	
+	var afterHookCalled bool
+	
+	// Set after hook
+	bus.SetAfterPublishHook(func(eventType reflect.Type, event any) {
+		afterHookCalled = true
+	})
+	
+	// Subscribe a handler that clears all handlers
+	if err := Subscribe(bus, func(e UserEvent) {
+		// Clear all handlers while in handler
+		bus.ClearAll()
+	}); err != nil {
+		t.Fatal(err)
+	}
+	
+	// Publish event
+	Publish(bus, UserEvent{UserID: "test", Action: "clear"})
+	
+	// After hook should still be called
+	if !afterHookCalled {
+		t.Error("afterPublish hook should be called even when handlers are cleared during execution")
+	}
+}
