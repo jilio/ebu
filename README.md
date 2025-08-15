@@ -21,6 +21,7 @@ A lightweight, type-safe event bus for Go with generics support. Build decoupled
 - ⏹️ **Context cancellation** - Stop processing handlers when context is cancelled
 - 🏃 **Race-safe** - Guaranteed once-only execution for once handlers
 - 💾 **Event persistence** - Built-in support for event storage and replay
+- 🏗️ **CQRS support** - Complete CQRS implementation with commands, queries, and projections
 - ✅ **100% test coverage** - Thoroughly tested for reliability
 
 ## Installation
@@ -561,8 +562,223 @@ func main() {
 3. **Message Recovery**: Resume processing after crashes
 4. **Event Replay**: Rebuild state or reprocess events
 5. **Debugging**: Analyze event flow in production
-6. **CQRS**: Separate write and read models with events
+6. **CQRS**: Separate write and read models with events (see CQRS section below)
 7. **Integration**: Share events between services via storage
+
+### CQRS (Command Query Responsibility Segregation)
+
+ebu includes a complete CQRS implementation that integrates seamlessly with the event bus. CQRS separates read and write operations, using commands to modify state and queries to read state, with events bridging the two.
+
+#### Basic CQRS Example
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    
+    eventbus "github.com/jilio/ebu"
+)
+
+// Commands - Write operations
+type CreateAccountCommand struct {
+    AccountID      string
+    InitialBalance float64
+}
+
+type DepositMoneyCommand struct {
+    AccountID string
+    Amount    float64
+}
+
+// Events - State changes
+type AccountCreated struct {
+    AccountID string
+    Balance   float64
+}
+
+type MoneyDeposited struct {
+    AccountID string
+    Amount    float64
+}
+
+// Queries - Read operations
+type GetAccountBalanceQuery struct {
+    AccountID string
+}
+
+// Aggregate - Domain logic
+type AccountAggregate struct {
+    eventbus.BaseAggregate
+    Balance float64
+}
+
+func (a *AccountAggregate) HandleCreateAccount(cmd CreateAccountCommand) []any {
+    // Business logic
+    if a.ID != "" {
+        return nil // Account already exists
+    }
+    
+    // Raise domain event
+    event := AccountCreated{
+        AccountID: cmd.AccountID,
+        Balance:   cmd.InitialBalance,
+    }
+    
+    a.ID = cmd.AccountID
+    a.Balance = cmd.InitialBalance
+    a.RaiseEvent(event)
+    
+    return a.GetUncommittedEvents()
+}
+
+// Projection - Read model
+type BalanceProjection struct {
+    balances map[string]float64
+}
+
+func (p *BalanceProjection) GetID() string {
+    return "balance-projection"
+}
+
+func (p *BalanceProjection) Handle(ctx context.Context, event any) error {
+    switch e := event.(type) {
+    case AccountCreated:
+        p.balances[e.AccountID] = e.Balance
+    case MoneyDeposited:
+        p.balances[e.AccountID] += e.Amount
+    }
+    return nil
+}
+
+func main() {
+    // Set up event bus and CQRS
+    bus := eventbus.New()
+    cqrs := eventbus.NewCQRS(bus)
+    
+    // In-memory aggregate storage
+    accounts := make(map[string]*AccountAggregate)
+    
+    // Register command handler
+    createHandler := func(ctx context.Context, cmd CreateAccountCommand) ([]any, error) {
+        agg := &AccountAggregate{}
+        events := agg.HandleCreateAccount(cmd)
+        if events != nil {
+            accounts[cmd.AccountID] = agg
+        }
+        return events, nil
+    }
+    cqrs.RegisterCommand(createHandler)
+    
+    // Register query handler
+    balanceQuery := func(ctx context.Context, query GetAccountBalanceQuery) (float64, error) {
+        if agg, ok := accounts[query.AccountID]; ok {
+            return agg.Balance, nil
+        }
+        return 0, fmt.Errorf("account not found")
+    }
+    cqrs.RegisterQuery(balanceQuery)
+    
+    // Register projection for read model
+    projection := &BalanceProjection{
+        balances: make(map[string]float64),
+    }
+    cqrs.RegisterProjection(projection, AccountCreated{}, MoneyDeposited{})
+    
+    // Execute commands
+    ctx := context.Background()
+    err := cqrs.ExecuteCommand(ctx, CreateAccountCommand{
+        AccountID:      "acc-123",
+        InitialBalance: 1000,
+    })
+    if err != nil {
+        panic(err)
+    }
+    
+    // Execute queries
+    balance, err := cqrs.ExecuteQuery(ctx, GetAccountBalanceQuery{
+        AccountID: "acc-123",
+    })
+    if err != nil {
+        panic(err)
+    }
+    
+    fmt.Printf("Account balance: %.2f\n", balance.(float64))
+}
+```
+
+#### CQRS with Event Sourcing
+
+Combine CQRS with event persistence for full event sourcing:
+
+```go
+// Set up persistent event bus
+store := eventbus.NewMemoryStore()
+bus := eventbus.New(eventbus.WithStore(store))
+cqrs := eventbus.NewCQRS(bus)
+
+// Aggregates can be rebuilt from event history
+func LoadAggregate(id string, store eventbus.EventStore) (*AccountAggregate, error) {
+    events, err := store.Load(context.Background(), 0, -1)
+    if err != nil {
+        return nil, err
+    }
+    
+    agg := &AccountAggregate{}
+    var aggregateEvents []any
+    
+    // Filter events for this aggregate
+    for _, storedEvent := range events {
+        var event any
+        json.Unmarshal(storedEvent.Data, &event)
+        // Check if event belongs to this aggregate
+        if getAggregateID(event) == id {
+            aggregateEvents = append(aggregateEvents, event)
+        }
+    }
+    
+    // Rebuild aggregate state from events
+    err = agg.LoadFromHistory(aggregateEvents)
+    return agg, err
+}
+```
+
+#### Key CQRS Components
+
+1. **Commands**: Represent intentions to change state
+   - Validated before execution
+   - Produce events when successful
+   - Single aggregate modification per command
+
+2. **Queries**: Represent requests for information
+   - Read from projections or aggregates
+   - Never modify state
+   - Can be cached for performance
+
+3. **Events**: Represent state changes that have occurred
+   - Immutable facts about what happened
+   - Bridge between write and read models
+   - Can be persisted for event sourcing
+
+4. **Aggregates**: Encapsulate business logic and state
+   - Process commands and emit events
+   - Ensure business invariants
+   - Can be rebuilt from event history
+
+5. **Projections**: Optimized read models
+   - Updated asynchronously from events
+   - Tailored for specific query needs
+   - Eventually consistent with write model
+
+#### CQRS Benefits
+
+- **Scalability**: Scale reads and writes independently
+- **Performance**: Optimized read models for queries
+- **Flexibility**: Different storage for reads and writes
+- **Audit Trail**: Complete history of all changes
+- **Simplicity**: Clear separation of concerns
+- **Testing**: Easy to test business logic in isolation
 
 ## API Reference
 
