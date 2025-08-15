@@ -76,9 +76,15 @@ func (bus *EventBus) persistEvent(eventType reflect.Type, event any) {
 		return
 	}
 
+	// Build full type name with package path
+	typeName := eventType.String()
+	if pkg := eventType.PkgPath(); pkg != "" {
+		typeName = pkg + "/" + eventType.Name()
+	}
+
 	stored := &StoredEvent{
 		Position:  position,
-		Type:      eventType.String(),
+		Type:      typeName,
 		Data:      data,
 		Timestamp: time.Now(),
 	}
@@ -139,9 +145,14 @@ func SubscribeWithReplay[T any](
 
 	// Replay missed events
 	var eventType = reflect.TypeOf((*T)(nil)).Elem()
+	// Build full type name with package path for comparison
+	typeName := eventType.String()
+	if pkg := eventType.PkgPath(); pkg != "" {
+		typeName = pkg + "/" + eventType.Name()
+	}
 	err := bus.Replay(ctx, lastPos+1, func(stored *StoredEvent) error {
 		// Only replay events of the correct type
-		if stored.Type != eventType.String() {
+		if stored.Type != typeName {
 			return nil
 		}
 
@@ -196,6 +207,8 @@ func (m *MemoryStore) Save(ctx context.Context, event *StoredEvent) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// Set position for the event
+	event.Position = int64(len(m.events)) + 1
 	m.events = append(m.events, event)
 	return nil
 }
@@ -207,7 +220,7 @@ func (m *MemoryStore) Load(ctx context.Context, from, to int64) ([]*StoredEvent,
 
 	var result []*StoredEvent
 	for _, event := range m.events {
-		if event.Position >= from && event.Position <= to {
+		if event.Position >= from && (to == -1 || event.Position <= to) {
 			result = append(result, event)
 		}
 	}

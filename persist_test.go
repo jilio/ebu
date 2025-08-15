@@ -336,11 +336,16 @@ func TestSubscribeWithReplayUnmarshalError(t *testing.T) {
 	// Now manually insert an event with invalid JSON that will cause unmarshal to fail
 	ctx := context.Background()
 	eventType := reflect.TypeOf((*TestEvent)(nil)).Elem()
+	// Build full type name with package path
+	typeName := eventType.String()
+	if pkg := eventType.PkgPath(); pkg != "" {
+		typeName = pkg + "/" + eventType.Name()
+	}
 
 	// This JSON is syntactically invalid
 	store.Save(ctx, &StoredEvent{
 		Position:  2,
-		Type:      eventType.String(),
+		Type:      typeName,
 		Data:      []byte(`{"ID": "unclosed`), // Invalid JSON
 		Timestamp: time.Now(),
 	})
