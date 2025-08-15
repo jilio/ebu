@@ -2027,43 +2027,43 @@ func TestAsyncSequentialHandlerContextCancelled(t *testing.T) {
 	bus := New()
 	var handlerCalled int32
 	started := make(chan bool)
-	
+
 	// Subscribe a sequential async handler that takes time
 	if err := Subscribe(bus, func(event UserEvent) {
 		atomic.AddInt32(&handlerCalled, 1)
 	}, Async(true)); err != nil { // true = sequential
 		t.Fatal(err)
 	}
-	
+
 	// Subscribe another handler to signal when processing starts
 	if err := Subscribe(bus, func(event UserEvent) {
 		started <- true
 	}, Async(false)); err != nil {
 		t.Fatal(err)
 	}
-	
+
 	// Create context
 	ctx, cancel := context.WithCancel(context.Background())
-	
+
 	// Publish multiple events in quick succession
 	go func() {
 		for i := 0; i < 3; i++ {
 			PublishContext(bus, ctx, UserEvent{UserID: fmt.Sprintf("%d", i), Action: "test"})
 		}
 	}()
-	
+
 	// Wait for processing to start, then cancel context
 	<-started
 	cancel()
-	
+
 	// Publish more events with cancelled context
 	for i := 3; i < 5; i++ {
 		PublishContext(bus, ctx, UserEvent{UserID: fmt.Sprintf("%d", i), Action: "test"})
 	}
-	
+
 	// Wait for all async processing
 	bus.WaitAsync()
-	
+
 	// Not all handlers should have been called due to context cancellation
 	count := atomic.LoadInt32(&handlerCalled)
 	if count >= 5 {
