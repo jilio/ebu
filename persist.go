@@ -76,9 +76,15 @@ func (bus *EventBus) persistEvent(eventType reflect.Type, event any) {
 		return
 	}
 
+	// Build full type name with package path
+	typeName := eventType.String()
+	if pkg := eventType.PkgPath(); pkg != "" {
+		typeName = pkg + "/" + eventType.Name()
+	}
+
 	stored := &StoredEvent{
 		Position:  position,
-		Type:      eventType.String(),
+		Type:      typeName,
 		Data:      data,
 		Timestamp: time.Now(),
 	}
@@ -139,9 +145,14 @@ func SubscribeWithReplay[T any](
 
 	// Replay missed events
 	var eventType = reflect.TypeOf((*T)(nil)).Elem()
+	// Build full type name with package path for comparison
+	typeName := eventType.String()
+	if pkg := eventType.PkgPath(); pkg != "" {
+		typeName = pkg + "/" + eventType.Name()
+	}
 	err := bus.Replay(ctx, lastPos+1, func(stored *StoredEvent) error {
 		// Only replay events of the correct type
-		if stored.Type != eventType.String() {
+		if stored.Type != typeName {
 			return nil
 		}
 

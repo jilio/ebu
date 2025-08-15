@@ -18,7 +18,7 @@ A lightweight, type-safe event bus for Go with generics support. Build decoupled
 - 🧵 **Thread-safe** - Safe for concurrent use across goroutines
 - 🌐 **Context support** - First-class context support for cancellation and request tracing
 - 🛡️ **Panic recovery** - Handlers are isolated from each other's panics
-- ⏹️ **Context cancellation** - Stop processing handlers when context is cancelled
+- 🚀 **Zero dependencies** - No external dependencies, pure Go standard library
 - 🏃 **Race-safe** - Guaranteed once-only execution for once handlers
 - 💾 **Event persistence** - Built-in support for event storage and replay
 - 🏗️ **CQRS support** - Complete CQRS implementation with commands, queries, and projections
