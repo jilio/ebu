@@ -564,10 +564,6 @@ func main() {
 6. **CQRS**: Separate write and read models with events
 7. **Integration**: Share events between services via storage
 
-#### The 100% Coverage Story
-
-The persistence module was initially 99.1% covered. That missing 0.9% was a JSON unmarshal error path that seemed impossible to trigger. By pushing for 100% coverage, we discovered that the test wasn't properly setting the bus position, which meant the error path was unreachable in production too! This could have led to silent failures where corrupted events would be skipped without any error reporting. **The lesson: that last 1% of coverage often reveals the most interesting bugs.**
-
 ## API Reference
 
 ### Core Functions
