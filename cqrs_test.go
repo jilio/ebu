@@ -3,12 +3,13 @@ package eventbus
 import (
 	"context"
 	"errors"
-	"reflect"
 	"sync"
 	"testing"
 )
 
 // Test domain events
+type AccountEvent interface{}
+
 type AccountCreated struct {
 	AccountID string
 	Balance   float64
@@ -24,21 +25,31 @@ type MoneyWithdrawn struct {
 	Amount    float64
 }
 
+func (a AccountCreated) AggregateID() string { return a.AccountID }
+func (m MoneyDeposited) AggregateID() string { return m.AccountID }
+func (m MoneyWithdrawn) AggregateID() string { return m.AccountID }
+
 // Test commands
 type CreateAccountCommand struct {
 	AccountID      string
 	InitialBalance float64
 }
 
+func (c CreateAccountCommand) AggregateID() string { return c.AccountID }
+
 type DepositMoneyCommand struct {
 	AccountID string
 	Amount    float64
 }
 
+func (d DepositMoneyCommand) AggregateID() string { return d.AccountID }
+
 type WithdrawMoneyCommand struct {
 	AccountID string
 	Amount    float64
 }
+
+func (w WithdrawMoneyCommand) AggregateID() string { return w.AccountID }
 
 // Test queries
 type GetAccountBalanceQuery struct {
@@ -49,28 +60,36 @@ type GetAllAccountsQuery struct{}
 
 // Test aggregate
 type AccountAggregate struct {
-	BaseAggregate
+	BaseAggregate[AccountEvent]
 	Balance float64
 }
 
-func (a *AccountAggregate) LoadFromHistory(events []any) error {
-	for _, event := range events {
+// NewAccountAggregate creates a new account aggregate
+func NewAccountAggregate(id string) *AccountAggregate {
+	agg := &AccountAggregate{
+		BaseAggregate: BaseAggregate[AccountEvent]{
+			ID: id,
+		},
+	}
+
+	// Set the apply function
+	agg.BaseAggregate.ApplyFunc = func(event AccountEvent) error {
 		switch e := event.(type) {
 		case AccountCreated:
-			a.ID = e.AccountID
-			a.Balance = e.Balance
+			agg.Balance = e.Balance
 		case MoneyDeposited:
-			a.Balance += e.Amount
+			agg.Balance += e.Amount
 		case MoneyWithdrawn:
-			a.Balance -= e.Amount
+			agg.Balance -= e.Amount
 		}
-		a.Version++
+		return nil
 	}
-	return nil
+
+	return agg
 }
 
 func (a *AccountAggregate) CreateAccount(id string, initialBalance float64) error {
-	if a.ID != "" {
+	if a.ID != "" && a.ID != id {
 		return errors.New("account already exists")
 	}
 	event := AccountCreated{
@@ -78,9 +97,7 @@ func (a *AccountAggregate) CreateAccount(id string, initialBalance float64) erro
 		Balance:   initialBalance,
 	}
 	a.ID = id
-	a.Balance = initialBalance
-	a.RaiseEvent(event)
-	return nil
+	return a.RaiseEvent(event)
 }
 
 func (a *AccountAggregate) Deposit(amount float64) error {
@@ -91,9 +108,7 @@ func (a *AccountAggregate) Deposit(amount float64) error {
 		AccountID: a.ID,
 		Amount:    amount,
 	}
-	a.Balance += amount
-	a.RaiseEvent(event)
-	return nil
+	return a.RaiseEvent(event)
 }
 
 func (a *AccountAggregate) Withdraw(amount float64) error {
@@ -107,9 +122,7 @@ func (a *AccountAggregate) Withdraw(amount float64) error {
 		AccountID: a.ID,
 		Amount:    amount,
 	}
-	a.Balance -= amount
-	a.RaiseEvent(event)
-	return nil
+	return a.RaiseEvent(event)
 }
 
 // Test projection
@@ -130,21 +143,18 @@ func (p *AccountBalanceProjection) GetID() string {
 	return p.id
 }
 
-func (p *AccountBalanceProjection) Handle(ctx context.Context, event any) error {
+func (p *AccountBalanceProjection) Handle(ctx context.Context, event AccountEvent) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	switch e := event.(type) {
 	case AccountCreated:
-		// Account creation always sets the balance
 		p.balances[e.AccountID] = e.Balance
 	case MoneyDeposited:
-		// Only process if account exists
 		if _, exists := p.balances[e.AccountID]; exists {
 			p.balances[e.AccountID] += e.Amount
 		}
 	case MoneyWithdrawn:
-		// Only process if account exists
 		if _, exists := p.balances[e.AccountID]; exists {
 			p.balances[e.AccountID] -= e.Amount
 		}
@@ -160,7 +170,7 @@ func (p *AccountBalanceProjection) GetBalance(accountID string) (float64, bool) 
 }
 
 func TestBaseAggregate(t *testing.T) {
-	agg := &BaseAggregate{
+	agg := &BaseAggregate[AccountEvent]{
 		ID:      "test-123",
 		Version: 0,
 	}
@@ -177,7 +187,10 @@ func TestBaseAggregate(t *testing.T) {
 
 	// Test RaiseEvent
 	event := AccountCreated{AccountID: "test-123", Balance: 100}
-	agg.RaiseEvent(event)
+	err := agg.RaiseEvent(event)
+	if err != nil {
+		t.Fatalf("Failed to raise event: %v", err)
+	}
 
 	if version := agg.GetVersion(); version != 1 {
 		t.Errorf("Expected version 1 after raising event, got %d", version)
@@ -197,7 +210,7 @@ func TestBaseAggregate(t *testing.T) {
 }
 
 func TestAccountAggregate(t *testing.T) {
-	agg := &AccountAggregate{}
+	agg := NewAccountAggregate("")
 
 	// Test CreateAccount
 	err := agg.CreateAccount("acc-1", 1000)
@@ -254,8 +267,8 @@ func TestAccountAggregate(t *testing.T) {
 	}
 
 	// Test LoadFromHistory
-	agg2 := &AccountAggregate{}
-	events := []any{
+	agg2 := NewAccountAggregate("acc-1")
+	events := []AccountEvent{
 		AccountCreated{AccountID: "acc-1", Balance: 1000},
 		MoneyDeposited{AccountID: "acc-1", Amount: 500},
 		MoneyWithdrawn{AccountID: "acc-1", Amount: 300},
@@ -275,20 +288,31 @@ func TestAccountAggregate(t *testing.T) {
 	}
 }
 
-func TestProjectionBuilder(t *testing.T) {
+func TestProjectionManager(t *testing.T) {
 	bus := New()
-	pb := NewProjectionBuilder(bus)
+	pm := NewProjectionManager[AccountEvent](bus)
 
 	projection := NewAccountBalanceProjection()
 
 	// Test Register
-	err := pb.Register(projection, AccountCreated{}, MoneyDeposited{}, MoneyWithdrawn{})
+	err := pm.Register(projection)
 	if err != nil {
 		t.Fatalf("Failed to register projection: %v", err)
 	}
 
+	// Manually subscribe to specific event types
+	SubscribeContext(bus, func(ctx context.Context, e AccountCreated) {
+		_ = pm.HandleEvent(ctx, e)
+	})
+	SubscribeContext(bus, func(ctx context.Context, e MoneyDeposited) {
+		_ = pm.HandleEvent(ctx, e)
+	})
+	SubscribeContext(bus, func(ctx context.Context, e MoneyWithdrawn) {
+		_ = pm.HandleEvent(ctx, e)
+	})
+
 	// Test Get
-	p, ok := pb.Get("account-balances")
+	p, ok := pm.Get("account-balances")
 	if !ok {
 		t.Fatal("Failed to get projection")
 	}
@@ -313,53 +337,53 @@ func TestProjectionBuilder(t *testing.T) {
 	if balance != 1300 {
 		t.Errorf("Expected balance 1300, got %f", balance)
 	}
-
-	// Test registering with nil event type - use a new projection to avoid duplicate handlers
-	projection2 := NewAccountBalanceProjection()
-	err = pb.Register(projection2, nil)
-	if err == nil {
-		t.Error("Expected error when registering with nil event type")
-	}
 }
 
-func TestCQRS(t *testing.T) {
+func TestCommandBus(t *testing.T) {
 	bus := New()
-	cqrs := NewCQRS(bus)
+	cmdBus := NewCommandBus[Command, AccountEvent](bus)
 
 	// In-memory store for demo
 	accounts := make(map[string]*AccountAggregate)
 
 	// Register command handler for CreateAccount
-	createHandler := func(ctx context.Context, cmd CreateAccountCommand) ([]any, error) {
-		if _, exists := accounts[cmd.AccountID]; exists {
+	createHandler := func(ctx context.Context, cmd Command) ([]AccountEvent, error) {
+		createCmd, ok := cmd.(CreateAccountCommand)
+		if !ok {
+			return nil, errors.New("invalid command type")
+		}
+
+		if _, exists := accounts[createCmd.AccountID]; exists {
 			return nil, errors.New("account already exists")
 		}
 
-		agg := &AccountAggregate{}
-		err := agg.CreateAccount(cmd.AccountID, cmd.InitialBalance)
+		agg := NewAccountAggregate(createCmd.AccountID)
+		err := agg.CreateAccount(createCmd.AccountID, createCmd.InitialBalance)
 		if err != nil {
 			return nil, err
 		}
 
-		accounts[cmd.AccountID] = agg
+		accounts[createCmd.AccountID] = agg
 		events := agg.GetUncommittedEvents()
 		agg.MarkEventsAsCommitted()
 		return events, nil
 	}
 
-	err := cqrs.RegisterCommand(createHandler)
-	if err != nil {
-		t.Fatalf("Failed to register command handler: %v", err)
-	}
+	cmdBus.Register("CreateAccount", createHandler)
 
-	// Register command handler for DepositMoney
-	depositHandler := func(ctx context.Context, cmd DepositMoneyCommand) ([]any, error) {
-		agg, exists := accounts[cmd.AccountID]
+	// Register deposit handler
+	depositHandler := func(ctx context.Context, cmd Command) ([]AccountEvent, error) {
+		depositCmd, ok := cmd.(DepositMoneyCommand)
+		if !ok {
+			return nil, errors.New("invalid command type")
+		}
+
+		agg, exists := accounts[depositCmd.AccountID]
 		if !exists {
 			return nil, errors.New("account not found")
 		}
 
-		err := agg.Deposit(cmd.Amount)
+		err := agg.Deposit(depositCmd.Amount)
 		if err != nil {
 			return nil, err
 		}
@@ -369,72 +393,12 @@ func TestCQRS(t *testing.T) {
 		return events, nil
 	}
 
-	err = cqrs.RegisterCommand(depositHandler)
-	if err != nil {
-		t.Fatalf("Failed to register deposit handler: %v", err)
-	}
-
-	// Register command handler for WithdrawMoney
-	withdrawHandler := func(ctx context.Context, cmd WithdrawMoneyCommand) ([]any, error) {
-		agg, exists := accounts[cmd.AccountID]
-		if !exists {
-			return nil, errors.New("account not found")
-		}
-
-		err := agg.Withdraw(cmd.Amount)
-		if err != nil {
-			return nil, err
-		}
-
-		events := agg.GetUncommittedEvents()
-		agg.MarkEventsAsCommitted()
-		return events, nil
-	}
-
-	err = cqrs.RegisterCommand(withdrawHandler)
-	if err != nil {
-		t.Fatalf("Failed to register withdraw handler: %v", err)
-	}
-
-	// Register query handler for GetAccountBalance
-	balanceHandler := func(ctx context.Context, query GetAccountBalanceQuery) (float64, error) {
-		agg, exists := accounts[query.AccountID]
-		if !exists {
-			return 0, errors.New("account not found")
-		}
-		return agg.Balance, nil
-	}
-
-	err = cqrs.RegisterQuery(balanceHandler)
-	if err != nil {
-		t.Fatalf("Failed to register query handler: %v", err)
-	}
-
-	// Register query handler for GetAllAccounts
-	allAccountsHandler := func(ctx context.Context, query GetAllAccountsQuery) ([]string, error) {
-		ids := make([]string, 0, len(accounts))
-		for id := range accounts {
-			ids = append(ids, id)
-		}
-		return ids, nil
-	}
-
-	err = cqrs.RegisterQuery(allAccountsHandler)
-	if err != nil {
-		t.Fatalf("Failed to register all accounts handler: %v", err)
-	}
-
-	// Register projection
-	projection := NewAccountBalanceProjection()
-	err = cqrs.RegisterProjection(projection, AccountCreated{}, MoneyDeposited{}, MoneyWithdrawn{})
-	if err != nil {
-		t.Fatalf("Failed to register projection: %v", err)
-	}
+	cmdBus.Register("DepositMoney", depositHandler)
 
 	ctx := context.Background()
 
 	// Test ExecuteCommand - Create Account
-	err = cqrs.ExecuteCommand(ctx, CreateAccountCommand{
+	err := cmdBus.Execute(ctx, "CreateAccount", CreateAccountCommand{
 		AccountID:      "acc-1",
 		InitialBalance: 1000,
 	})
@@ -443,7 +407,7 @@ func TestCQRS(t *testing.T) {
 	}
 
 	// Test ExecuteCommand - Deposit
-	err = cqrs.ExecuteCommand(ctx, DepositMoneyCommand{
+	err = cmdBus.Execute(ctx, "DepositMoney", DepositMoneyCommand{
 		AccountID: "acc-1",
 		Amount:    500,
 	})
@@ -451,284 +415,330 @@ func TestCQRS(t *testing.T) {
 		t.Fatalf("Failed to deposit: %v", err)
 	}
 
-	// Test ExecuteCommand - Withdraw
-	err = cqrs.ExecuteCommand(ctx, WithdrawMoneyCommand{
-		AccountID: "acc-1",
-		Amount:    200,
-	})
-	if err != nil {
-		t.Fatalf("Failed to withdraw: %v", err)
-	}
-
-	// Wait for all async handlers to complete
-	bus.WaitAsync()
-
-	// Test ExecuteQuery - Get Balance
-	result, err := cqrs.ExecuteQuery(ctx, GetAccountBalanceQuery{AccountID: "acc-1"})
-	if err != nil {
-		t.Fatalf("Failed to get balance: %v", err)
-	}
-
-	balance := result.(float64)
-	if balance != 1300 {
-		t.Errorf("Expected balance 1300, got %f", balance)
-	}
-
-	// Test ExecuteQuery - Get All Accounts
-	result, err = cqrs.ExecuteQuery(ctx, GetAllAccountsQuery{})
-	if err != nil {
-		t.Fatalf("Failed to get all accounts: %v", err)
-	}
-
-	accountIDs := result.([]string)
-	if len(accountIDs) != 1 {
-		t.Errorf("Expected 1 account, got %d", len(accountIDs))
-	}
-
-	// Test GetProjection
-	p, ok := cqrs.GetProjection("account-balances")
-	if !ok {
-		t.Fatal("Failed to get projection")
-	}
-
-	accProj := p.(*AccountBalanceProjection)
-	projBalance, ok := accProj.GetBalance("acc-1")
-	if !ok {
-		t.Fatal("Account not found in projection")
-	}
-
-	if projBalance != 1300 {
-		t.Errorf("Expected projection balance 1300, got %f", projBalance)
-	}
-
-	// Test GetBus
-	if cqrs.GetBus() != bus {
-		t.Error("GetBus returned different bus instance")
+	// Verify account state
+	agg := accounts["acc-1"]
+	if agg.Balance != 1500 {
+		t.Errorf("Expected balance 1500, got %f", agg.Balance)
 	}
 
 	// Test command not found
-	err = cqrs.ExecuteCommand(ctx, struct{}{})
+	err = cmdBus.Execute(ctx, "UnknownCommand", struct{}{})
 	if err == nil {
 		t.Error("Expected error for unregistered command")
 	}
 
-	// Test query not found
-	_, err = cqrs.ExecuteQuery(ctx, struct{}{})
-	if err == nil {
-		t.Error("Expected error for unregistered query")
-	}
-
 	// Test duplicate account creation
-	err = cqrs.ExecuteCommand(ctx, CreateAccountCommand{
+	err = cmdBus.Execute(ctx, "CreateAccount", CreateAccountCommand{
 		AccountID:      "acc-1",
 		InitialBalance: 500,
 	})
 	if err == nil {
 		t.Error("Expected error when creating duplicate account")
 	}
+}
 
-	// Test operations on non-existent account
-	err = cqrs.ExecuteCommand(ctx, DepositMoneyCommand{
-		AccountID: "acc-999",
-		Amount:    100,
-	})
-	if err == nil {
-		t.Error("Expected error for deposit to non-existent account")
+func TestQueryBus(t *testing.T) {
+	queryBus := NewQueryBus[Query, any]()
+
+	// In-memory store for demo
+	accounts := map[string]*AccountAggregate{
+		"acc-1": {
+			BaseAggregate: BaseAggregate[AccountEvent]{ID: "acc-1"},
+			Balance:       1000,
+		},
+		"acc-2": {
+			BaseAggregate: BaseAggregate[AccountEvent]{ID: "acc-2"},
+			Balance:       2000,
+		},
 	}
 
-	_, err = cqrs.ExecuteQuery(ctx, GetAccountBalanceQuery{AccountID: "acc-999"})
+	// Register query handler for GetAccountBalance
+	balanceHandler := func(ctx context.Context, query Query) (any, error) {
+		balanceQuery, ok := query.(GetAccountBalanceQuery)
+		if !ok {
+			return nil, errors.New("invalid query type")
+		}
+
+		agg, exists := accounts[balanceQuery.AccountID]
+		if !exists {
+			return 0.0, errors.New("account not found")
+		}
+		return agg.Balance, nil
+	}
+
+	queryBus.Register("GetAccountBalance", balanceHandler)
+
+	// Register query handler for GetAllAccounts
+	allAccountsHandler := func(ctx context.Context, query Query) (any, error) {
+		_, ok := query.(GetAllAccountsQuery)
+		if !ok {
+			return nil, errors.New("invalid query type")
+		}
+
+		ids := make([]string, 0, len(accounts))
+		for id := range accounts {
+			ids = append(ids, id)
+		}
+		return ids, nil
+	}
+
+	queryBus.Register("GetAllAccounts", allAccountsHandler)
+
+	ctx := context.Background()
+
+	// Test ExecuteQuery - Get Balance
+	result, err := queryBus.Execute(ctx, "GetAccountBalance", GetAccountBalanceQuery{AccountID: "acc-1"})
+	if err != nil {
+		t.Fatalf("Failed to get balance: %v", err)
+	}
+
+	balance := result.(float64)
+	if balance != 1000 {
+		t.Errorf("Expected balance 1000, got %f", balance)
+	}
+
+	// Test ExecuteQuery - Get All Accounts
+	result, err = queryBus.Execute(ctx, "GetAllAccounts", GetAllAccountsQuery{})
+	if err != nil {
+		t.Fatalf("Failed to get all accounts: %v", err)
+	}
+
+	accountIDs := result.([]string)
+	if len(accountIDs) != 2 {
+		t.Errorf("Expected 2 accounts, got %d", len(accountIDs))
+	}
+
+	// Test query not found
+	_, err = queryBus.Execute(ctx, "UnknownQuery", struct{}{})
+	if err == nil {
+		t.Error("Expected error for unregistered query")
+	}
+
+	// Test non-existent account
+	_, err = queryBus.Execute(ctx, "GetAccountBalance", GetAccountBalanceQuery{AccountID: "acc-999"})
 	if err == nil {
 		t.Error("Expected error for query on non-existent account")
 	}
 }
 
-func TestCQRSInvalidHandlers(t *testing.T) {
-	bus := New()
-	cqrs := NewCQRS(bus)
-
-	// Test registering non-function as command handler
-	err := cqrs.RegisterCommand("not a function")
-	if err == nil {
-		t.Error("Expected error when registering non-function as command handler")
+func TestMemoryAggregateStore(t *testing.T) {
+	factory := func(id string) *AccountAggregate {
+		return NewAccountAggregate(id)
 	}
 
-	// Test registering command handler with wrong number of parameters
-	wrongParams := func(cmd CreateAccountCommand) ([]any, error) {
-		return nil, nil
-	}
-	err = cqrs.RegisterCommand(wrongParams)
-	if err == nil {
-		t.Error("Expected error for command handler with wrong number of parameters")
+	store := NewMemoryAggregateStore[*AccountAggregate, AccountEvent](factory)
+	ctx := context.Background()
+
+	// Test creating and saving new aggregate
+	agg := NewAccountAggregate("acc-1")
+	err := agg.CreateAccount("acc-1", 1000)
+	if err != nil {
+		t.Fatalf("Failed to create account: %v", err)
 	}
 
-	// Test registering command handler with wrong number of return values
-	wrongReturns := func(ctx context.Context, cmd CreateAccountCommand) error {
-		return nil
-	}
-	err = cqrs.RegisterCommand(wrongReturns)
-	if err == nil {
-		t.Error("Expected error for command handler with wrong number of return values")
+	err = agg.Deposit(500)
+	if err != nil {
+		t.Fatalf("Failed to deposit: %v", err)
 	}
 
-	// Test registering non-function as query handler
-	err = cqrs.RegisterQuery("not a function")
-	if err == nil {
-		t.Error("Expected error when registering non-function as query handler")
+	err = store.Save(ctx, agg)
+	if err != nil {
+		t.Fatalf("Failed to save aggregate: %v", err)
 	}
 
-	// Test registering query handler with wrong number of parameters
-	wrongQueryParams := func(query GetAccountBalanceQuery) (float64, error) {
-		return 0, nil
-	}
-	err = cqrs.RegisterQuery(wrongQueryParams)
-	if err == nil {
-		t.Error("Expected error for query handler with wrong number of parameters")
+	// Test loading aggregate
+	loaded, err := store.Load(ctx, "acc-1")
+	if err != nil {
+		t.Fatalf("Failed to load aggregate: %v", err)
 	}
 
-	// Test registering query handler with wrong number of return values
-	wrongQueryReturns := func(ctx context.Context, query GetAccountBalanceQuery) float64 {
-		return 0
+	if loaded.GetID() != "acc-1" {
+		t.Errorf("Expected ID acc-1, got %s", loaded.GetID())
 	}
-	err = cqrs.RegisterQuery(wrongQueryReturns)
-	if err == nil {
-		t.Error("Expected error for query handler with wrong number of return values")
+
+	if loaded.Balance != 1500 {
+		t.Errorf("Expected balance 1500, got %f", loaded.Balance)
+	}
+
+	// Test loading non-existent aggregate
+	newAgg, err := store.Load(ctx, "acc-2")
+	if err != nil {
+		t.Fatalf("Failed to load new aggregate: %v", err)
+	}
+
+	if newAgg.GetID() != "acc-2" {
+		t.Errorf("Expected ID acc-2, got %s", newAgg.GetID())
+	}
+
+	if newAgg.Balance != 0 {
+		t.Errorf("Expected balance 0 for new aggregate, got %f", newAgg.Balance)
 	}
 }
 
-func TestCQRSWithErrors(t *testing.T) {
-	bus := New()
-	cqrs := NewCQRS(bus)
-
-	// Register a command handler that returns an error
-	errorHandler := func(ctx context.Context, cmd CreateAccountCommand) ([]any, error) {
-		return nil, errors.New("simulated error")
+func TestAggregateCommandHandler(t *testing.T) {
+	factory := func(id string) *AccountAggregate {
+		return NewAccountAggregate(id)
 	}
 
-	err := cqrs.RegisterCommand(errorHandler)
-	if err != nil {
-		t.Fatalf("Failed to register command handler: %v", err)
-	}
+	store := NewMemoryAggregateStore[*AccountAggregate, AccountEvent](factory)
+
+	// Create a command handler for CreateAccount
+	handler := AggregateCommandHandler[CreateAccountCommand, *AccountAggregate, AccountEvent](
+		store,
+		factory,
+		func(ctx context.Context, agg *AccountAggregate, cmd CreateAccountCommand) error {
+			return agg.CreateAccount(cmd.AccountID, cmd.InitialBalance)
+		},
+	)
 
 	ctx := context.Background()
-	err = cqrs.ExecuteCommand(ctx, CreateAccountCommand{
+
+	// Test handling create command
+	events, err := handler(ctx, CreateAccountCommand{
 		AccountID:      "acc-1",
 		InitialBalance: 1000,
 	})
-
-	if err == nil {
-		t.Error("Expected error from command handler")
-	}
-
-	// Register a query handler that returns an error
-	queryErrorHandler := func(ctx context.Context, query GetAccountBalanceQuery) (float64, error) {
-		return 0, errors.New("query error")
-	}
-
-	err = cqrs.RegisterQuery(queryErrorHandler)
 	if err != nil {
-		t.Fatalf("Failed to register query handler: %v", err)
+		t.Fatalf("Failed to handle command: %v", err)
 	}
 
-	_, err = cqrs.ExecuteQuery(ctx, GetAccountBalanceQuery{AccountID: "acc-1"})
-	if err == nil {
-		t.Error("Expected error from query handler")
+	if len(events) != 1 {
+		t.Errorf("Expected 1 event, got %d", len(events))
 	}
-}
 
-// Test pointer event types for projections
-type PointerEvent struct {
-	ID    string
-	Value int
-}
+	// Create deposit handler
+	depositHandler := AggregateCommandHandler[DepositMoneyCommand, *AccountAggregate, AccountEvent](
+		store,
+		factory,
+		func(ctx context.Context, agg *AccountAggregate, cmd DepositMoneyCommand) error {
+			return agg.Deposit(cmd.Amount)
+		},
+	)
 
-func TestProjectionWithPointerEventTypes(t *testing.T) {
-	bus := New()
-	pb := NewProjectionBuilder(bus)
-
-	// Create a simple counting projection
-	projection := &SimpleCountingProjection{id: "pointer-test"}
-
-	// Register with pointer event type (tests the reflect.Ptr case)
-	err := pb.Register(projection, &PointerEvent{})
+	// Test handling deposit command
+	events, err = depositHandler(ctx, DepositMoneyCommand{
+		AccountID: "acc-1",
+		Amount:    500,
+	})
 	if err != nil {
-		t.Fatalf("Failed to register projection with pointer event type: %v", err)
+		t.Fatalf("Failed to handle deposit command: %v", err)
 	}
 
-	// Publish pointer events
-	Publish(bus, PointerEvent{ID: "1", Value: 100})
-	Publish(bus, PointerEvent{ID: "2", Value: 200})
+	if len(events) != 1 {
+		t.Errorf("Expected 1 event, got %d", len(events))
+	}
 
-	// Wait for processing
-	bus.WaitAsync()
+	// Load and verify aggregate state
+	agg, err := store.Load(ctx, "acc-1")
+	if err != nil {
+		t.Fatalf("Failed to load aggregate: %v", err)
+	}
 
-	if projection.count != 2 {
-		t.Errorf("Expected 2 events, got %d", projection.count)
+	if agg.Balance != 1500 {
+		t.Errorf("Expected balance 1500, got %f", agg.Balance)
 	}
 }
 
-// SimpleCountingProjection for testing
-type SimpleCountingProjection struct {
-	id    string
-	count int
-	mu    sync.Mutex
-}
-
-func (p *SimpleCountingProjection) GetID() string {
-	return p.id
-}
-
-func (p *SimpleCountingProjection) Handle(ctx context.Context, event any) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.count++
-	return nil
-}
-
-// Test the error-returning handler path directly
-func TestProjectionHandlerWithError(t *testing.T) {
-	bus := New()
-
-	// Directly add a handler that returns an error to test that code path
-	handler := func(ctx context.Context, event any) error {
-		return errors.New("handler error")
+func TestAggregateCommandHandlerWithoutAggregateID(t *testing.T) {
+	factory := func(id string) *AccountAggregate {
+		return NewAccountAggregate(id)
 	}
 
-	h := &internalHandler{
-		handler:        handler,
-		handlerType:    reflect.TypeOf(handler),
-		eventType:      reflect.TypeOf(AccountCreated{}),
-		acceptsContext: true,
-		async:          false,
+	store := NewMemoryAggregateStore[*AccountAggregate, AccountEvent](factory)
+
+	// Command without AggregateID method
+	type InvalidCommand struct {
+		Value string
 	}
 
-	bus.mu.Lock()
-	bus.handlers[reflect.TypeOf(AccountCreated{})] = []*internalHandler{h}
-	bus.mu.Unlock()
+	handler := AggregateCommandHandler[InvalidCommand, *AccountAggregate, AccountEvent](
+		store,
+		factory,
+		func(ctx context.Context, agg *AccountAggregate, cmd InvalidCommand) error {
+			return nil
+		},
+	)
 
-	// Publish an event - the error will be ignored
-	Publish(bus, AccountCreated{AccountID: "test", Balance: 100})
+	ctx := context.Background()
 
-	// No panic means the test passes
-}
-
-// Test subscription failure in projection registration
-func TestProjectionSubscribeError(t *testing.T) {
-	// Create a projection builder with a nil bus to force an error
-	pb := &ProjectionBuilder{
-		bus:         nil, // This will cause subscribeToEvent to return an error
-		projections: make(map[string]Projection),
-	}
-
-	projection := &SimpleCountingProjection{id: "fail-test"}
-
-	// This should fail when trying to subscribe
-	err := pb.Register(projection, AccountCreated{})
+	// Should fail because command doesn't implement AggregateID
+	_, err := handler(ctx, InvalidCommand{Value: "test"})
 	if err == nil {
-		t.Error("Expected error when subscribing with nil bus")
+		t.Error("Expected error for command without AggregateID method")
+	}
+}
+
+func TestBaseAggregateApply(t *testing.T) {
+	agg := &BaseAggregate[AccountEvent]{
+		ID:      "test-123",
+		Version: 0,
 	}
 
-	expectedErr := "failed to subscribe projection to eventbus.AccountCreated: bus is nil"
-	if err.Error() != expectedErr {
-		t.Errorf("Expected error %q, got %q", expectedErr, err.Error())
+	errorFunc := func(event AccountEvent) error {
+		return errors.New("apply error")
+	}
+
+	agg.ApplyFunc = errorFunc
+
+	// Test Apply with error
+	err := agg.Apply(AccountCreated{AccountID: "test", Balance: 100})
+	if err == nil {
+		t.Error("Expected error from Apply")
+	}
+
+	// Test RaiseEvent with error
+	err = agg.RaiseEvent(AccountCreated{AccountID: "test", Balance: 100})
+	if err == nil {
+		t.Error("Expected error from RaiseEvent")
+	}
+
+	// Test LoadFromHistory with error
+	events := []AccountEvent{
+		AccountCreated{AccountID: "test", Balance: 100},
+	}
+	err = agg.LoadFromHistory(events)
+	if err == nil {
+		t.Error("Expected error from LoadFromHistory")
+	}
+}
+
+func TestCreateAndRestoreSnapshot(t *testing.T) {
+	agg := NewAccountAggregate("acc-1")
+
+	// Create account and make some changes
+	err := agg.CreateAccount("acc-1", 1000)
+	if err != nil {
+		t.Fatalf("Failed to create account: %v", err)
+	}
+
+	// Create snapshot
+	snapshot, err := agg.CreateSnapshot()
+	if err != nil {
+		t.Fatalf("Failed to create snapshot: %v", err)
+	}
+
+	// Create new aggregate and restore from snapshot
+	agg2 := NewAccountAggregate("")
+	err = agg2.RestoreFromSnapshot(snapshot, 1)
+	if err != nil {
+		t.Fatalf("Failed to restore from snapshot: %v", err)
+	}
+
+	if agg2.GetID() != "acc-1" {
+		t.Errorf("Expected ID acc-1, got %s", agg2.GetID())
+	}
+
+	if agg2.GetVersion() != 1 {
+		t.Errorf("Expected version 1, got %d", agg2.GetVersion())
+	}
+}
+
+func TestRestoreSnapshotWithInvalidJSON(t *testing.T) {
+	agg := NewAccountAggregate("")
+
+	invalidJSON := []byte("not valid json")
+	err := agg.RestoreFromSnapshot(invalidJSON, 1)
+	if err == nil {
+		t.Error("Expected error when restoring from invalid JSON")
 	}
 }
