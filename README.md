@@ -20,6 +20,7 @@ A lightweight, type-safe event bus for Go with generics support. Build decoupled
 - 🛡️ **Panic recovery** - Handlers are isolated from each other's panics
 - ⏹️ **Context cancellation** - Stop processing handlers when context is cancelled
 - 🏃 **Race-safe** - Guaranteed once-only execution for once handlers
+- 💾 **Event persistence** - Built-in support for event storage and replay
 - ✅ **100% test coverage** - Thoroughly tested for reliability
 
 ## Installation
@@ -444,6 +445,122 @@ func main() {
 - Hooks are called even if there are no handlers for an event
 - Only one hook of each type can be set (setting a new one replaces the old)
 - Hooks receive the event type and event value, allowing for type-based routing
+
+### Event Persistence
+
+ebu includes built-in support for event persistence, enabling event sourcing patterns, audit logs, and resumable subscriptions. The persistence layer is designed to be simple and pluggable.
+
+```go
+import (
+    "context"
+    
+    eventbus "github.com/jilio/ebu"
+)
+
+type UserCreatedEvent struct {
+    UserID   string
+    Username string
+    Email    string
+}
+
+func main() {
+    // Create a persistent event bus with in-memory store
+    store := eventbus.NewMemoryStore()
+    bus := eventbus.NewPersistent(store)
+    
+    // Events are automatically persisted when published
+    eventbus.Publish(bus.EventBus, UserCreatedEvent{
+        UserID:   "123",
+        Username: "john_doe",
+        Email:    "john@example.com",
+    })
+    
+    // Replay events from a specific position
+    ctx := context.Background()
+    err := bus.Replay(ctx, 0, func(event *eventbus.StoredEvent) error {
+        fmt.Printf("Replaying event at position %d: %s\n", 
+            event.Position, event.Type)
+        return nil
+    })
+    if err != nil {
+        panic(err)
+    }
+}
+```
+
+#### Resumable Subscriptions
+
+Subscriptions can automatically resume from where they left off after a restart:
+
+```go
+func main() {
+    store := eventbus.NewMemoryStore()
+    bus := eventbus.NewPersistent(store)
+    
+    // Subscribe with automatic position tracking
+    err := eventbus.SubscribeWithReplay(bus, "email-sender", 
+        func(event EmailNotification) {
+            sendEmail(event)
+            // Position is automatically saved after successful handling
+        })
+    if err != nil {
+        panic(err)
+    }
+    
+    // After restart, the subscription resumes from last position
+    // No events are missed or duplicated!
+}
+```
+
+#### Custom Event Stores
+
+Implement the `EventStore` interface to use your own storage backend:
+
+```go
+type EventStore interface {
+    Save(ctx context.Context, event *StoredEvent) error
+    Load(ctx context.Context, from, to int64) ([]*StoredEvent, error)
+    GetPosition(ctx context.Context) (int64, error)
+    SaveSubscriptionPosition(ctx context.Context, subscriptionID string, position int64) error
+    LoadSubscriptionPosition(ctx context.Context, subscriptionID string) (int64, error)
+}
+
+// Example: PostgreSQL implementation
+type PostgresStore struct {
+    db *sql.DB
+}
+
+func (p *PostgresStore) Save(ctx context.Context, event *StoredEvent) error {
+    _, err := p.db.ExecContext(ctx, `
+        INSERT INTO events (position, type, data, timestamp)
+        VALUES ($1, $2, $3, $4)
+    `, event.Position, event.Type, event.Data, event.Timestamp)
+    return err
+}
+
+// ... implement other methods
+
+func main() {
+    db, _ := sql.Open("postgres", connectionString)
+    store := &PostgresStore{db: db}
+    bus := eventbus.NewPersistent(store)
+    // Use the bus normally - events are now persisted to PostgreSQL
+}
+```
+
+#### Use Cases for Persistence
+
+1. **Event Sourcing**: Store all state changes as events
+2. **Audit Logging**: Keep an immutable log of all actions
+3. **Message Recovery**: Resume processing after crashes
+4. **Event Replay**: Rebuild state or reprocess events
+5. **Debugging**: Analyze event flow in production
+6. **CQRS**: Separate write and read models with events
+7. **Integration**: Share events between services via storage
+
+#### The 100% Coverage Story
+
+The persistence module was initially 99.1% covered. That missing 0.9% was a JSON unmarshal error path that seemed impossible to trigger. By pushing for 100% coverage, we discovered that the test wasn't properly setting the bus position, which meant the error path was unreachable in production too! This could have led to silent failures where corrupted events would be skipped without any error reporting. **The lesson: that last 1% of coverage often reveals the most interesting bugs.**
 
 ## API Reference
 
