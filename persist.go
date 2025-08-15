@@ -35,46 +35,45 @@ type StoredEvent struct {
 	Timestamp time.Time       `json:"timestamp"`
 }
 
-// PersistentEventBus wraps EventBus with persistence
-type PersistentEventBus struct {
-	*EventBus
-	store    EventStore
-	position int64
-	mu       sync.RWMutex
+// WithStore enables persistence with the given store
+func WithStore(store EventStore) BusOption {
+	return func(bus *EventBus) {
+		bus.store = store
+		
+		// Load current position
+		ctx := context.Background()
+		if pos, err := store.GetPosition(ctx); err == nil {
+			bus.storePosition = pos
+		}
+		
+		// Chain the persistence hook with any existing hook
+		existingHook := bus.beforePublish
+		bus.beforePublish = func(eventType reflect.Type, event any) {
+			// Call existing hook first if any
+			if existingHook != nil {
+				existingHook(eventType, event)
+			}
+			// Then persist the event
+			bus.persistEvent(eventType, event)
+		}
+	}
 }
 
-// NewPersistent creates a new EventBus with persistence
-func NewPersistent(store EventStore) *PersistentEventBus {
-	bus := New()
-	peb := &PersistentEventBus{
-		EventBus: bus,
-		store:    store,
+// persistEvent saves an event to storage (only if store is configured)
+func (bus *EventBus) persistEvent(eventType reflect.Type, event any) {
+	if bus.store == nil {
+		return // No persistence configured
 	}
 	
-	// Load current position
-	ctx := context.Background()
-	if pos, err := store.GetPosition(ctx); err == nil {
-		peb.position = pos
-	}
-	
-	// Hook into publish events to persist them
-	bus.SetBeforePublishHook(func(eventType reflect.Type, event any) {
-		peb.persistEvent(eventType, event)
-	})
-	
-	return peb
-}
-
-// persistEvent saves an event to storage
-func (peb *PersistentEventBus) persistEvent(eventType reflect.Type, event any) {
-	peb.mu.Lock()
-	peb.position++
-	position := peb.position
-	peb.mu.Unlock()
+	bus.storeMu.Lock()
+	bus.storePosition++
+	position := bus.storePosition
+	bus.storeMu.Unlock()
 	
 	data, err := json.Marshal(event)
 	if err != nil {
-		return // Silent fail for now, could add error handler
+		// Silent fail for now, could add error handler option
+		return
 	}
 	
 	stored := &StoredEvent{
@@ -85,16 +84,20 @@ func (peb *PersistentEventBus) persistEvent(eventType reflect.Type, event any) {
 	}
 	
 	ctx := context.Background()
-	peb.store.Save(ctx, stored)
+	bus.store.Save(ctx, stored)
 }
 
 // Replay replays events from a position
-func (peb *PersistentEventBus) Replay(ctx context.Context, from int64, handler func(*StoredEvent) error) error {
-	peb.mu.RLock()
-	to := peb.position
-	peb.mu.RUnlock()
+func (bus *EventBus) Replay(ctx context.Context, from int64, handler func(*StoredEvent) error) error {
+	if bus.store == nil {
+		return fmt.Errorf("replay requires persistence (use WithStore option)")
+	}
 	
-	events, err := peb.store.Load(ctx, from, to)
+	bus.storeMu.RLock()
+	to := bus.storePosition
+	bus.storeMu.RUnlock()
+	
+	events, err := bus.store.Load(ctx, from, to)
 	if err != nil {
 		return fmt.Errorf("load events: %w", err)
 	}
@@ -108,21 +111,35 @@ func (peb *PersistentEventBus) Replay(ctx context.Context, from int64, handler f
 	return nil
 }
 
+// IsPersistent returns true if persistence is enabled
+func (bus *EventBus) IsPersistent() bool {
+	return bus.store != nil
+}
+
+// GetStore returns the event store (or nil if not persistent)
+func (bus *EventBus) GetStore() EventStore {
+	return bus.store
+}
+
 // SubscribeWithReplay subscribes and replays missed events
 func SubscribeWithReplay[T any](
-	peb *PersistentEventBus,
+	bus *EventBus,
 	subscriptionID string,
 	handler Handler[T],
 	opts ...SubscribeOption,
 ) error {
+	if bus.store == nil {
+		return fmt.Errorf("SubscribeWithReplay requires persistence (use WithStore option)")
+	}
+	
 	ctx := context.Background()
 	
 	// Load last position for this subscription
-	lastPos, _ := peb.store.LoadSubscriptionPosition(ctx, subscriptionID)
+	lastPos, _ := bus.store.LoadSubscriptionPosition(ctx, subscriptionID)
 	
 	// Replay missed events
 	var eventType = reflect.TypeOf((*T)(nil)).Elem()
-	err := peb.Replay(ctx, lastPos+1, func(stored *StoredEvent) error {
+	err := bus.Replay(ctx, lastPos+1, func(stored *StoredEvent) error {
 		// Only replay events of the correct type
 		if stored.Type != eventType.String() {
 			return nil
@@ -136,7 +153,7 @@ func SubscribeWithReplay[T any](
 		handler(event)
 		
 		// Update position
-		peb.store.SaveSubscriptionPosition(ctx, subscriptionID, stored.Position)
+		bus.store.SaveSubscriptionPosition(ctx, subscriptionID, stored.Position)
 		return nil
 	})
 	
@@ -149,14 +166,14 @@ func SubscribeWithReplay[T any](
 		handler(event)
 		
 		// Update position after handling
-		peb.mu.RLock()
-		pos := peb.position
-		peb.mu.RUnlock()
+		bus.storeMu.RLock()
+		pos := bus.storePosition
+		bus.storeMu.RUnlock()
 		
-		peb.store.SaveSubscriptionPosition(ctx, subscriptionID, pos)
+		bus.store.SaveSubscriptionPosition(ctx, subscriptionID, pos)
 	}
 	
-	return Subscribe(peb.EventBus, wrappedHandler, opts...)
+	return Subscribe(bus, wrappedHandler, opts...)
 }
 
 // MemoryStore is a simple in-memory implementation of EventStore

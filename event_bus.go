@@ -44,13 +44,28 @@ type EventBus struct {
 	afterPublish  PublishHook
 	mu            sync.RWMutex
 	wg            sync.WaitGroup
+	
+	// Optional persistence fields (nil if not using persistence)
+	store         EventStore
+	storePosition int64
+	storeMu       sync.RWMutex
 }
 
-// New creates a new EventBus
-func New() *EventBus {
-	return &EventBus{
+// BusOption configures an EventBus during creation
+type BusOption func(*EventBus)
+
+// New creates a new EventBus with optional configuration
+func New(opts ...BusOption) *EventBus {
+	bus := &EventBus{
 		handlers: make(map[reflect.Type][]*internalHandler),
 	}
+	
+	// Apply all options
+	for _, opt := range opts {
+		opt(bus)
+	}
+	
+	return bus
 }
 
 // Once configures the handler to be called only once

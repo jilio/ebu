@@ -19,15 +19,113 @@ type AnotherTestEvent struct {
 	Name string
 }
 
+// TestWithStoreHookChaining tests that WithStore chains with existing hooks
+func TestWithStoreHookChaining(t *testing.T) {
+	store := NewMemoryStore()
+	
+	// Create bus with existing hook
+	var hookCalled bool
+	bus := New()
+	bus.SetBeforePublishHook(func(eventType reflect.Type, event any) {
+		hookCalled = true
+	})
+	
+	// Apply WithStore after setting hook
+	WithStore(store)(bus)
+	
+	// Publish an event
+	Publish(bus, TestEvent{ID: 1, Value: "test"})
+	
+	// Both hook and persistence should work
+	if !hookCalled {
+		t.Error("Existing hook should still be called after WithStore")
+	}
+	
+	ctx := context.Background()
+	pos, _ := store.GetPosition(ctx)
+	if pos != 1 {
+		t.Error("Event should be persisted even with existing hook")
+	}
+}
+
+// TestBackwardCompatibility ensures New() still works without options
+func TestBackwardCompatibility(t *testing.T) {
+	// Should be able to create bus without any options (non-persistent)
+	bus := New()
+	
+	if bus == nil {
+		t.Fatal("Failed to create bus without options")
+	}
+	
+	if bus.IsPersistent() {
+		t.Error("Bus should not be persistent without WithStore option")
+	}
+	
+	// GetStore should return nil for non-persistent bus
+	if bus.GetStore() != nil {
+		t.Error("GetStore should return nil for non-persistent bus")
+	}
+	
+	// Should work normally for publishing and subscribing
+	var received bool
+	Subscribe(bus, func(e TestEvent) {
+		received = true
+	})
+	
+	Publish(bus, TestEvent{ID: 1, Value: "test"})
+	
+	if !received {
+		t.Error("Failed to receive event on non-persistent bus")
+	}
+}
+
+// TestNonPersistentReplay tests that Replay fails gracefully on non-persistent bus
+func TestNonPersistentReplay(t *testing.T) {
+	bus := New() // No persistence
+	
+	ctx := context.Background()
+	err := bus.Replay(ctx, 0, func(event *StoredEvent) error {
+		return nil
+	})
+	
+	if err == nil {
+		t.Error("Expected error when calling Replay on non-persistent bus")
+	}
+	
+	if !strings.Contains(err.Error(), "requires persistence") {
+		t.Errorf("Expected error message about persistence, got: %v", err)
+	}
+}
+
+// TestSubscribeWithReplayNoPersistence tests that SubscribeWithReplay fails without persistence
+func TestSubscribeWithReplayNoPersistence(t *testing.T) {
+	bus := New() // No persistence
+	
+	err := SubscribeWithReplay(bus, "test-sub", func(e TestEvent) {})
+	
+	if err == nil {
+		t.Error("Expected error when calling SubscribeWithReplay on non-persistent bus")
+	}
+	
+	if !strings.Contains(err.Error(), "requires persistence") {
+		t.Errorf("Expected error message about persistence, got: %v", err)
+	}
+}
+
 // TestPersistentEventBus tests basic persistence functionality
 func TestPersistentEventBus(t *testing.T) {
 	store := NewMemoryStore()
-	bus := NewPersistent(store)
+	bus := New(WithStore(store))
+	
+	// Test GetStore returns the correct store
+	if bus.GetStore() != store {
+		t.Error("GetStore should return the store passed to WithStore")
+	}
 	
 	// Publish some events
-	Publish(bus.EventBus, TestEvent{ID: 1, Value: "first"})
-	Publish(bus.EventBus, TestEvent{ID: 2, Value: "second"})
-	Publish(bus.EventBus, TestEvent{ID: 3, Value: "third"})
+	Publish(bus, TestEvent{ID: 1, Value: "first"})
+	Publish(bus, TestEvent{ID: 2, Value: "second"})
+	Publish(bus, TestEvent{ID: 3, Value: "third"})
 	
 	// Check position tracking
 	ctx := context.Background()
@@ -54,11 +152,11 @@ func TestPersistentEventBus(t *testing.T) {
 // TestReplay tests event replay functionality
 func TestReplay(t *testing.T) {
 	store := NewMemoryStore()
-	bus := NewPersistent(store)
+	bus := New(WithStore(store))
 	
 	// Publish events
 	for i := 1; i <= 5; i++ {
-		Publish(bus.EventBus, TestEvent{ID: i})
+		Publish(bus, TestEvent{ID: i})
 	}
 	
 	// Replay from position 2
@@ -90,7 +188,7 @@ func TestReplay(t *testing.T) {
 func TestReplayWithErrors(t *testing.T) {
 	// Test with store that fails Load
 	store := &errorStore{failLoad: true}
-	bus := NewPersistent(store)
+	bus := New(WithStore(store))
 	
 	ctx := context.Background()
 	err := bus.Replay(ctx, 1, func(event *StoredEvent) error {
@@ -103,11 +201,11 @@ func TestReplayWithErrors(t *testing.T) {
 	
 	// Test handler error during replay
 	store2 := NewMemoryStore()
-	bus2 := NewPersistent(store2)
+	bus2 := New(WithStore(store2))
 	
 	// Add some events
-	Publish(bus2.EventBus, TestEvent{ID: 1})
-	Publish(bus2.EventBus, TestEvent{ID: 2})
+	Publish(bus2, TestEvent{ID: 1})
+	Publish(bus2, TestEvent{ID: 2})
 	
 	// Replay with handler that errors on second event
 	callCount := 0
@@ -127,11 +225,11 @@ func TestReplayWithErrors(t *testing.T) {
 // TestSubscribeWithReplay tests subscription with replay
 func TestSubscribeWithReplay(t *testing.T) {
 	store := NewMemoryStore()
-	bus := NewPersistent(store)
+	bus := New(WithStore(store))
 	
 	// Publish some events before subscription
 	for i := 1; i <= 3; i++ {
-		Publish(bus.EventBus, TestEvent{ID: i})
+		Publish(bus, TestEvent{ID: i})
 	}
 	
 	// Subscribe with replay
@@ -150,8 +248,8 @@ func TestSubscribeWithReplay(t *testing.T) {
 	}
 	
 	// Publish more events
-	Publish(bus.EventBus, TestEvent{ID: 4})
-	Publish(bus.EventBus, TestEvent{ID: 5})
+	Publish(bus, TestEvent{ID: 4})
+	Publish(bus, TestEvent{ID: 5})
 	
 	// Give async handlers time to process
 	time.Sleep(10 * time.Millisecond)
@@ -176,11 +274,11 @@ func TestSubscribeWithReplay(t *testing.T) {
 // TestSubscribeWithReplayResume tests resuming from saved position
 func TestSubscribeWithReplayResume(t *testing.T) {
 	store := NewMemoryStore()
-	bus := NewPersistent(store)
+	bus := New(WithStore(store))
 	
 	// Publish initial events
 	for i := 1; i <= 3; i++ {
-		Publish(bus.EventBus, TestEvent{ID: i})
+		Publish(bus, TestEvent{ID: i})
 	}
 	
 	// First subscription
@@ -195,14 +293,14 @@ func TestSubscribeWithReplayResume(t *testing.T) {
 	
 	// Publish more events
 	for i := 4; i <= 6; i++ {
-		Publish(bus.EventBus, TestEvent{ID: i})
+		Publish(bus, TestEvent{ID: i})
 	}
 	
 	// Wait for processing
 	time.Sleep(10 * time.Millisecond)
 	
 	// Create new bus with same store (simulating restart)
-	bus2 := NewPersistent(store)
+	bus2 := New(WithStore(store))
 	
 	// Resume subscription - should only get new events
 	var received2 []int
@@ -216,7 +314,7 @@ func TestSubscribeWithReplayResume(t *testing.T) {
 	}
 	
 	// Publish new event
-	Publish(bus2.EventBus, TestEvent{ID: 7})
+	Publish(bus2, TestEvent{ID: 7})
 	
 	// Wait for processing
 	time.Sleep(10 * time.Millisecond)
@@ -230,10 +328,10 @@ func TestSubscribeWithReplayResume(t *testing.T) {
 // TestSubscribeWithReplayUnmarshalError tests unmarshal error handling
 func TestSubscribeWithReplayUnmarshalError(t *testing.T) {
 	store := NewMemoryStore()
-	bus := NewPersistent(store)
+	bus := New(WithStore(store))
 	
 	// First publish a valid event to set the position
-	Publish(bus.EventBus, TestEvent{ID: 1, Value: "valid"})
+	Publish(bus, TestEvent{ID: 1, Value: "valid"})
 	
 	// Now manually insert an event with invalid JSON that will cause unmarshal to fail
 	ctx := context.Background()
@@ -248,9 +346,9 @@ func TestSubscribeWithReplayUnmarshalError(t *testing.T) {
 	})
 	
 	// Update the bus position manually since we bypassed Publish
-	bus.mu.Lock()
-	bus.position = 2
-	bus.mu.Unlock()
+	bus.storeMu.Lock()
+	bus.storePosition = 2
+	bus.storeMu.Unlock()
 	
 	// Subscribe with replay - should fail due to unmarshal error
 	var received []TestEvent
@@ -274,14 +372,14 @@ func TestSubscribeWithReplayUnmarshalError(t *testing.T) {
 // TestSubscribeWithReplayDifferentEventTypes tests filtering by event type
 func TestSubscribeWithReplayDifferentEventTypes(t *testing.T) {
 	store := NewMemoryStore()
-	bus := NewPersistent(store)
+	bus := New(WithStore(store))
 	
 	// Publish mixed event types
-	Publish(bus.EventBus, TestEvent{ID: 1})
-	Publish(bus.EventBus, AnotherTestEvent{Name: "ignored"})
-	Publish(bus.EventBus, TestEvent{ID: 2})
-	Publish(bus.EventBus, AnotherTestEvent{Name: "also ignored"})
-	Publish(bus.EventBus, TestEvent{ID: 3})
+	Publish(bus, TestEvent{ID: 1})
+	Publish(bus, AnotherTestEvent{Name: "ignored"})
+	Publish(bus, TestEvent{ID: 2})
+	Publish(bus, AnotherTestEvent{Name: "also ignored"})
+	Publish(bus, TestEvent{ID: 3})
 	
 	// Subscribe to TestEvent only
 	var received []int
@@ -376,7 +474,7 @@ func TestMemoryStore(t *testing.T) {
 // TestPersistentBusWithFailingStore tests with store that fails GetPosition
 func TestPersistentBusWithFailingStore(t *testing.T) {
 	store := &errorStore{}
-	bus := NewPersistent(store)
+	bus := New(WithStore(store))
 	
 	// Should still create bus even if GetPosition fails
 	if bus == nil {
@@ -384,26 +482,46 @@ func TestPersistentBusWithFailingStore(t *testing.T) {
 	}
 	
 	// Position should be 0 when GetPosition fails
-	if bus.position != 0 {
-		t.Errorf("Expected position 0 when GetPosition fails, got %d", bus.position)
+	if bus.storePosition != 0 {
+		t.Errorf("Expected position 0 when GetPosition fails, got %d", bus.storePosition)
+	}
+}
+
+// TestPersistEventWithNilStore tests defensive check in persistEvent
+func TestPersistEventWithNilStore(t *testing.T) {
+	// Create bus with store first to set up the hook
+	store := NewMemoryStore()
+	bus := New(WithStore(store))
+	
+	// Now manually set store to nil to test defensive check
+	// This simulates an edge case where store becomes nil after initialization
+	bus.store = nil
+	
+	// Publish an event - the hook will call persistEvent with nil store
+	Publish(bus, TestEvent{ID: 1})
+	
+	// Should not panic, and position should not change
+	if bus.storePosition != 0 {
+		t.Error("Expected position to remain 0 when store is nil")
 	}
 }
 
 // TestPersistEventWithUnmarshalableData tests persist with unmarshalable data
 func TestPersistEventWithUnmarshalableData(t *testing.T) {
 	store := NewMemoryStore()
-	bus := NewPersistent(store)
+	bus := New(WithStore(store))
 	
-	// Create a type that causes marshal errors
-	type CyclicEvent struct {
-		Self *CyclicEvent
+	// Create a type that truly cannot be marshaled to JSON
+	type UnmarshalableEvent struct {
+		Ch chan int // Channels cannot be marshaled to JSON
 	}
 	
-	event := &CyclicEvent{}
-	event.Self = event // Create cycle
+	event := UnmarshalableEvent{
+		Ch: make(chan int),
+	}
 	
 	// This should not panic, just silently fail
-	Publish(bus.EventBus, event)
+	Publish(bus, event)
 	
 	// Check that no event was stored
 	ctx := context.Background()

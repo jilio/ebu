@@ -453,6 +453,7 @@ ebu includes built-in support for event persistence, enabling event sourcing pat
 ```go
 import (
     "context"
+    "fmt"
     
     eventbus "github.com/jilio/ebu"
 )
@@ -466,16 +467,21 @@ type UserCreatedEvent struct {
 func main() {
     // Create a persistent event bus with in-memory store
     store := eventbus.NewMemoryStore()
-    bus := eventbus.NewPersistent(store)
+    bus := eventbus.New(eventbus.WithStore(store))
     
-    // Events are automatically persisted when published
-    eventbus.Publish(bus.EventBus, UserCreatedEvent{
+    // Use the bus normally - persistence is transparently handled
+    eventbus.Publish(bus, UserCreatedEvent{
         UserID:   "123",
         Username: "john_doe",
         Email:    "john@example.com",
     })
     
-    // Replay events from a specific position
+    // Regular subscriptions work as usual
+    eventbus.Subscribe(bus, func(event UserCreatedEvent) {
+        fmt.Printf("User created: %s\n", event.Username)
+    })
+    
+    // Replay functionality uses bus directly
     ctx := context.Background()
     err := bus.Replay(ctx, 0, func(event *eventbus.StoredEvent) error {
         fmt.Printf("Replaying event at position %d: %s\n", 
@@ -495,7 +501,7 @@ Subscriptions can automatically resume from where they left off after a restart:
 ```go
 func main() {
     store := eventbus.NewMemoryStore()
-    bus := eventbus.NewPersistent(store)
+    bus := eventbus.New(eventbus.WithStore(store))
     
     // Subscribe with automatic position tracking
     err := eventbus.SubscribeWithReplay(bus, "email-sender", 
@@ -543,7 +549,7 @@ func (p *PostgresStore) Save(ctx context.Context, event *StoredEvent) error {
 func main() {
     db, _ := sql.Open("postgres", connectionString)
     store := &PostgresStore{db: db}
-    bus := eventbus.NewPersistent(store)
+    bus := eventbus.New(eventbus.WithStore(store))
     // Use the bus normally - events are now persisted to PostgreSQL
 }
 ```
