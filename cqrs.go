@@ -2,6 +2,7 @@ package eventbus
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -74,6 +75,44 @@ func (a *BaseAggregate) RaiseEvent(event any) {
 	defer a.mu.Unlock()
 	a.uncommittedEvents = append(a.uncommittedEvents, event)
 	a.Version++
+}
+
+// CreateSnapshot creates a JSON snapshot of the aggregate state
+// Subclasses should override this to include their specific fields
+func (a *BaseAggregate) CreateSnapshot() ([]byte, error) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	// Create a snapshot with just the base fields
+	// Derived aggregates should override to include their state
+	snapshot := map[string]interface{}{
+		"id":      a.ID,
+		"version": a.Version,
+	}
+
+	return json.Marshal(snapshot)
+}
+
+// RestoreFromSnapshot restores aggregate state from a JSON snapshot
+// Subclasses should override this to restore their specific fields
+func (a *BaseAggregate) RestoreFromSnapshot(data []byte, version int64) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	var snapshot map[string]interface{}
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		return fmt.Errorf("failed to unmarshal snapshot: %w", err)
+	}
+
+	// Restore base fields
+	if id, ok := snapshot["id"].(string); ok {
+		a.ID = id
+	}
+
+	a.Version = version
+	a.uncommittedEvents = nil
+
+	return nil
 }
 
 // Projection represents a read model that is updated by events

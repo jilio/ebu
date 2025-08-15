@@ -196,6 +196,8 @@ func (m *MemoryStore) Save(ctx context.Context, event *StoredEvent) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// Set position for the event
+	event.Position = int64(len(m.events)) + 1
 	m.events = append(m.events, event)
 	return nil
 }
@@ -207,7 +209,7 @@ func (m *MemoryStore) Load(ctx context.Context, from, to int64) ([]*StoredEvent,
 
 	var result []*StoredEvent
 	for _, event := range m.events {
-		if event.Position >= from && event.Position <= to {
+		if event.Position >= from && (to == -1 || event.Position <= to) {
 			result = append(result, event)
 		}
 	}

@@ -49,6 +49,9 @@ type EventBus struct {
 	store         EventStore
 	storePosition int64
 	storeMu       sync.RWMutex
+
+	// Extensions for additional features (snapshots, etc.)
+	extensions map[string]interface{}
 }
 
 // BusOption configures an EventBus during creation

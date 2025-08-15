@@ -780,6 +780,197 @@ func LoadAggregate(id string, store eventbus.EventStore) (*AccountAggregate, err
 - **Simplicity**: Clear separation of concerns
 - **Testing**: Easy to test business logic in isolation
 
+### Aggregate Snapshots
+
+Snapshots optimize event-sourced aggregates by storing their state at specific points, reducing the number of events needed to rebuild an aggregate.
+
+#### Why Use Snapshots?
+
+As event streams grow, rebuilding aggregates from thousands of events becomes slow. Snapshots solve this by:
+- **Reducing load time** - Load state from latest snapshot + recent events only
+- **Improving scalability** - Keep load times constant regardless of history length
+- **Enabling archival** - Archive old events while keeping snapshots for fast access
+
+#### Basic Snapshot Example
+
+```go
+package main
+
+import (
+    "context"
+    
+    eventbus "github.com/jilio/ebu"
+)
+
+// Configure event bus with snapshots
+func setupWithSnapshots() *eventbus.EventBus {
+    eventStore := eventbus.NewMemoryStore()
+    snapshotStore := eventbus.NewMemorySnapshotStore()
+    
+    // Create bus with persistence and snapshots
+    bus := eventbus.New(
+        eventbus.WithStore(eventStore),
+        eventbus.WithSnapshots(snapshotStore, eventbus.EveryNEvents(100)),
+    )
+    
+    return bus
+}
+
+// Custom aggregate with snapshot support
+type BankAccount struct {
+    eventbus.BaseAggregate
+    Balance float64 `json:"balance"`
+    Owner   string  `json:"owner"`
+}
+
+// Override CreateSnapshot to include custom fields
+func (a *BankAccount) CreateSnapshot() ([]byte, error) {
+    a.mu.RLock()
+    defer a.mu.RUnlock()
+    
+    return json.Marshal(map[string]interface{}{
+        "id":      a.ID,
+        "version": a.Version,
+        "balance": a.Balance,
+        "owner":   a.Owner,
+    })
+}
+
+// Override RestoreFromSnapshot to restore custom fields
+func (a *BankAccount) RestoreFromSnapshot(data []byte, version int64) error {
+    a.mu.Lock()
+    defer a.mu.Unlock()
+    
+    var snapshot map[string]interface{}
+    if err := json.Unmarshal(data, &snapshot); err != nil {
+        return err
+    }
+    
+    // Restore fields
+    if id, ok := snapshot["id"].(string); ok {
+        a.ID = id
+    }
+    if balance, ok := snapshot["balance"].(float64); ok {
+        a.Balance = balance
+    }
+    if owner, ok := snapshot["owner"].(string); ok {
+        a.Owner = owner
+    }
+    
+    a.Version = version
+    return nil
+}
+
+// Load aggregate with snapshot support
+func loadAccount(ctx context.Context, accountID string) (*BankAccount, error) {
+    eventStore := getEventStore() // Your event store
+    snapshotStore := getSnapshotStore() // Your snapshot store
+    
+    return eventbus.LoadAggregate(
+        ctx,
+        accountID,
+        func() eventbus.SnapshottableAggregate {
+            return &BankAccount{}
+        },
+        eventStore,
+        snapshotStore,
+    )
+}
+```
+
+#### Snapshot Policies
+
+Control when snapshots are created using built-in or custom policies:
+
+```go
+// Snapshot every 100 events
+policy1 := eventbus.EveryNEvents(100)
+
+// Snapshot every hour
+policy2 := eventbus.TimeInterval(time.Hour)
+
+// Combine multiple policies (snapshot when ANY condition is met)
+policy3 := eventbus.Combined(
+    eventbus.EveryNEvents(100),
+    eventbus.TimeInterval(time.Hour),
+)
+
+// Never snapshot (default if no policy specified)
+policy4 := eventbus.Never()
+
+// Custom policy
+customPolicy := eventbus.PolicyFunc(func(agg eventbus.Aggregate, lastVersion int64, lastTime time.Time) bool {
+    // Custom logic here
+    return agg.GetVersion() > 1000 && time.Since(lastTime) > 30*time.Minute
+})
+
+// Apply policy when creating bus
+bus := eventbus.New(
+    eventbus.WithStore(eventStore),
+    eventbus.WithSnapshots(snapshotStore, policy1),
+)
+```
+
+#### Implementing Custom Snapshot Stores
+
+Create custom snapshot stores for different backends:
+
+```go
+type PostgresSnapshotStore struct {
+    db *sql.DB
+}
+
+func (s *PostgresSnapshotStore) Save(ctx context.Context, snapshot *eventbus.Snapshot) error {
+    _, err := s.db.ExecContext(ctx, `
+        INSERT INTO snapshots (aggregate_id, aggregate_type, version, data, timestamp)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (aggregate_id) 
+        DO UPDATE SET version = $3, data = $4, timestamp = $5
+    `, snapshot.AggregateID, snapshot.AggregateType, 
+       snapshot.Version, snapshot.Data, snapshot.Timestamp)
+    return err
+}
+
+func (s *PostgresSnapshotStore) Load(ctx context.Context, aggregateID string) (*eventbus.Snapshot, error) {
+    var snapshot eventbus.Snapshot
+    err := s.db.QueryRowContext(ctx, `
+        SELECT aggregate_id, aggregate_type, version, data, timestamp
+        FROM snapshots WHERE aggregate_id = $1
+    `, aggregateID).Scan(
+        &snapshot.AggregateID,
+        &snapshot.AggregateType,
+        &snapshot.Version,
+        &snapshot.Data,
+        &snapshot.Timestamp,
+    )
+    if err == sql.ErrNoRows {
+        return nil, fmt.Errorf("snapshot not found")
+    }
+    return &snapshot, err
+}
+
+func (s *PostgresSnapshotStore) Delete(ctx context.Context, aggregateID string) error {
+    _, err := s.db.ExecContext(ctx, 
+        "DELETE FROM snapshots WHERE aggregate_id = $1", aggregateID)
+    return err
+}
+```
+
+#### Snapshot Best Practices
+
+1. **Choose appropriate intervals** - Balance between snapshot frequency and storage costs
+2. **Version compatibility** - Handle schema changes between snapshot versions
+3. **Async snapshotting** - Create snapshots asynchronously to avoid blocking writes
+4. **Snapshot validation** - Verify snapshot integrity before use
+5. **Fallback strategy** - Always be able to rebuild from events if snapshots fail
+
+#### Use Cases
+
+- **High-volume aggregates** - Shopping carts, user sessions, game states
+- **Long-lived aggregates** - User accounts, projects, organizations
+- **Performance-critical reads** - Real-time dashboards, APIs
+- **Audit requirements** - Keep full history while maintaining performance
+
 ## API Reference
 
 ### Core Functions
