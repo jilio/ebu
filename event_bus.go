@@ -315,6 +315,12 @@ func callHandlerWithContext[T any](h *internalHandler, ctx context.Context, even
 	if h.acceptsContext {
 		if fn, ok := h.handler.(ContextHandler[T]); ok {
 			fn(ctx, event)
+		} else if fn, ok := h.handler.(func(context.Context, any)); ok {
+			// Handle generic context handler (used by CQRS projections)
+			fn(ctx, event)
+		} else if fn, ok := h.handler.(func(context.Context, any) error); ok {
+			// Handle generic context handler with error (used by CQRS projections)
+			_ = fn(ctx, event)
 		}
 	} else {
 		if fn, ok := h.handler.(Handler[T]); ok {
