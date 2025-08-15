@@ -13,16 +13,16 @@ import (
 type EventStore interface {
 	// Save an event to storage
 	Save(ctx context.Context, event *StoredEvent) error
-	
+
 	// Load events from storage within a range
 	Load(ctx context.Context, from, to int64) ([]*StoredEvent, error)
-	
+
 	// Get the current position (highest event number)
 	GetPosition(ctx context.Context) (int64, error)
-	
+
 	// Save subscription position for resumable subscriptions
 	SaveSubscriptionPosition(ctx context.Context, subscriptionID string, position int64) error
-	
+
 	// Load subscription position
 	LoadSubscriptionPosition(ctx context.Context, subscriptionID string) (int64, error)
 }
@@ -39,13 +39,13 @@ type StoredEvent struct {
 func WithStore(store EventStore) BusOption {
 	return func(bus *EventBus) {
 		bus.store = store
-		
+
 		// Load current position
 		ctx := context.Background()
 		if pos, err := store.GetPosition(ctx); err == nil {
 			bus.storePosition = pos
 		}
-		
+
 		// Chain the persistence hook with any existing hook
 		existingHook := bus.beforePublish
 		bus.beforePublish = func(eventType reflect.Type, event any) {
@@ -64,25 +64,25 @@ func (bus *EventBus) persistEvent(eventType reflect.Type, event any) {
 	if bus.store == nil {
 		return // No persistence configured
 	}
-	
+
 	bus.storeMu.Lock()
 	bus.storePosition++
 	position := bus.storePosition
 	bus.storeMu.Unlock()
-	
+
 	data, err := json.Marshal(event)
 	if err != nil {
 		// Silent fail for now, could add error handler option
 		return
 	}
-	
+
 	stored := &StoredEvent{
 		Position:  position,
 		Type:      eventType.String(),
 		Data:      data,
 		Timestamp: time.Now(),
 	}
-	
+
 	ctx := context.Background()
 	bus.store.Save(ctx, stored)
 }
@@ -92,22 +92,22 @@ func (bus *EventBus) Replay(ctx context.Context, from int64, handler func(*Store
 	if bus.store == nil {
 		return fmt.Errorf("replay requires persistence (use WithStore option)")
 	}
-	
+
 	bus.storeMu.RLock()
 	to := bus.storePosition
 	bus.storeMu.RUnlock()
-	
+
 	events, err := bus.store.Load(ctx, from, to)
 	if err != nil {
 		return fmt.Errorf("load events: %w", err)
 	}
-	
+
 	for _, event := range events {
 		if err := handler(event); err != nil {
 			return fmt.Errorf("handle event at position %d: %w", event.Position, err)
 		}
 	}
-	
+
 	return nil
 }
 
@@ -131,12 +131,12 @@ func SubscribeWithReplay[T any](
 	if bus.store == nil {
 		return fmt.Errorf("SubscribeWithReplay requires persistence (use WithStore option)")
 	}
-	
+
 	ctx := context.Background()
-	
+
 	// Load last position for this subscription
 	lastPos, _ := bus.store.LoadSubscriptionPosition(ctx, subscriptionID)
-	
+
 	// Replay missed events
 	var eventType = reflect.TypeOf((*T)(nil)).Elem()
 	err := bus.Replay(ctx, lastPos+1, func(stored *StoredEvent) error {
@@ -144,35 +144,35 @@ func SubscribeWithReplay[T any](
 		if stored.Type != eventType.String() {
 			return nil
 		}
-		
+
 		var event T
 		if err := json.Unmarshal(stored.Data, &event); err != nil {
 			return err
 		}
-		
+
 		handler(event)
-		
+
 		// Update position
 		bus.store.SaveSubscriptionPosition(ctx, subscriptionID, stored.Position)
 		return nil
 	})
-	
+
 	if err != nil {
 		return fmt.Errorf("replay events: %w", err)
 	}
-	
+
 	// Subscribe for future events with position tracking
 	wrappedHandler := func(event T) {
 		handler(event)
-		
+
 		// Update position after handling
 		bus.storeMu.RLock()
 		pos := bus.storePosition
 		bus.storeMu.RUnlock()
-		
+
 		bus.store.SaveSubscriptionPosition(ctx, subscriptionID, pos)
 	}
-	
+
 	return Subscribe(bus, wrappedHandler, opts...)
 }
 
@@ -195,7 +195,7 @@ func NewMemoryStore() *MemoryStore {
 func (m *MemoryStore) Save(ctx context.Context, event *StoredEvent) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	
+
 	m.events = append(m.events, event)
 	return nil
 }
@@ -204,14 +204,14 @@ func (m *MemoryStore) Save(ctx context.Context, event *StoredEvent) error {
 func (m *MemoryStore) Load(ctx context.Context, from, to int64) ([]*StoredEvent, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	
+
 	var result []*StoredEvent
 	for _, event := range m.events {
 		if event.Position >= from && event.Position <= to {
 			result = append(result, event)
 		}
 	}
-	
+
 	return result, nil
 }
 
@@ -219,11 +219,11 @@ func (m *MemoryStore) Load(ctx context.Context, from, to int64) ([]*StoredEvent,
 func (m *MemoryStore) GetPosition(ctx context.Context) (int64, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	
+
 	if len(m.events) == 0 {
 		return 0, nil
 	}
-	
+
 	return m.events[len(m.events)-1].Position, nil
 }
 
@@ -231,7 +231,7 @@ func (m *MemoryStore) GetPosition(ctx context.Context) (int64, error) {
 func (m *MemoryStore) SaveSubscriptionPosition(ctx context.Context, subscriptionID string, position int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	
+
 	m.subscriptions[subscriptionID] = position
 	return nil
 }
@@ -240,11 +240,11 @@ func (m *MemoryStore) SaveSubscriptionPosition(ctx context.Context, subscription
 func (m *MemoryStore) LoadSubscriptionPosition(ctx context.Context, subscriptionID string) (int64, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	
+
 	pos, ok := m.subscriptions[subscriptionID]
 	if !ok {
 		return 0, nil
 	}
-	
+
 	return pos, nil
 }

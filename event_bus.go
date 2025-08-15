@@ -44,7 +44,7 @@ type EventBus struct {
 	afterPublish  PublishHook
 	mu            sync.RWMutex
 	wg            sync.WaitGroup
-	
+
 	// Optional persistence fields (nil if not using persistence)
 	store         EventStore
 	storePosition int64
@@ -59,12 +59,12 @@ func New(opts ...BusOption) *EventBus {
 	bus := &EventBus{
 		handlers: make(map[reflect.Type][]*internalHandler),
 	}
-	
+
 	// Apply all options
 	for _, opt := range opts {
 		opt(bus)
 	}
-	
+
 	return bus
 }
 
