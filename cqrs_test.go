@@ -3,6 +3,7 @@ package eventbus
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 )
@@ -740,5 +741,319 @@ func TestRestoreSnapshotWithInvalidJSON(t *testing.T) {
 	err := agg.RestoreFromSnapshot(invalidJSON, 1)
 	if err == nil {
 		t.Error("Expected error when restoring from invalid JSON")
+	}
+}
+
+func TestBaseAggregateApplyWithoutFunc(t *testing.T) {
+	// Test Apply without ApplyFunc set
+	agg := &BaseAggregate[AccountEvent]{
+		ID:      "test-123",
+		Version: 0,
+	}
+	
+	// Apply should work without ApplyFunc
+	err := agg.Apply(AccountCreated{AccountID: "test", Balance: 100})
+	if err != nil {
+		t.Errorf("Expected no error from Apply without ApplyFunc, got: %v", err)
+	}
+	
+	if agg.Version != 1 {
+		t.Errorf("Expected version 1 after Apply, got %d", agg.Version)
+	}
+}
+
+func TestProjectionManagerHandleEventWithError(t *testing.T) {
+	bus := New()
+	pm := NewProjectionManager[AccountEvent](bus)
+	
+	// Create a projection that returns an error
+	projection := &errorProjection{}
+	
+	err := pm.Register(projection)
+	if err != nil {
+		t.Fatalf("Failed to register projection: %v", err)
+	}
+	
+	// HandleEvent should return the error from the projection
+	ctx := context.Background()
+	err = pm.HandleEvent(ctx, AccountCreated{AccountID: "test", Balance: 100})
+	if err == nil {
+		t.Error("Expected error from HandleEvent when projection returns error")
+	}
+}
+
+// errorProjection is a test projection that returns errors
+type errorProjection struct{}
+
+func (p *errorProjection) GetID() string {
+	return "error-projection"
+}
+
+func (p *errorProjection) Handle(ctx context.Context, event AccountEvent) error {
+	return errors.New("projection error")
+}
+
+func TestMemoryAggregateStoreLoadWithHistoryError(t *testing.T) {
+	// Create aggregate type that fails LoadFromHistory
+	factory := func(id string) *errorAggregate {
+		return &errorAggregate{
+			BaseAggregate: BaseAggregate[AccountEvent]{
+				ID: id,
+			},
+		}
+	}
+	
+	store := NewMemoryAggregateStore(factory)
+	
+	// Save some events
+	ctx := context.Background()
+	
+	// Store events directly
+	store.mu.Lock()
+	store.events["test-1"] = []AccountEvent{
+		AccountCreated{AccountID: "test-1", Balance: 100},
+	}
+	store.mu.Unlock()
+	
+	// Load should fail due to LoadFromHistory error
+	_, err := store.Load(ctx, "test-1")
+	if err == nil {
+		t.Error("Expected error from Load when LoadFromHistory fails")
+	}
+}
+
+type errorAggregate struct {
+	BaseAggregate[AccountEvent]
+}
+
+func (a *errorAggregate) LoadFromHistory(events []AccountEvent) error {
+	return errors.New("load from history error")
+}
+
+func TestAggregateCommandHandlerWithExistingAggregate(t *testing.T) {
+	factory := func(id string) *AccountAggregate {
+		return NewAccountAggregate(id)
+	}
+	
+	store := NewMemoryAggregateStore(factory)
+	
+	// Pre-create and save an aggregate
+	ctx := context.Background()
+	agg := factory("test-account")
+	_ = agg.CreateAccount("test-account", 1000)
+	
+	err := store.Save(ctx, agg)
+	if err != nil {
+		t.Fatalf("Failed to save aggregate: %v", err)
+	}
+	
+	// Create handler that deposits money
+	handler := AggregateCommandHandler[DepositMoneyCommand](
+		store,
+		factory,
+		func(ctx context.Context, agg *AccountAggregate, cmd DepositMoneyCommand) error {
+			return agg.Deposit(cmd.Amount)
+		},
+	)
+	
+	// Execute command on existing aggregate
+	cmd := DepositMoneyCommand{
+		AccountID: "test-account",
+		Amount:    500,
+	}
+	
+	events, err := handler(ctx, cmd)
+	if err != nil {
+		t.Fatalf("Failed to execute command: %v", err)
+	}
+	
+	if len(events) != 1 {
+		t.Errorf("Expected 1 event, got %d", len(events))
+	}
+	
+	// Verify aggregate was loaded from store
+	loadedAgg, _ := store.Load(ctx, "test-account")
+	if loadedAgg.Balance != 1500 {
+		t.Errorf("Expected balance 1500, got %f", loadedAgg.Balance)
+	}
+}
+
+func TestCallHandlerWithContextNonContextHandler(t *testing.T) {
+	// This tests the non-context handler path in callHandlerWithContext
+	bus := New()
+	
+	called := false
+	handler := func(e TestEvent) {
+		called = true
+	}
+	
+	// Subscribe without context
+	Subscribe(bus, handler)
+	
+	// Publish event
+	Publish(bus, TestEvent{ID: 1, Value: "test"})
+	
+	// Wait for handlers
+	bus.WaitAsync()
+	
+	if !called {
+		t.Error("Non-context handler was not called")
+	}
+}
+
+func TestAggregateCommandHandlerErrors(t *testing.T) {
+	factory := func(id string) *AccountAggregate {
+		return NewAccountAggregate(id)
+	}
+	
+	store := NewMemoryAggregateStore(factory)
+	ctx := context.Background()
+	
+	// Test 1: Command handle returns error
+	handler := AggregateCommandHandler[CreateAccountCommand](
+		store,
+		factory,
+		func(ctx context.Context, agg *AccountAggregate, cmd CreateAccountCommand) error {
+			return errors.New("handle error")
+		},
+	)
+	
+	cmd := CreateAccountCommand{
+		AccountID:      "test-account",
+		InitialBalance: 1000,
+	}
+	
+	_, err := handler(ctx, cmd)
+	if err == nil || err.Error() != "handle error" {
+		t.Errorf("Expected handle error, got %v", err)
+	}
+	
+	// Test 2: Store save returns error
+	// Create a store that fails on save
+	failingStore := &failingSaveStore{
+		MemoryAggregateStore: store,
+	}
+	
+	handler2 := AggregateCommandHandler[CreateAccountCommand](
+		failingStore,
+		factory,
+		func(ctx context.Context, agg *AccountAggregate, cmd CreateAccountCommand) error {
+			return agg.CreateAccount(cmd.AccountID, cmd.InitialBalance)
+		},
+	)
+	
+	_, err = handler2(ctx, cmd)
+	if err == nil || err.Error() != "save error" {
+		t.Errorf("Expected save error, got %v", err)
+	}
+	
+	// Test 3: Store load returns error but aggregate creation succeeds
+	// Use a store that always fails on Load to test aggregate creation
+	failingLoadStore := &failingLoadStore{
+		MemoryAggregateStore: store,
+	}
+	
+	handler3 := AggregateCommandHandler[CreateAccountCommand](
+		failingLoadStore,
+		factory,
+		func(ctx context.Context, agg *AccountAggregate, cmd CreateAccountCommand) error {
+			return agg.CreateAccount(cmd.AccountID, cmd.InitialBalance)
+		},
+	)
+	
+	cmd2 := CreateAccountCommand{
+		AccountID:      "new-account",
+		InitialBalance: 500,
+	}
+	
+	events, err := handler3(ctx, cmd2)
+	if err != nil {
+		t.Fatalf("Expected successful creation for new aggregate, got %v", err)
+	}
+	
+	if len(events) != 1 {
+		t.Errorf("Expected 1 event, got %d", len(events))
+	}
+}
+
+type failingSaveStore struct {
+	*MemoryAggregateStore[*AccountAggregate, AccountEvent]
+}
+
+func (s *failingSaveStore) Save(ctx context.Context, agg *AccountAggregate) error {
+	return errors.New("save error")
+}
+
+type failingLoadStore struct {
+	*MemoryAggregateStore[*AccountAggregate, AccountEvent]
+}
+
+func (s *failingLoadStore) Load(ctx context.Context, id string) (*AccountAggregate, error) {
+	return nil, errors.New("load error")
+}
+
+func (s *failingLoadStore) Save(ctx context.Context, agg *AccountAggregate) error {
+	// Allow save to succeed for this test
+	return nil
+}
+
+func TestCallHandlerWithContextGenericHandlers(t *testing.T) {
+	bus := New()
+	
+	// Test generic context handler without error
+	called1 := false
+	handler1 := func(ctx context.Context, event any) {
+		called1 = true
+	}
+	
+	// Register handler directly using internalHandler
+	bus.mu.Lock()
+	eventType := reflect.TypeOf(AccountCreated{})
+	if _, exists := bus.handlers[eventType]; !exists {
+		bus.handlers[eventType] = []*internalHandler{}
+	}
+	bus.handlers[eventType] = append(bus.handlers[eventType], &internalHandler{
+		handler:        handler1,
+		acceptsContext: true,
+		handlerType:    reflect.TypeOf(handler1),
+		async:          false,
+	})
+	bus.mu.Unlock()
+	
+	// Publish event
+	Publish(bus, AccountCreated{AccountID: "test", Balance: 100})
+	bus.WaitAsync()
+	
+	if !called1 {
+		t.Error("Generic context handler was not called")
+	}
+	
+	// Test generic context handler with error
+	called2 := false
+	handler2 := func(ctx context.Context, event any) error {
+		called2 = true
+		return nil
+	}
+	
+	// Register handler directly using internalHandler
+	bus.mu.Lock()
+	eventType2 := reflect.TypeOf(MoneyDeposited{})
+	if _, exists := bus.handlers[eventType2]; !exists {
+		bus.handlers[eventType2] = []*internalHandler{}
+	}
+	bus.handlers[eventType2] = append(bus.handlers[eventType2], &internalHandler{
+		handler:        handler2,
+		acceptsContext: true,
+		handlerType:    reflect.TypeOf(handler2),
+		async:          false,
+	})
+	bus.mu.Unlock()
+	
+	// Publish event
+	Publish(bus, MoneyDeposited{AccountID: "test", Amount: 50})
+	bus.WaitAsync()
+	
+	if !called2 {
+		t.Error("Generic context handler with error was not called")
 	}
 }
