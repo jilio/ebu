@@ -135,6 +135,11 @@ func (pb *ProjectionBuilder) Register(projection Projection, eventTypes ...any) 
 }
 
 func (pb *ProjectionBuilder) subscribeToEvent(eventType reflect.Type, handler func(context.Context, any) error) error {
+	// Check for nil bus to return an error instead of panicking
+	if pb.bus == nil {
+		return errors.New("bus is nil")
+	}
+
 	// Create a wrapper that implements ContextHandler for the specific type
 	wrapperFunc := func(ctx context.Context, event any) {
 		_ = handler(ctx, event) // Ignore error for now in async handlers
@@ -307,4 +312,3 @@ func (c *CQRS) GetProjection(id string) (Projection, bool) {
 func (c *CQRS) GetBus() *EventBus {
 	return c.bus
 }
-

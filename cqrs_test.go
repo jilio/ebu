@@ -3,6 +3,7 @@ package eventbus
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 )
@@ -634,3 +635,100 @@ func TestCQRSWithErrors(t *testing.T) {
 	}
 }
 
+// Test pointer event types for projections
+type PointerEvent struct {
+	ID    string
+	Value int
+}
+
+func TestProjectionWithPointerEventTypes(t *testing.T) {
+	bus := New()
+	pb := NewProjectionBuilder(bus)
+
+	// Create a simple counting projection
+	projection := &SimpleCountingProjection{id: "pointer-test"}
+
+	// Register with pointer event type (tests the reflect.Ptr case)
+	err := pb.Register(projection, &PointerEvent{})
+	if err != nil {
+		t.Fatalf("Failed to register projection with pointer event type: %v", err)
+	}
+
+	// Publish pointer events
+	Publish(bus, PointerEvent{ID: "1", Value: 100})
+	Publish(bus, PointerEvent{ID: "2", Value: 200})
+
+	// Wait for processing
+	bus.WaitAsync()
+
+	if projection.count != 2 {
+		t.Errorf("Expected 2 events, got %d", projection.count)
+	}
+}
+
+// SimpleCountingProjection for testing
+type SimpleCountingProjection struct {
+	id    string
+	count int
+	mu    sync.Mutex
+}
+
+func (p *SimpleCountingProjection) GetID() string {
+	return p.id
+}
+
+func (p *SimpleCountingProjection) Handle(ctx context.Context, event any) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.count++
+	return nil
+}
+
+// Test the error-returning handler path directly
+func TestProjectionHandlerWithError(t *testing.T) {
+	bus := New()
+
+	// Directly add a handler that returns an error to test that code path
+	handler := func(ctx context.Context, event any) error {
+		return errors.New("handler error")
+	}
+
+	h := &internalHandler{
+		handler:        handler,
+		handlerType:    reflect.TypeOf(handler),
+		eventType:      reflect.TypeOf(AccountCreated{}),
+		acceptsContext: true,
+		async:          false,
+	}
+
+	bus.mu.Lock()
+	bus.handlers[reflect.TypeOf(AccountCreated{})] = []*internalHandler{h}
+	bus.mu.Unlock()
+
+	// Publish an event - the error will be ignored
+	Publish(bus, AccountCreated{AccountID: "test", Balance: 100})
+
+	// No panic means the test passes
+}
+
+// Test subscription failure in projection registration
+func TestProjectionSubscribeError(t *testing.T) {
+	// Create a projection builder with a nil bus to force an error
+	pb := &ProjectionBuilder{
+		bus:         nil, // This will cause subscribeToEvent to return an error
+		projections: make(map[string]Projection),
+	}
+
+	projection := &SimpleCountingProjection{id: "fail-test"}
+
+	// This should fail when trying to subscribe
+	err := pb.Register(projection, AccountCreated{})
+	if err == nil {
+		t.Error("Expected error when subscribing with nil bus")
+	}
+
+	expectedErr := "failed to subscribe projection to eventbus.AccountCreated: bus is nil"
+	if err.Error() != expectedErr {
+		t.Errorf("Expected error %q, got %q", expectedErr, err.Error())
+	}
+}
