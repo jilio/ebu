@@ -10,7 +10,7 @@ import (
 )
 
 // SnapshotTestEvent is a test event type for snapshot tests
-type SnapshotTestEvent interface{}
+type SnapshotTestEvent any
 
 type DepositEvent struct {
 	Amount float64
@@ -31,7 +31,7 @@ func (a *TestAggregate) CreateSnapshot() ([]byte, error) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
-	snapshot := map[string]interface{}{
+	snapshot := map[string]any{
 		"id":      a.ID,
 		"version": a.Version,
 		"balance": a.Balance,
@@ -45,7 +45,7 @@ func (a *TestAggregate) RestoreFromSnapshot(data []byte, version int64) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	var snapshot map[string]interface{}
+	var snapshot map[string]any
 	if err := json.Unmarshal(data, &snapshot); err != nil {
 		return fmt.Errorf("failed to unmarshal snapshot: %w", err)
 	}
@@ -75,7 +75,7 @@ func (a *TestAggregate) LoadFromHistory(events []SnapshotTestEvent) error {
 			a.Balance += e.Amount
 		case WithdrawEvent:
 			a.Balance -= e.Amount
-		case map[string]interface{}:
+		case map[string]any:
 			// Handle events from snapshot loading
 			if eventType, ok := e["type"].(string); ok {
 				switch eventType {
@@ -356,7 +356,7 @@ func TestBaseAggregateSnapshot(t *testing.T) {
 		t.Fatalf("Failed to create snapshot: %v", err)
 	}
 
-	var snapshot map[string]interface{}
+	var snapshot map[string]any
 	err = json.Unmarshal(data, &snapshot)
 	if err != nil {
 		t.Fatalf("Failed to unmarshal snapshot: %v", err)
@@ -420,7 +420,7 @@ func TestWithSnapshots(t *testing.T) {
 
 	// Test GetSnapshotManager with extensions but no snapshot manager
 	bus3 := New()
-	bus3.extensions = make(map[string]interface{})
+	bus3.extensions = make(map[string]any)
 	bus3.extensions["other"] = "value"
 	manager3 := GetSnapshotManager(bus3)
 	if manager3 != nil {
@@ -629,7 +629,7 @@ func TestLoadAggregateWithSnapshot(t *testing.T) {
 	// But we need events with positions > 10 to be loaded after the snapshot
 	// So let's add dummy events first to get to position 10
 	for i := 0; i < 10; i++ {
-		dummyEvent := map[string]interface{}{
+		dummyEvent := map[string]any{
 			"aggregate_id": "dummy",
 			"type":         "dummy",
 		}
@@ -644,7 +644,7 @@ func TestLoadAggregateWithSnapshot(t *testing.T) {
 
 	// Now save the actual events after position 10
 	for i := 0; i < 5; i++ {
-		event := map[string]interface{}{
+		event := map[string]any{
 			"aggregate_id": "agg-1",
 			"type":         "deposit",
 			"amount":       float64(100),
@@ -744,7 +744,7 @@ func TestLoadAggregateWithSnapshot(t *testing.T) {
 
 	// Test loading with FailingAggregate when there ARE matching events
 	// This tests the LoadFromHistory error path
-	failEvent := map[string]interface{}{
+	failEvent := map[string]any{
 		"aggregate_id": "fail-agg",
 		"type":         "test",
 	}

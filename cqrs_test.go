@@ -6,10 +6,11 @@ import (
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 )
 
 // Test domain events
-type AccountEvent interface{}
+type AccountEvent any
 
 type AccountCreated struct {
 	AccountID string
@@ -51,6 +52,11 @@ type WithdrawMoneyCommand struct {
 }
 
 func (w WithdrawMoneyCommand) AggregateID() string { return w.AccountID }
+
+// Test queries
+type GetBalanceQuery struct {
+	AccountID string
+}
 
 // Test queries
 type GetAccountBalanceQuery struct {
@@ -1055,5 +1061,396 @@ func TestCallHandlerWithContextGenericHandlers(t *testing.T) {
 	
 	if !called2 {
 		t.Error("Generic context handler with error was not called")
+	}
+}
+
+func TestProjectionManagerOptions(t *testing.T) {
+	bus := New()
+	
+	// Test with error handler
+	errorHandled := false
+	var capturedError error
+	var capturedProjection Projection[AccountEvent]
+	
+	pm := NewProjectionManager[AccountEvent](bus, 
+		WithProjectionErrorHandler[AccountEvent](func(err error, p Projection[AccountEvent], e AccountEvent) {
+			errorHandled = true
+			capturedError = err
+			capturedProjection = p
+		}),
+	)
+	
+	// Test registering nil projection
+	err := pm.Register(nil)
+	if err == nil || err.Error() != "projection cannot be nil" {
+		t.Errorf("Expected 'projection cannot be nil' error, got %v", err)
+	}
+	
+	// Register a projection that returns an error
+	projection := &errorProjection{}
+	_ = pm.Register(projection)
+	
+	// Handle event should trigger error handler
+	ctx := context.Background()
+	err = pm.HandleEvent(ctx, AccountCreated{AccountID: "test", Balance: 100})
+	
+	if err != nil {
+		t.Error("Expected error to be handled, not returned")
+	}
+	
+	if !errorHandled {
+		t.Error("Error handler was not called")
+	}
+	
+	if capturedError == nil || capturedError.Error() != "projection error" {
+		t.Errorf("Expected 'projection error', got %v", capturedError)
+	}
+	
+	if capturedProjection.GetID() != "error-projection" {
+		t.Errorf("Expected projection ID 'error-projection', got %s", capturedProjection.GetID())
+	}
+	
+	// Test async projections
+	pm2 := NewProjectionManager[AccountEvent](bus, WithAsyncProjections[AccountEvent]())
+	
+	projection2 := NewAccountBalanceProjection()
+	_ = pm2.Register(projection2)
+	
+	// Handle events asynchronously
+	_ = pm2.HandleEvent(ctx, AccountCreated{AccountID: "acc-1", Balance: 1000})
+	
+	// Verify async handling worked
+	balance, ok := projection2.GetBalance("acc-1")
+	if !ok {
+		t.Error("Account not found after async handling")
+	}
+	
+	if balance != 1000 {
+		t.Errorf("Expected balance 1000, got %f", balance)
+	}
+}
+
+func TestCommandBusOptions(t *testing.T) {
+	bus := New()
+	ctx := context.Background()
+	
+	// Test pre-handler
+	preHandlerCalled := false
+	var capturedCmdType string
+	var capturedCmd CreateAccountCommand
+	
+	// Test post-handler
+	postHandlerCalled := false
+	var capturedEvents []AccountEvent
+	var capturedErr error
+	
+	cb := NewCommandBus[CreateAccountCommand, AccountEvent](bus,
+		WithCommandPreHandler[CreateAccountCommand, AccountEvent](func(ctx context.Context, cmdType string, cmd CreateAccountCommand) error {
+			preHandlerCalled = true
+			capturedCmdType = cmdType
+			capturedCmd = cmd
+			return nil
+		}),
+		WithCommandPostHandler[CreateAccountCommand, AccountEvent](func(ctx context.Context, cmdType string, cmd CreateAccountCommand, events []AccountEvent, err error) {
+			postHandlerCalled = true
+			capturedEvents = events
+			capturedErr = err
+		}),
+	)
+	
+	// Register handler
+	cb.Register("CreateAccount", func(ctx context.Context, cmd CreateAccountCommand) ([]AccountEvent, error) {
+		return []AccountEvent{
+			AccountCreated{AccountID: cmd.AccountID, Balance: cmd.InitialBalance},
+		}, nil
+	})
+	
+	// Execute command
+	cmd := CreateAccountCommand{AccountID: "test-1", InitialBalance: 1000}
+	err := cb.Execute(ctx, "CreateAccount", cmd)
+	
+	if err != nil {
+		t.Fatalf("Command execution failed: %v", err)
+	}
+	
+	if !preHandlerCalled {
+		t.Error("Pre-handler was not called")
+	}
+	
+	if capturedCmdType != "CreateAccount" {
+		t.Errorf("Expected command type 'CreateAccount', got %s", capturedCmdType)
+	}
+	
+	if capturedCmd.AccountID != "test-1" {
+		t.Errorf("Expected account ID 'test-1', got %s", capturedCmd.AccountID)
+	}
+	
+	if !postHandlerCalled {
+		t.Error("Post-handler was not called")
+	}
+	
+	if len(capturedEvents) != 1 {
+		t.Errorf("Expected 1 event, got %d", len(capturedEvents))
+	}
+	
+	if capturedErr != nil {
+		t.Errorf("Expected no error in post-handler, got %v", capturedErr)
+	}
+	
+	// Test pre-handler returning error
+	cb2 := NewCommandBus[CreateAccountCommand, AccountEvent](bus,
+		WithCommandPreHandler[CreateAccountCommand, AccountEvent](func(ctx context.Context, cmdType string, cmd CreateAccountCommand) error {
+			return errors.New("pre-handler error")
+		}),
+	)
+	
+	cb2.Register("CreateAccount", func(ctx context.Context, cmd CreateAccountCommand) ([]AccountEvent, error) {
+		return []AccountEvent{AccountCreated{AccountID: cmd.AccountID}}, nil
+	})
+	
+	err = cb2.Execute(ctx, "CreateAccount", cmd)
+	if err == nil || err.Error() != "pre-handler failed: pre-handler error" {
+		t.Errorf("Expected pre-handler error, got %v", err)
+	}
+}
+
+func TestQueryBusOptions(t *testing.T) {
+	ctx := context.Background()
+	
+	// Test query logger
+	loggerCalled := false
+	var loggedQueryType string
+	var loggedQuery GetBalanceQuery
+	var loggedResult float64
+	var loggedErr error
+	
+	qb := NewQueryBus[GetBalanceQuery, float64](
+		WithQueryLogger[GetBalanceQuery, float64](func(ctx context.Context, queryType string, query GetBalanceQuery, result float64, err error) {
+			loggerCalled = true
+			loggedQueryType = queryType
+			loggedQuery = query
+			loggedResult = result
+			loggedErr = err
+		}),
+	)
+	
+	// Register handler
+	qb.Register("GetBalance", func(ctx context.Context, query GetBalanceQuery) (float64, error) {
+		return 1500.0, nil
+	})
+	
+	// Execute query
+	query := GetBalanceQuery{AccountID: "test-1"}
+	result, err := qb.Execute(ctx, "GetBalance", query)
+	
+	if err != nil {
+		t.Fatalf("Query execution failed: %v", err)
+	}
+	
+	if result != 1500.0 {
+		t.Errorf("Expected result 1500.0, got %f", result)
+	}
+	
+	if !loggerCalled {
+		t.Error("Logger was not called")
+	}
+	
+	if loggedQueryType != "GetBalance" {
+		t.Errorf("Expected query type 'GetBalance', got %s", loggedQueryType)
+	}
+	
+	if loggedQuery.AccountID != "test-1" {
+		t.Errorf("Expected account ID 'test-1', got %s", loggedQuery.AccountID)
+	}
+	
+	if loggedResult != 1500.0 {
+		t.Errorf("Expected logged result 1500.0, got %f", loggedResult)
+	}
+	
+	if loggedErr != nil {
+		t.Errorf("Expected no logged error, got %v", loggedErr)
+	}
+}
+
+func TestCQRSConfig(t *testing.T) {
+	bus := New()
+	
+	// Use the fluent API to configure CQRS components
+	config := NewCQRSConfig[CreateAccountCommand, GetBalanceQuery, AccountEvent, float64](bus)
+	
+	cmdBus, queryBus, projManager := config.
+		WithCommands(
+			WithCommandPreHandler[CreateAccountCommand, AccountEvent](func(ctx context.Context, cmdType string, cmd CreateAccountCommand) error {
+				// Validation logic here
+				return nil
+			}),
+		).
+		WithQueries(
+			WithQueryLogger[GetBalanceQuery, float64](func(ctx context.Context, queryType string, query GetBalanceQuery, result float64, err error) {
+				// Logging logic here
+			}),
+		).
+		WithProjections(
+			WithAsyncProjections[AccountEvent](),
+		).
+		Build()
+	
+	if cmdBus == nil {
+		t.Error("CommandBus was not created")
+	}
+	
+	if queryBus == nil {
+		t.Error("QueryBus was not created")
+	}
+	
+	if projManager == nil {
+		t.Error("ProjectionManager was not created")
+	}
+}
+
+func TestSubscribeProjection(t *testing.T) {
+	bus := New()
+	
+	// Create a projection manager for a specific event type
+	pm := NewProjectionManager[AccountCreated](bus)
+	
+	// Track handled events
+	handled := false
+	var handledEvent AccountCreated
+	
+	// Create a test projection
+	testProj := &testProjection[AccountCreated]{
+		id: "test",
+		handler: func(ctx context.Context, e AccountCreated) error {
+			handled = true
+			handledEvent = e
+			return nil
+		},
+	}
+	
+	_ = pm.Register(testProj)
+	
+	// Use the helper to subscribe
+	SubscribeProjection(bus, pm, AccountCreated{})
+	
+	// Publish event
+	Publish(bus, AccountCreated{AccountID: "test-1", Balance: 1000})
+	bus.WaitAsync()
+	
+	// The projection should have been updated
+	if !handled {
+		t.Error("Event was not handled")
+	}
+	
+	if handledEvent.AccountID != "test-1" {
+		t.Errorf("Expected account ID 'test-1', got %s", handledEvent.AccountID)
+	}
+}
+
+// testProjection is a generic test projection
+type testProjection[E any] struct {
+	id      string
+	handler func(context.Context, E) error
+}
+
+func (p *testProjection[E]) GetID() string {
+	return p.id
+}
+
+func (p *testProjection[E]) Handle(ctx context.Context, event E) error {
+	if p.handler != nil {
+		return p.handler(ctx, event)
+	}
+	return nil
+}
+
+func TestSetupCQRSProjections(t *testing.T) {
+	bus := New()
+	
+	// Since SetupCQRSProjections uses SubscribeProjection which requires matching types,
+	// we need to test with concrete event types
+	pm := NewProjectionManager[AccountCreated](bus)
+	
+	// Track events
+	handled := false
+	testProj := &testProjection[AccountCreated]{
+		id: "test",
+		handler: func(ctx context.Context, e AccountCreated) error {
+			handled = true
+			return nil
+		},
+	}
+	
+	// Use the helper to set up projections - note we can only subscribe to AccountCreated
+	err := SetupCQRSProjections(
+		bus,
+		pm,
+		[]Projection[AccountCreated]{testProj},
+		[]AccountCreated{AccountCreated{}}, // Only one event type that matches
+	)
+	
+	if err != nil {
+		t.Fatalf("Failed to set up projections: %v", err)
+	}
+	
+	// Verify projection was registered
+	p, ok := pm.Get("test")
+	if !ok {
+		t.Error("Projection was not registered")
+	}
+	
+	if p.GetID() != "test" {
+		t.Errorf("Expected projection ID 'test', got %s", p.GetID())
+	}
+	
+	// Test events are handled
+	Publish(bus, AccountCreated{AccountID: "test-2", Balance: 500})
+	bus.WaitAsync()
+	
+	if !handled {
+		t.Error("Event was not handled")
+	}
+}
+
+func TestWithQueryCache(t *testing.T) {
+	// Test that WithQueryCache option works
+	qb := NewQueryBus[GetBalanceQuery, float64](
+		WithQueryCache[GetBalanceQuery, float64](5 * time.Minute),
+	)
+	
+	if !qb.cacheEnabled {
+		t.Error("Cache should be enabled")
+	}
+	
+	if qb.cacheTTL != 5*time.Minute {
+		t.Errorf("Expected cache TTL 5 minutes, got %v", qb.cacheTTL)
+	}
+	
+	if qb.cache == nil {
+		t.Error("Cache map should be initialized")
+	}
+}
+
+func TestSetupCQRSProjectionsError(t *testing.T) {
+	bus := New()
+	pm := NewProjectionManager[AccountCreated](bus)
+	
+	// Create a projection with empty ID to trigger error
+	projWithEmptyID := &testProjection[AccountCreated]{id: ""}
+	
+	// SetupCQRSProjections should fail on empty ID
+	err := SetupCQRSProjections(
+		bus,
+		pm,
+		[]Projection[AccountCreated]{projWithEmptyID},
+		[]AccountCreated{},
+	)
+	
+	if err == nil {
+		t.Error("Expected error for projection with empty ID")
+	}
+	
+	if err.Error() != "failed to register projection : projection ID cannot be empty" {
+		t.Errorf("Unexpected error message: %v", err)
 	}
 }

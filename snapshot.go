@@ -234,7 +234,7 @@ func WithSnapshots(store SnapshotStore, policy SnapshotPolicy) BusOption {
 	return func(bus *EventBus) {
 		// Store snapshot manager in bus for access by CQRS
 		if bus.extensions == nil {
-			bus.extensions = make(map[string]interface{})
+			bus.extensions = make(map[string]any)
 		}
 		bus.extensions["snapshot_manager"] = NewSnapshotManager(store, policy)
 	}
@@ -295,7 +295,7 @@ func LoadAggregate[A SnapshottableAggregate[E], E any](
 			// We need a way to determine if an event belongs to this aggregate
 			// This is typically done by examining the event data
 			// For now, we'll unmarshal and check if it has the aggregate ID
-			var eventData map[string]interface{}
+			var eventData map[string]any
 			if err := json.Unmarshal(storedEvent.Data, &eventData); err != nil {
 				continue // Skip events that can't be unmarshaled
 			}
