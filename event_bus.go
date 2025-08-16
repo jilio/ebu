@@ -27,6 +27,7 @@ type internalHandler struct {
 	async          bool
 	sequential     bool
 	acceptsContext bool
+	filter         any // Predicate function for filtering events
 	mu             sync.Mutex
 	executed       uint32 // For once handlers, atomically tracks if executed
 }
@@ -231,6 +232,15 @@ func PublishContext[T any](bus *EventBus, ctx context.Context, event T) {
 	var onceHandlersToRemove []*internalHandler
 
 	for _, h := range handlersCopy {
+		// Check filter if present
+		if h.filter != nil {
+			if filterFunc, ok := h.filter.(func(T) bool); ok {
+				if !filterFunc(event) {
+					continue // Skip this handler as event doesn't match filter
+				}
+			}
+		}
+
 		// For once handlers, use CompareAndSwap to ensure atomic execution
 		if h.once {
 			if !atomic.CompareAndSwapUint32(&h.executed, 0, 1) {
@@ -413,6 +423,13 @@ func Async() SubscribeOption {
 func Sequential() SubscribeOption {
 	return func(h *internalHandler) {
 		h.sequential = true
+	}
+}
+
+// WithFilter configures the handler to only receive events that match the predicate
+func WithFilter[T any](predicate func(T) bool) SubscribeOption {
+	return func(h *internalHandler) {
+		h.filter = predicate
 	}
 }
 
