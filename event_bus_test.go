@@ -2274,7 +2274,7 @@ func TestDirectHandlerCalls(t *testing.T) {
 			t.Error("handler was not called")
 		}
 	})
-	
+
 	t.Run("func_context_any_handler", func(t *testing.T) {
 		// Test the func(context.Context, any) case directly
 		called := false
@@ -2287,19 +2287,19 @@ func TestDirectHandlerCalls(t *testing.T) {
 				t.Error("context should not be nil")
 			}
 		}
-		
+
 		h := &internalHandler{
 			handler:     handler,
 			handlerType: reflect.TypeOf(handler),
 		}
-		
+
 		callHandlerWithContext(h, context.Background(), "test", nil)
-		
+
 		if !called {
 			t.Error("handler was not called")
 		}
 	})
-	
+
 	t.Run("func_context_any_error_handler", func(t *testing.T) {
 		// Test the func(context.Context, any) error case directly
 		called := false
@@ -2313,19 +2313,19 @@ func TestDirectHandlerCalls(t *testing.T) {
 			}
 			return nil
 		}
-		
+
 		h := &internalHandler{
 			handler:     handler,
 			handlerType: reflect.TypeOf(handler),
 		}
-		
+
 		callHandlerWithContext(h, context.Background(), "test", nil)
-		
+
 		if !called {
 			t.Error("handler was not called")
 		}
 	})
-	
+
 	t.Run("Handler_T_interface", func(t *testing.T) {
 		// Test the Handler[T] interface case
 		called := false
@@ -2335,19 +2335,19 @@ func TestDirectHandlerCalls(t *testing.T) {
 				t.Errorf("expected 'test', got %s", event)
 			}
 		}
-		
+
 		h := &internalHandler{
 			handler:     handler,
 			handlerType: reflect.TypeOf(handler),
 		}
-		
+
 		callHandlerWithContext(h, context.Background(), "test", nil)
-		
+
 		if !called {
 			t.Error("handler was not called")
 		}
 	})
-	
+
 	t.Run("ContextHandler_T_interface", func(t *testing.T) {
 		// Test the ContextHandler[T] interface case
 		called := false
@@ -2360,14 +2360,14 @@ func TestDirectHandlerCalls(t *testing.T) {
 				t.Error("context should not be nil")
 			}
 		}
-		
+
 		h := &internalHandler{
 			handler:     handler,
 			handlerType: reflect.TypeOf(handler),
 		}
-		
+
 		callHandlerWithContext(h, context.Background(), "test", nil)
-		
+
 		if !called {
 			t.Error("handler was not called")
 		}
@@ -2668,28 +2668,28 @@ func TestContextAnyHandlers(t *testing.T) {
 		called := false
 		var receivedCtx context.Context
 		var receivedEvent any
-		
+
 		// Create a handler with func(context.Context, any) signature
 		handler := func(ctx context.Context, event any) {
 			called = true
 			receivedCtx = ctx
 			receivedEvent = event
 		}
-		
+
 		// Create internal handler
 		h := &internalHandler{
 			handler:     handler,
 			handlerType: reflect.TypeOf(handler),
 			eventType:   reflect.TypeOf(""),
 		}
-		
+
 		// Test event
 		testEvent := "test event"
 		ctx := context.WithValue(context.Background(), "key", "value")
-		
+
 		// Call the handler
 		callHandlerWithContext(h, ctx, testEvent, nil)
-		
+
 		// Verify
 		if !called {
 			t.Error("Handler was not called")
@@ -2701,12 +2701,12 @@ func TestContextAnyHandlers(t *testing.T) {
 			t.Errorf("Event was not passed correctly: got %v, want %v", receivedEvent, testEvent)
 		}
 	})
-	
+
 	t.Run("func(context.Context, any) error handler", func(t *testing.T) {
 		called := false
 		var receivedCtx context.Context
 		var receivedEvent any
-		
+
 		// Create a handler with func(context.Context, any) error signature
 		handler := func(ctx context.Context, event any) error {
 			called = true
@@ -2714,21 +2714,21 @@ func TestContextAnyHandlers(t *testing.T) {
 			receivedEvent = event
 			return nil
 		}
-		
+
 		// Create internal handler
 		h := &internalHandler{
 			handler:     handler,
 			handlerType: reflect.TypeOf(handler),
 			eventType:   reflect.TypeOf(0),
 		}
-		
+
 		// Test event
 		testEvent := 42
 		ctx := context.WithValue(context.Background(), "test", "data")
-		
+
 		// Call the handler
 		callHandlerWithContext(h, ctx, testEvent, nil)
-		
+
 		// Verify
 		if !called {
 			t.Error("Handler was not called")
@@ -2740,35 +2740,35 @@ func TestContextAnyHandlers(t *testing.T) {
 			t.Errorf("Event was not passed correctly: got %v, want %v", receivedEvent, testEvent)
 		}
 	})
-	
+
 	t.Run("func(context.Context, any) error handler with struct event", func(t *testing.T) {
 		type TestEvent struct {
 			Message string
 		}
-		
+
 		called := false
 		var receivedEvent any
-		
+
 		// Create a handler with func(context.Context, any) error signature
 		handler := func(ctx context.Context, event any) error {
 			called = true
 			receivedEvent = event
 			return nil
 		}
-		
+
 		// Create internal handler
 		h := &internalHandler{
 			handler:     handler,
 			handlerType: reflect.TypeOf(handler),
 			eventType:   reflect.TypeOf(TestEvent{}),
 		}
-		
+
 		// Test event
 		testEvent := TestEvent{Message: "hello"}
-		
+
 		// Call the handler
 		callHandlerWithContext(h, context.Background(), testEvent, nil)
-		
+
 		// Verify
 		if !called {
 			t.Error("Handler was not called")

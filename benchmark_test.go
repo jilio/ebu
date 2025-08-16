@@ -160,7 +160,6 @@ func BenchmarkLargeEvents(b *testing.B) {
 	}
 }
 
-
 // Benchmark memory allocation
 func BenchmarkMemoryAllocation(b *testing.B) {
 	b.Run("small-events", func(b *testing.B) {
@@ -265,4 +264,3 @@ func BenchmarkClear(b *testing.B) {
 		}
 	})
 }
-
