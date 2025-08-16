@@ -35,8 +35,8 @@ type StoredEvent struct {
 	Timestamp time.Time       `json:"timestamp"`
 }
 
-// WithEventStore enables persistence with the given store
-func WithEventStore(store EventStore) Option {
+// WithStore enables persistence with the given store
+func WithStore(store EventStore) Option {
 	return func(bus *EventBus) {
 		bus.store = store
 

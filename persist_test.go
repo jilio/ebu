@@ -19,8 +19,8 @@ type AnotherTestEvent struct {
 	Name string
 }
 
-// TestWithEventStoreHookChaining tests that WithEventStore chains with existing hooks
-func TestWithEventStoreHookChaining(t *testing.T) {
+// TestWithStoreHookChaining tests that WithStore chains with existing hooks
+func TestWithStoreHookChaining(t *testing.T) {
 	store := NewMemoryStore()
 
 	// Create bus with existing hook
@@ -30,15 +30,15 @@ func TestWithEventStoreHookChaining(t *testing.T) {
 		hookCalled = true
 	})
 
-	// Apply WithEventStore after setting hook
-	WithEventStore(store)(bus)
+	// Apply WithStore after setting hook
+	WithStore(store)(bus)
 
 	// Publish an event
 	Publish(bus, TestEvent{ID: 1, Value: "test"})
 
 	// Both hook and persistence should work
 	if !hookCalled {
-		t.Error("Existing hook should still be called after WithEventStore")
+		t.Error("Existing hook should still be called after WithStore")
 	}
 
 	ctx := context.Background()
@@ -58,7 +58,7 @@ func TestBackwardCompatibility(t *testing.T) {
 	}
 
 	if bus.IsPersistent() {
-		t.Error("Bus should not be persistent without WithEventStore option")
+		t.Error("Bus should not be persistent without WithStore option")
 	}
 
 	// GetStore should return nil for non-persistent bus
@@ -115,11 +115,11 @@ func TestSubscribeWithReplayNoPersistence(t *testing.T) {
 // TestPersistentEventBus tests basic persistence functionality
 func TestPersistentEventBus(t *testing.T) {
 	store := NewMemoryStore()
-	bus := New(WithEventStore(store))
+	bus := New(WithStore(store))
 
 	// Test GetStore returns the correct store
 	if bus.GetStore() != store {
-		t.Error("GetStore should return the store passed to WithEventStore")
+		t.Error("GetStore should return the store passed to WithStore")
 	}
 
 	// Publish some events
@@ -152,7 +152,7 @@ func TestPersistentEventBus(t *testing.T) {
 // TestReplay tests event replay functionality
 func TestReplay(t *testing.T) {
 	store := NewMemoryStore()
-	bus := New(WithEventStore(store))
+	bus := New(WithStore(store))
 
 	// Publish events
 	for i := 1; i <= 5; i++ {
@@ -188,7 +188,7 @@ func TestReplay(t *testing.T) {
 func TestReplayWithErrors(t *testing.T) {
 	// Test with store that fails Load
 	store := &errorStore{failLoad: true}
-	bus := New(WithEventStore(store))
+	bus := New(WithStore(store))
 
 	ctx := context.Background()
 	err := bus.Replay(ctx, 1, func(event *StoredEvent) error {
@@ -201,7 +201,7 @@ func TestReplayWithErrors(t *testing.T) {
 
 	// Test handler error during replay
 	store2 := NewMemoryStore()
-	bus2 := New(WithEventStore(store2))
+	bus2 := New(WithStore(store2))
 
 	// Add some events
 	Publish(bus2, TestEvent{ID: 1})
@@ -225,7 +225,7 @@ func TestReplayWithErrors(t *testing.T) {
 // TestSubscribeWithReplay tests subscription with replay
 func TestSubscribeWithReplay(t *testing.T) {
 	store := NewMemoryStore()
-	bus := New(WithEventStore(store))
+	bus := New(WithStore(store))
 
 	// Publish some events before subscription
 	for i := 1; i <= 3; i++ {
@@ -274,7 +274,7 @@ func TestSubscribeWithReplay(t *testing.T) {
 // TestSubscribeWithReplayResume tests resuming from saved position
 func TestSubscribeWithReplayResume(t *testing.T) {
 	store := NewMemoryStore()
-	bus := New(WithEventStore(store))
+	bus := New(WithStore(store))
 
 	// Publish initial events
 	for i := 1; i <= 3; i++ {
@@ -300,7 +300,7 @@ func TestSubscribeWithReplayResume(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 
 	// Create new bus with same store (simulating restart)
-	bus2 := New(WithEventStore(store))
+	bus2 := New(WithStore(store))
 
 	// Resume subscription - should only get new events
 	var received2 []int
@@ -328,7 +328,7 @@ func TestSubscribeWithReplayResume(t *testing.T) {
 // TestSubscribeWithReplayUnmarshalError tests unmarshal error handling
 func TestSubscribeWithReplayUnmarshalError(t *testing.T) {
 	store := NewMemoryStore()
-	bus := New(WithEventStore(store))
+	bus := New(WithStore(store))
 
 	// First publish a valid event to set the position
 	Publish(bus, TestEvent{ID: 1, Value: "valid"})
@@ -377,7 +377,7 @@ func TestSubscribeWithReplayUnmarshalError(t *testing.T) {
 // TestSubscribeWithReplayDifferentEventTypes tests filtering by event type
 func TestSubscribeWithReplayDifferentEventTypes(t *testing.T) {
 	store := NewMemoryStore()
-	bus := New(WithEventStore(store))
+	bus := New(WithStore(store))
 
 	// Publish mixed event types
 	Publish(bus, TestEvent{ID: 1})
@@ -479,7 +479,7 @@ func TestMemoryStore(t *testing.T) {
 // TestPersistentBusWithFailingStore tests with store that fails GetPosition
 func TestPersistentBusWithFailingStore(t *testing.T) {
 	store := &errorStore{}
-	bus := New(WithEventStore(store))
+	bus := New(WithStore(store))
 
 	// Should still create bus even if GetPosition fails
 	if bus == nil {
@@ -496,7 +496,7 @@ func TestPersistentBusWithFailingStore(t *testing.T) {
 func TestPersistEventWithNilStore(t *testing.T) {
 	// Create bus with store first to set up the hook
 	store := NewMemoryStore()
-	bus := New(WithEventStore(store))
+	bus := New(WithStore(store))
 
 	// Now manually set store to nil to test defensive check
 	// This simulates an edge case where store becomes nil after initialization
@@ -514,7 +514,7 @@ func TestPersistEventWithNilStore(t *testing.T) {
 // TestPersistEventWithUnmarshalableData tests persist with unmarshalable data
 func TestPersistEventWithUnmarshalableData(t *testing.T) {
 	store := NewMemoryStore()
-	bus := New(WithEventStore(store))
+	bus := New(WithStore(store))
 
 	// Create a type that truly cannot be marshaled to JSON
 	type UnmarshalableEvent struct {
