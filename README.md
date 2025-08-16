@@ -456,7 +456,7 @@ package main
 
 import (
     "encoding/json"
-    "github.com/jilio/ebu"
+    eventbus "github.com/jilio/ebu"
 )
 
 type OrderCreatedEvent struct {
