@@ -334,7 +334,7 @@ func TestProjectionManager(t *testing.T) {
 	Publish(bus, MoneyWithdrawn{AccountID: "acc-1", Amount: 200})
 
 	// Wait for all async handlers to complete
-	bus.WaitAsync()
+	bus.Wait()
 
 	balance, ok := projection.GetBalance("acc-1")
 	if !ok {
@@ -900,7 +900,7 @@ func TestCallHandlerWithContextNonContextHandler(t *testing.T) {
 	Publish(bus, TestEvent{ID: 1, Value: "test"})
 
 	// Wait for handlers
-	bus.WaitAsync()
+	bus.Wait()
 
 	if !called {
 		t.Error("Non-context handler was not called")
@@ -1012,23 +1012,24 @@ func TestCallHandlerWithContextGenericHandlers(t *testing.T) {
 		called1 = true
 	}
 
-	// Register handler directly using internalHandler
-	bus.mu.Lock()
+	// Register handler directly using internalHandler with sharding
 	eventType := reflect.TypeOf(AccountCreated{})
-	if _, exists := bus.handlers[eventType]; !exists {
-		bus.handlers[eventType] = []*internalHandler{}
+	shard := bus.getShard(eventType)
+	shard.mu.Lock()
+	if _, exists := shard.handlers[eventType]; !exists {
+		shard.handlers[eventType] = []*internalHandler{}
 	}
-	bus.handlers[eventType] = append(bus.handlers[eventType], &internalHandler{
+	shard.handlers[eventType] = append(shard.handlers[eventType], &internalHandler{
 		handler:        handler1,
 		acceptsContext: true,
 		handlerType:    reflect.TypeOf(handler1),
 		async:          false,
 	})
-	bus.mu.Unlock()
+	shard.mu.Unlock()
 
 	// Publish event
 	Publish(bus, AccountCreated{AccountID: "test", Balance: 100})
-	bus.WaitAsync()
+	bus.Wait()
 
 	if !called1 {
 		t.Error("Generic context handler was not called")
@@ -1041,23 +1042,24 @@ func TestCallHandlerWithContextGenericHandlers(t *testing.T) {
 		return nil
 	}
 
-	// Register handler directly using internalHandler
-	bus.mu.Lock()
+	// Register handler directly using internalHandler with sharding
 	eventType2 := reflect.TypeOf(MoneyDeposited{})
-	if _, exists := bus.handlers[eventType2]; !exists {
-		bus.handlers[eventType2] = []*internalHandler{}
+	shard2 := bus.getShard(eventType2)
+	shard2.mu.Lock()
+	if _, exists := shard2.handlers[eventType2]; !exists {
+		shard2.handlers[eventType2] = []*internalHandler{}
 	}
-	bus.handlers[eventType2] = append(bus.handlers[eventType2], &internalHandler{
+	shard2.handlers[eventType2] = append(shard2.handlers[eventType2], &internalHandler{
 		handler:        handler2,
 		acceptsContext: true,
 		handlerType:    reflect.TypeOf(handler2),
 		async:          false,
 	})
-	bus.mu.Unlock()
+	shard2.mu.Unlock()
 
 	// Publish event
 	Publish(bus, MoneyDeposited{AccountID: "test", Amount: 50})
-	bus.WaitAsync()
+	bus.Wait()
 
 	if !called2 {
 		t.Error("Generic context handler with error was not called")
@@ -1299,7 +1301,7 @@ func TestSubscribeProjection(t *testing.T) {
 
 	// Publish event
 	Publish(bus, AccountCreated{AccountID: "test-1", Balance: 1000})
-	bus.WaitAsync()
+	bus.Wait()
 
 	// The projection should have been updated
 	if !handled {
@@ -1369,7 +1371,7 @@ func TestSetupCQRSProjections(t *testing.T) {
 
 	// Test events are handled
 	Publish(bus, AccountCreated{AccountID: "test-2", Balance: 500})
-	bus.WaitAsync()
+	bus.Wait()
 
 	if !handled {
 		t.Error("Event was not handled")

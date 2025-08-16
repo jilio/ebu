@@ -36,7 +36,7 @@ type StoredEvent struct {
 }
 
 // WithStore enables persistence with the given store
-func WithStore(store EventStore) BusOption {
+func WithStore(store EventStore) Option {
 	return func(bus *EventBus) {
 		bus.store = store
 
