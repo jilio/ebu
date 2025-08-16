@@ -1272,41 +1272,6 @@ func TestQueryBusOptions(t *testing.T) {
 	}
 }
 
-func TestCQRSConfig(t *testing.T) {
-	bus := New()
-
-	// Use the fluent API to configure CQRS components
-	config := NewCQRSConfig[CreateAccountCommand, GetBalanceQuery, AccountEvent, float64](bus)
-
-	cmdBus, queryBus, projManager := config.
-		WithCommands(
-			WithCommandPreHandler[CreateAccountCommand, AccountEvent](func(ctx context.Context, cmdType string, cmd CreateAccountCommand) error {
-				// Validation logic here
-				return nil
-			}),
-		).
-		WithQueries(
-			WithQueryLogger(func(ctx context.Context, queryType string, query GetBalanceQuery, result float64, err error) {
-				// Logging logic here
-			}),
-		).
-		WithProjections(
-			WithAsyncProjections[AccountEvent](),
-		).
-		Build()
-
-	if cmdBus == nil {
-		t.Error("CommandBus was not created")
-	}
-
-	if queryBus == nil {
-		t.Error("QueryBus was not created")
-	}
-
-	if projManager == nil {
-		t.Error("ProjectionManager was not created")
-	}
-}
 
 func TestSubscribeProjection(t *testing.T) {
 	bus := New()

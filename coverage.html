@@ -1,0 +1,1553 @@
+
+<!DOCTYPE html>
+<html>
+	<head>
+		<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+		<title>ebu: Go Coverage Report</title>
+		<style>
+			body {
+				background: black;
+				color: rgb(80, 80, 80);
+			}
+			body, pre, #legend span {
+				font-family: Menlo, monospace;
+				font-weight: bold;
+			}
+			#topbar {
+				background: black;
+				position: fixed;
+				top: 0; left: 0; right: 0;
+				height: 42px;
+				border-bottom: 1px solid rgb(80, 80, 80);
+			}
+			#content {
+				margin-top: 50px;
+			}
+			#nav, #legend {
+				float: left;
+				margin-left: 10px;
+			}
+			#legend {
+				margin-top: 12px;
+			}
+			#nav {
+				margin-top: 10px;
+			}
+			#legend span {
+				margin: 0 5px;
+			}
+			.cov0 { color: rgb(192, 0, 0) }
+.cov1 { color: rgb(128, 128, 128) }
+.cov2 { color: rgb(116, 140, 131) }
+.cov3 { color: rgb(104, 152, 134) }
+.cov4 { color: rgb(92, 164, 137) }
+.cov5 { color: rgb(80, 176, 140) }
+.cov6 { color: rgb(68, 188, 143) }
+.cov7 { color: rgb(56, 200, 146) }
+.cov8 { color: rgb(44, 212, 149) }
+.cov9 { color: rgb(32, 224, 152) }
+.cov10 { color: rgb(20, 236, 155) }
+
+		</style>
+	</head>
+	<body>
+		<div id="topbar">
+			<div id="nav">
+				<select id="files">
+				
+				<option value="file0">github.com/jilio/ebu/cqrs.go (93.0%)</option>
+				
+				<option value="file1">github.com/jilio/ebu/event_bus.go (97.3%)</option>
+				
+				<option value="file2">github.com/jilio/ebu/persist.go (100.0%)</option>
+				
+				<option value="file3">github.com/jilio/ebu/snapshot.go (100.0%)</option>
+				
+				</select>
+			</div>
+			<div id="legend">
+				<span>not tracked</span>
+			
+				<span class="cov0">not covered</span>
+				<span class="cov8">covered</span>
+			
+			</div>
+		</div>
+		<div id="content">
+		
+		<pre class="file" id="file0" style="display: none">package eventbus
+
+import (
+        "context"
+        "encoding/json"
+        "errors"
+        "fmt"
+        "sync"
+)
+
+// Command represents an intent to change the system state
+type Command interface{}
+
+// Query represents a request for information from the system
+type Query interface{}
+
+// CommandHandler processes commands and returns events to be published
+type CommandHandler[C Command, E any] func(ctx context.Context, cmd C) ([]E, error)
+
+// QueryHandler processes queries and returns the requested data
+type QueryHandler[Q Query, R any] func(ctx context.Context, query Q) (R, error)
+
+// Aggregate represents an aggregate root in DDD
+type Aggregate[E any] interface {
+        // GetID returns the aggregate's unique identifier
+        GetID() string
+        // GetVersion returns the current version of the aggregate
+        GetVersion() int64
+        // GetUncommittedEvents returns events that haven't been persisted yet
+        GetUncommittedEvents() []E
+        // MarkEventsAsCommitted clears the uncommitted events
+        MarkEventsAsCommitted()
+        // LoadFromHistory rebuilds the aggregate from historical events
+        LoadFromHistory(events []E) error
+        // Apply handles an event to update the aggregate state
+        Apply(event E) error
+        // CreateSnapshot creates a snapshot of the aggregate state
+        CreateSnapshot() ([]byte, error)
+        // RestoreFromSnapshot restores aggregate state from a snapshot
+        RestoreFromSnapshot(data []byte, version int64) error
+}
+
+// BaseAggregate provides common functionality for aggregates
+type BaseAggregate[E any] struct {
+        ID                string
+        Version           int64
+        uncommittedEvents []E
+        mu                sync.RWMutex
+        // ApplyFunc is called to apply events to the aggregate
+        ApplyFunc func(event E) error
+}
+
+func (a *BaseAggregate[E]) GetID() string <span class="cov8" title="1">{
+        a.mu.RLock()
+        defer a.mu.RUnlock()
+        return a.ID
+}</span>
+
+func (a *BaseAggregate[E]) GetVersion() int64 <span class="cov8" title="1">{
+        a.mu.RLock()
+        defer a.mu.RUnlock()
+        return a.Version
+}</span>
+
+func (a *BaseAggregate[E]) GetUncommittedEvents() []E <span class="cov8" title="1">{
+        a.mu.RLock()
+        defer a.mu.RUnlock()
+        events := make([]E, len(a.uncommittedEvents))
+        copy(events, a.uncommittedEvents)
+        return events
+}</span>
+
+func (a *BaseAggregate[E]) MarkEventsAsCommitted() <span class="cov8" title="1">{
+        a.mu.Lock()
+        defer a.mu.Unlock()
+        a.uncommittedEvents = nil
+}</span>
+
+// RaiseEvent adds an event to the uncommitted events and applies it
+func (a *BaseAggregate[E]) RaiseEvent(event E) error <span class="cov8" title="1">{
+        a.mu.Lock()
+        defer a.mu.Unlock()
+
+        // Apply the event if a handler is set
+        if a.ApplyFunc != nil </span><span class="cov8" title="1">{
+                if err := a.ApplyFunc(event); err != nil </span><span class="cov8" title="1">{
+                        return err
+                }</span>
+        }
+
+        <span class="cov8" title="1">a.uncommittedEvents = append(a.uncommittedEvents, event)
+        a.Version++
+        return nil</span>
+}
+
+// Apply handles an event to update the aggregate state
+func (a *BaseAggregate[E]) Apply(event E) error <span class="cov8" title="1">{
+        a.mu.Lock()
+        defer a.mu.Unlock()
+
+        if a.ApplyFunc != nil </span><span class="cov8" title="1">{
+                if err := a.ApplyFunc(event); err != nil </span><span class="cov8" title="1">{
+                        return err
+                }</span>
+        }
+        <span class="cov0" title="0">a.Version++
+        return nil</span>
+}
+
+// LoadFromHistory rebuilds the aggregate from historical events
+func (a *BaseAggregate[E]) LoadFromHistory(events []E) error <span class="cov8" title="1">{
+        a.mu.Lock()
+        defer a.mu.Unlock()
+
+        for _, event := range events </span><span class="cov8" title="1">{
+                if a.ApplyFunc != nil </span><span class="cov8" title="1">{
+                        if err := a.ApplyFunc(event); err != nil </span><span class="cov8" title="1">{
+                                return err
+                        }</span>
+                }
+                <span class="cov8" title="1">a.Version++</span>
+        }
+        <span class="cov8" title="1">return nil</span>
+}
+
+// CreateSnapshot creates a JSON snapshot of the aggregate state
+func (a *BaseAggregate[E]) CreateSnapshot() ([]byte, error) <span class="cov8" title="1">{
+        a.mu.RLock()
+        defer a.mu.RUnlock()
+
+        snapshot := map[string]interface{}{
+                "id":      a.ID,
+                "version": a.Version,
+        }
+
+        return json.Marshal(snapshot)
+}</span>
+
+// RestoreFromSnapshot restores aggregate state from a JSON snapshot
+func (a *BaseAggregate[E]) RestoreFromSnapshot(data []byte, version int64) error <span class="cov8" title="1">{
+        a.mu.Lock()
+        defer a.mu.Unlock()
+
+        var snapshot map[string]interface{}
+        if err := json.Unmarshal(data, &amp;snapshot); err != nil </span><span class="cov8" title="1">{
+                return fmt.Errorf("failed to unmarshal snapshot: %w", err)
+        }</span>
+
+        <span class="cov8" title="1">if id, ok := snapshot["id"].(string); ok </span><span class="cov8" title="1">{
+                a.ID = id
+        }</span>
+
+        <span class="cov8" title="1">a.Version = version
+        a.uncommittedEvents = nil
+
+        return nil</span>
+}
+
+// Projection represents a read model that is updated by events
+type Projection[E any] interface {
+        // Handle processes an event to update the projection
+        Handle(ctx context.Context, event E) error
+        // GetID returns the projection's identifier
+        GetID() string
+}
+
+// CommandBus handles command routing and execution
+type CommandBus[C Command, E any] struct {
+        handlers map[string]CommandHandler[C, E]
+        eventBus *EventBus
+        mu       sync.RWMutex
+}
+
+// NewCommandBus creates a new command bus
+func NewCommandBus[C Command, E any](eventBus *EventBus) *CommandBus[C, E] <span class="cov8" title="1">{
+        return &amp;CommandBus[C, E]{
+                handlers: make(map[string]CommandHandler[C, E]),
+                eventBus: eventBus,
+        }
+}</span>
+
+// Register registers a command handler for a specific command type
+func (cb *CommandBus[C, E]) Register(cmdType string, handler CommandHandler[C, E]) <span class="cov8" title="1">{
+        cb.mu.Lock()
+        defer cb.mu.Unlock()
+        cb.handlers[cmdType] = handler
+}</span>
+
+// Execute executes a command and publishes resulting events
+func (cb *CommandBus[C, E]) Execute(ctx context.Context, cmdType string, cmd C) error <span class="cov8" title="1">{
+        cb.mu.RLock()
+        handler, ok := cb.handlers[cmdType]
+        cb.mu.RUnlock()
+
+        if !ok </span><span class="cov8" title="1">{
+                return fmt.Errorf("no handler registered for command type %s", cmdType)
+        }</span>
+
+        <span class="cov8" title="1">events, err := handler(ctx, cmd)
+        if err != nil </span><span class="cov8" title="1">{
+                return err
+        }</span>
+
+        // Publish events
+        <span class="cov8" title="1">for _, event := range events </span><span class="cov8" title="1">{
+                Publish(cb.eventBus, event)
+        }</span>
+
+        <span class="cov8" title="1">return nil</span>
+}
+
+// QueryBus handles query routing and execution
+type QueryBus[Q Query, R any] struct {
+        handlers map[string]QueryHandler[Q, R]
+        mu       sync.RWMutex
+}
+
+// NewQueryBus creates a new query bus
+func NewQueryBus[Q Query, R any]() *QueryBus[Q, R] <span class="cov8" title="1">{
+        return &amp;QueryBus[Q, R]{
+                handlers: make(map[string]QueryHandler[Q, R]),
+        }
+}</span>
+
+// Register registers a query handler for a specific query type
+func (qb *QueryBus[Q, R]) Register(queryType string, handler QueryHandler[Q, R]) <span class="cov8" title="1">{
+        qb.mu.Lock()
+        defer qb.mu.Unlock()
+        qb.handlers[queryType] = handler
+}</span>
+
+// Execute executes a query and returns the result
+func (qb *QueryBus[Q, R]) Execute(ctx context.Context, queryType string, query Q) (R, error) <span class="cov8" title="1">{
+        qb.mu.RLock()
+        handler, ok := qb.handlers[queryType]
+        qb.mu.RUnlock()
+
+        var zero R
+        if !ok </span><span class="cov8" title="1">{
+                return zero, fmt.Errorf("no handler registered for query type %s", queryType)
+        }</span>
+
+        <span class="cov8" title="1">return handler(ctx, query)</span>
+}
+
+// ProjectionManager manages projections for specific event types
+type ProjectionManager[E any] struct {
+        projections map[string]Projection[E]
+        eventBus    *EventBus
+        mu          sync.RWMutex
+}
+
+// NewProjectionManager creates a new projection manager
+func NewProjectionManager[E any](eventBus *EventBus) *ProjectionManager[E] <span class="cov8" title="1">{
+        return &amp;ProjectionManager[E]{
+                projections: make(map[string]Projection[E]),
+                eventBus:    eventBus,
+        }
+}</span>
+
+// Register registers a projection WITHOUT subscribing to events
+// You must manually subscribe to specific event types
+func (pm *ProjectionManager[E]) Register(projection Projection[E]) error <span class="cov8" title="1">{
+        pm.mu.Lock()
+        pm.projections[projection.GetID()] = projection
+        pm.mu.Unlock()
+
+        // Note: Automatic subscription removed because generic interfaces
+        // don't match concrete types in Go's type system.
+        // Callers must manually subscribe to specific event types.
+
+        return nil
+}</span>
+
+// HandleEvent forwards an event to all registered projections
+func (pm *ProjectionManager[E]) HandleEvent(ctx context.Context, event E) error <span class="cov8" title="1">{
+        pm.mu.RLock()
+        projections := make([]Projection[E], 0, len(pm.projections))
+        for _, p := range pm.projections </span><span class="cov8" title="1">{
+                projections = append(projections, p)
+        }</span>
+        <span class="cov8" title="1">pm.mu.RUnlock()
+
+        for _, projection := range projections </span><span class="cov8" title="1">{
+                if err := projection.Handle(ctx, event); err != nil </span><span class="cov0" title="0">{
+                        return err
+                }</span>
+        }
+        <span class="cov8" title="1">return nil</span>
+}
+
+// Get retrieves a projection by ID
+func (pm *ProjectionManager[E]) Get(id string) (Projection[E], bool) <span class="cov8" title="1">{
+        pm.mu.RLock()
+        defer pm.mu.RUnlock()
+        p, ok := pm.projections[id]
+        return p, ok
+}</span>
+
+// AggregateStore provides storage for aggregates
+type AggregateStore[A Aggregate[E], E any] interface {
+        // Load loads an aggregate by ID
+        Load(ctx context.Context, id string) (A, error)
+        // Save saves an aggregate
+        Save(ctx context.Context, aggregate A) error
+}
+
+// MemoryAggregateStore provides in-memory storage for aggregates
+type MemoryAggregateStore[A Aggregate[E], E any] struct {
+        aggregates map[string]A
+        events     map[string][]E
+        mu         sync.RWMutex
+        factory    func(id string) A
+}
+
+// NewMemoryAggregateStore creates a new memory aggregate store
+func NewMemoryAggregateStore[A Aggregate[E], E any](factory func(id string) A) *MemoryAggregateStore[A, E] <span class="cov8" title="1">{
+        return &amp;MemoryAggregateStore[A, E]{
+                aggregates: make(map[string]A),
+                events:     make(map[string][]E),
+                factory:    factory,
+        }
+}</span>
+
+// Load loads an aggregate by ID
+func (s *MemoryAggregateStore[A, E]) Load(ctx context.Context, id string) (A, error) <span class="cov8" title="1">{
+        s.mu.RLock()
+        defer s.mu.RUnlock()
+
+        // Check if we have it in memory
+        if agg, ok := s.aggregates[id]; ok </span><span class="cov8" title="1">{
+                return agg, nil
+        }</span>
+
+        // Create new aggregate and load events
+        <span class="cov8" title="1">agg := s.factory(id)
+        if events, ok := s.events[id]; ok </span><span class="cov0" title="0">{
+                if err := agg.LoadFromHistory(events); err != nil </span><span class="cov0" title="0">{
+                        var zero A
+                        return zero, err
+                }</span>
+        }
+
+        <span class="cov8" title="1">return agg, nil</span>
+}
+
+// Save saves an aggregate
+func (s *MemoryAggregateStore[A, E]) Save(ctx context.Context, aggregate A) error <span class="cov8" title="1">{
+        s.mu.Lock()
+        defer s.mu.Unlock()
+
+        id := aggregate.GetID()
+
+        // Append uncommitted events to history
+        uncommitted := aggregate.GetUncommittedEvents()
+        s.events[id] = append(s.events[id], uncommitted...)
+
+        // Mark events as committed
+        aggregate.MarkEventsAsCommitted()
+
+        // Store aggregate
+        s.aggregates[id] = aggregate
+
+        return nil
+}</span>
+
+// CommandResult represents the result of a command execution
+type CommandResult[E any] struct {
+        Events  []E
+        Version int64
+}
+
+// AggregateCommandHandler creates a command handler for an aggregate
+func AggregateCommandHandler[C Command, A Aggregate[E], E any](
+        store AggregateStore[A, E],
+        factory func(id string) A,
+        handle func(ctx context.Context, agg A, cmd C) error,
+) CommandHandler[C, E] <span class="cov8" title="1">{
+        return func(ctx context.Context, cmd C) ([]E, error) </span><span class="cov8" title="1">{
+                // This is a simplified version - real implementation would need to extract ID from command
+                // For now, we'll assume commands have an AggregateID() method via interface
+                type aggregateCommand interface {
+                        AggregateID() string
+                }
+
+                cmdWithID, ok := any(cmd).(aggregateCommand)
+                if !ok </span><span class="cov8" title="1">{
+                        return nil, errors.New("command must implement AggregateID() method")
+                }</span>
+
+                <span class="cov8" title="1">id := cmdWithID.AggregateID()
+
+                // Load or create aggregate
+                agg, err := store.Load(ctx, id)
+                if err != nil </span><span class="cov0" title="0">{
+                        // Create new aggregate if not found
+                        agg = factory(id)
+                }</span>
+
+                // Handle command
+                <span class="cov8" title="1">if err := handle(ctx, agg, cmd); err != nil </span><span class="cov0" title="0">{
+                        return nil, err
+                }</span>
+
+                // Get uncommitted events
+                <span class="cov8" title="1">events := agg.GetUncommittedEvents()
+
+                // Save aggregate
+                if err := store.Save(ctx, agg); err != nil </span><span class="cov0" title="0">{
+                        return nil, err
+                }</span>
+
+                <span class="cov8" title="1">return events, nil</span>
+        }
+}
+</pre>
+		
+		<pre class="file" id="file1" style="display: none">package eventbus
+
+import (
+        "context"
+        "fmt"
+        "reflect"
+        "sync"
+        "sync/atomic"
+)
+
+// Handler is a generic event handler function
+type Handler[T any] func(T)
+
+// ContextHandler is a generic event handler function that accepts context
+type ContextHandler[T any] func(context.Context, T)
+
+// SubscribeOption configures a subscription
+type SubscribeOption func(*internalHandler)
+
+// internalHandler wraps a handler with metadata
+type internalHandler struct {
+        handler        any
+        handlerType    reflect.Type
+        eventType      reflect.Type
+        once           bool
+        async          bool
+        sequential     bool
+        acceptsContext bool
+        mu             sync.Mutex
+        executed       uint32 // For once handlers, atomically tracks if executed
+}
+
+// PanicHandler is called when a handler panics
+type PanicHandler func(event any, handlerType reflect.Type, panicValue any)
+
+// PublishHook is called when an event is published
+type PublishHook func(eventType reflect.Type, event any)
+
+// EventBus is a type-safe event bus that can handle multiple event types
+type EventBus struct {
+        handlers      map[reflect.Type][]*internalHandler
+        panicHandler  PanicHandler
+        beforePublish PublishHook
+        afterPublish  PublishHook
+        mu            sync.RWMutex
+        wg            sync.WaitGroup
+
+        // Optional persistence fields (nil if not using persistence)
+        store         EventStore
+        storePosition int64
+        storeMu       sync.RWMutex
+
+        // Extensions for additional features (snapshots, etc.)
+        extensions map[string]interface{}
+}
+
+// BusOption configures an EventBus during creation
+type BusOption func(*EventBus)
+
+// New creates a new EventBus with optional configuration
+func New(opts ...BusOption) *EventBus <span class="cov8" title="1">{
+        bus := &amp;EventBus{
+                handlers: make(map[reflect.Type][]*internalHandler),
+        }
+
+        // Apply all options
+        for _, opt := range opts </span><span class="cov8" title="1">{
+                opt(bus)
+        }</span>
+
+        <span class="cov8" title="1">return bus</span>
+}
+
+// Once configures the handler to be called only once
+func Once() SubscribeOption <span class="cov8" title="1">{
+        return func(h *internalHandler) </span><span class="cov8" title="1">{
+                h.once = true
+        }</span>
+}
+
+// Async configures the handler to run asynchronously
+// If sequential is true, events are processed one at a time (no concurrency)
+func Async(sequential bool) SubscribeOption <span class="cov8" title="1">{
+        return func(h *internalHandler) </span><span class="cov8" title="1">{
+                h.async = true
+                h.sequential = sequential
+        }</span>
+}
+
+// Subscribe registers a handler for events of type T
+func Subscribe[T any](bus *EventBus, handler Handler[T], opts ...SubscribeOption) error <span class="cov8" title="1">{
+        // Validate bus
+        if bus == nil </span><span class="cov8" title="1">{
+                return fmt.Errorf("eventbus: bus cannot be nil")
+        }</span>
+
+        // Validate handler
+        <span class="cov8" title="1">if handler == nil </span><span class="cov8" title="1">{
+                return fmt.Errorf("eventbus: handler cannot be nil")
+        }</span>
+
+        <span class="cov8" title="1">eventType := reflect.TypeOf((*T)(nil)).Elem()
+
+        h := &amp;internalHandler{
+                handler:     handler,
+                handlerType: reflect.TypeOf(handler),
+                eventType:   eventType,
+        }
+
+        // Apply options with validation
+        for _, opt := range opts </span><span class="cov8" title="1">{
+                if opt == nil </span><span class="cov8" title="1">{
+                        return fmt.Errorf("eventbus: subscribe option cannot be nil")
+                }</span>
+                <span class="cov8" title="1">opt(h)</span>
+        }
+
+        <span class="cov8" title="1">bus.mu.Lock()
+        defer bus.mu.Unlock()
+
+        bus.handlers[eventType] = append(bus.handlers[eventType], h)
+        return nil</span>
+}
+
+// SubscribeContext registers a context-aware handler for events of type T
+func SubscribeContext[T any](bus *EventBus, handler ContextHandler[T], opts ...SubscribeOption) error <span class="cov8" title="1">{
+        // Validate bus
+        if bus == nil </span><span class="cov8" title="1">{
+                return fmt.Errorf("eventbus: bus cannot be nil")
+        }</span>
+
+        // Validate handler
+        <span class="cov8" title="1">if handler == nil </span><span class="cov8" title="1">{
+                return fmt.Errorf("eventbus: handler cannot be nil")
+        }</span>
+
+        <span class="cov8" title="1">eventType := reflect.TypeOf((*T)(nil)).Elem()
+
+        h := &amp;internalHandler{
+                handler:        handler,
+                handlerType:    reflect.TypeOf(handler),
+                eventType:      eventType,
+                acceptsContext: true,
+        }
+
+        // Apply options with validation
+        for _, opt := range opts </span><span class="cov8" title="1">{
+                if opt == nil </span><span class="cov8" title="1">{
+                        return fmt.Errorf("eventbus: subscribe option cannot be nil")
+                }</span>
+                <span class="cov8" title="1">opt(h)</span>
+        }
+
+        <span class="cov8" title="1">bus.mu.Lock()
+        defer bus.mu.Unlock()
+
+        bus.handlers[eventType] = append(bus.handlers[eventType], h)
+        return nil</span>
+}
+
+// Unsubscribe removes a specific handler for events of type T
+// The handler parameter must be the exact same function reference that was subscribed
+func Unsubscribe[T any, H any](bus *EventBus, handler H) error <span class="cov8" title="1">{
+        eventType := reflect.TypeOf((*T)(nil)).Elem()
+        handlerPtr := reflect.ValueOf(handler).Pointer()
+
+        bus.mu.Lock()
+        defer bus.mu.Unlock()
+
+        handlers, exists := bus.handlers[eventType]
+        if !exists </span><span class="cov8" title="1">{
+                return fmt.Errorf("no handlers found for event type %v", eventType)
+        }</span>
+
+        <span class="cov8" title="1">for i, h := range handlers </span><span class="cov8" title="1">{
+                if reflect.ValueOf(h.handler).Pointer() == handlerPtr </span><span class="cov8" title="1">{
+                        // Remove handler
+                        bus.handlers[eventType] = append(handlers[:i], handlers[i+1:]...)
+                        return nil
+                }</span>
+        }
+
+        <span class="cov8" title="1">return fmt.Errorf("handler not found for event type %v", eventType)</span>
+}
+
+// Publish sends an event to all registered handlers
+func Publish[T any](bus *EventBus, event T) <span class="cov8" title="1">{
+        PublishContext(bus, context.Background(), event)
+}</span>
+
+// PublishContext sends an event with context to all registered handlers
+func PublishContext[T any](bus *EventBus, ctx context.Context, event T) <span class="cov8" title="1">{
+        eventType := reflect.TypeOf(event)
+
+        // Call beforePublish hook if set
+        bus.mu.RLock()
+        beforeHook := bus.beforePublish
+        bus.mu.RUnlock()
+
+        if beforeHook != nil </span><span class="cov8" title="1">{
+                beforeHook(eventType, event)
+        }</span>
+
+        <span class="cov8" title="1">bus.mu.RLock()
+        handlers, exists := bus.handlers[eventType]
+        if !exists </span><span class="cov8" title="1">{
+                bus.mu.RUnlock()
+
+                // Still call afterPublish hook even if no handlers
+                bus.mu.RLock()
+                afterHook := bus.afterPublish
+                bus.mu.RUnlock()
+
+                if afterHook != nil </span><span class="cov8" title="1">{
+                        afterHook(eventType, event)
+                }</span>
+                <span class="cov8" title="1">return</span>
+        }
+
+        // Copy handlers slice to avoid holding lock during execution
+        <span class="cov8" title="1">handlersCopy := make([]*internalHandler, len(handlers))
+        copy(handlersCopy, handlers)
+        bus.mu.RUnlock()
+
+        // Execute handlers
+        for _, h := range handlersCopy </span><span class="cov8" title="1">{
+                // Check if context is cancelled before processing
+                if ctx.Err() != nil </span><span class="cov8" title="1">{
+                        // Context cancelled, skip remaining handlers
+                        break</span>
+                }
+
+                // For once handlers, check if already executed
+                <span class="cov8" title="1">if h.once &amp;&amp; !atomic.CompareAndSwapUint32(&amp;h.executed, 0, 1) </span><span class="cov8" title="1">{
+                        // Already executed, skip
+                        continue</span>
+                }
+
+                <span class="cov8" title="1">if h.async </span><span class="cov8" title="1">{
+                        bus.wg.Add(1)
+                        go func(handler *internalHandler, capturedCtx context.Context) </span><span class="cov8" title="1">{
+                                defer bus.wg.Done()
+                                if handler.sequential </span><span class="cov8" title="1">{
+                                        handler.mu.Lock()
+                                        defer handler.mu.Unlock()
+                                }</span>
+                                // Check context cancellation in goroutine
+                                <span class="cov8" title="1">if capturedCtx.Err() != nil </span><span class="cov8" title="1">{
+                                        return
+                                }</span>
+                                <span class="cov8" title="1">callHandlerWithContext(handler, capturedCtx, event, bus.panicHandler)</span>
+                        }(h, ctx)
+                } else<span class="cov8" title="1"> {
+                        callHandlerWithContext(h, ctx, event, bus.panicHandler)
+                }</span>
+        }
+
+        // Remove executed once handlers
+        // We do this in a separate pass to avoid race conditions
+        <span class="cov8" title="1">bus.mu.Lock()
+        handlers = bus.handlers[eventType]
+        if len(handlers) == 0 </span><span class="cov8" title="1">{
+                bus.mu.Unlock()
+
+                // Call afterPublish hook
+                bus.mu.RLock()
+                afterHook := bus.afterPublish
+                bus.mu.RUnlock()
+
+                if afterHook != nil </span><span class="cov8" title="1">{
+                        afterHook(eventType, event)
+                }</span>
+                <span class="cov8" title="1">return</span>
+        }
+
+        // Check if any once handlers were executed and need removal
+        <span class="cov8" title="1">hasExecutedOnce := false
+        for _, h := range handlers </span><span class="cov8" title="1">{
+                if h.once &amp;&amp; atomic.LoadUint32(&amp;h.executed) == 1 </span><span class="cov8" title="1">{
+                        hasExecutedOnce = true
+                        break</span>
+                }
+        }
+
+        <span class="cov8" title="1">if hasExecutedOnce </span><span class="cov8" title="1">{
+                // Create a new slice without the executed once handlers
+                newHandlers := make([]*internalHandler, 0, len(handlers))
+                for _, h := range handlers </span><span class="cov8" title="1">{
+                        // Keep handler if it's not a once handler OR if it's a once handler that hasn't been executed
+                        if !h.once || atomic.LoadUint32(&amp;h.executed) == 0 </span><span class="cov8" title="1">{
+                                newHandlers = append(newHandlers, h)
+                        }</span>
+                }
+                <span class="cov8" title="1">bus.handlers[eventType] = newHandlers</span>
+        }
+        <span class="cov8" title="1">bus.mu.Unlock()
+
+        // Call afterPublish hook
+        bus.mu.RLock()
+        afterHook := bus.afterPublish
+        bus.mu.RUnlock()
+
+        if afterHook != nil </span><span class="cov8" title="1">{
+                afterHook(eventType, event)
+        }</span>
+}
+
+// callHandlerWithContext executes a handler with the given context and event
+func callHandlerWithContext[T any](h *internalHandler, ctx context.Context, event T, panicHandler PanicHandler) <span class="cov8" title="1">{
+        defer func() </span><span class="cov8" title="1">{
+                if r := recover(); r != nil </span><span class="cov8" title="1">{
+                        if panicHandler != nil </span><span class="cov8" title="1">{
+                                panicHandler(event, h.handlerType, r)
+                        }</span>
+                }
+        }()
+
+        <span class="cov8" title="1">if h.acceptsContext </span><span class="cov8" title="1">{
+                if fn, ok := h.handler.(ContextHandler[T]); ok </span><span class="cov8" title="1">{
+                        fn(ctx, event)
+                }</span> else<span class="cov0" title="0"> if fn, ok := h.handler.(func(context.Context, any)); ok </span><span class="cov0" title="0">{
+                        // Handle generic context handler (used by CQRS projections)
+                        fn(ctx, event)
+                }</span> else<span class="cov0" title="0"> if fn, ok := h.handler.(func(context.Context, any) error); ok </span><span class="cov0" title="0">{
+                        // Handle generic context handler with error (used by CQRS projections)
+                        _ = fn(ctx, event)
+                }</span>
+        } else<span class="cov8" title="1"> {
+                if fn, ok := h.handler.(Handler[T]); ok </span><span class="cov8" title="1">{
+                        fn(event)
+                }</span>
+        }
+}
+
+// HasSubscribers returns true if there are any handlers for event type T
+func HasSubscribers[T any](bus *EventBus) bool <span class="cov8" title="1">{
+        eventType := reflect.TypeOf((*T)(nil)).Elem()
+
+        bus.mu.RLock()
+        defer bus.mu.RUnlock()
+
+        handlers, exists := bus.handlers[eventType]
+        return exists &amp;&amp; len(handlers) &gt; 0
+}</span>
+
+// WaitAsync waits for all async handlers to complete
+func (bus *EventBus) WaitAsync() <span class="cov8" title="1">{
+        bus.wg.Wait()
+}</span>
+
+// Clear removes all handlers for event type T
+func Clear[T any](bus *EventBus) <span class="cov8" title="1">{
+        eventType := reflect.TypeOf((*T)(nil)).Elem()
+
+        bus.mu.Lock()
+        defer bus.mu.Unlock()
+
+        delete(bus.handlers, eventType)
+}</span>
+
+// ClearAll removes all handlers
+func (bus *EventBus) ClearAll() <span class="cov8" title="1">{
+        bus.mu.Lock()
+        defer bus.mu.Unlock()
+
+        bus.handlers = make(map[reflect.Type][]*internalHandler)
+}</span>
+
+// SetPanicHandler sets a function to be called when a handler panics
+func (bus *EventBus) SetPanicHandler(handler PanicHandler) <span class="cov8" title="1">{
+        bus.mu.Lock()
+        defer bus.mu.Unlock()
+
+        bus.panicHandler = handler
+}</span>
+
+// SetBeforePublishHook sets a hook to be called before handlers are executed
+func (bus *EventBus) SetBeforePublishHook(hook PublishHook) <span class="cov8" title="1">{
+        bus.mu.Lock()
+        defer bus.mu.Unlock()
+
+        bus.beforePublish = hook
+}</span>
+
+// SetAfterPublishHook sets a hook to be called after all handlers have executed
+func (bus *EventBus) SetAfterPublishHook(hook PublishHook) <span class="cov8" title="1">{
+        bus.mu.Lock()
+        defer bus.mu.Unlock()
+
+        bus.afterPublish = hook
+}</span>
+</pre>
+		
+		<pre class="file" id="file2" style="display: none">package eventbus
+
+import (
+        "context"
+        "encoding/json"
+        "fmt"
+        "reflect"
+        "sync"
+        "time"
+)
+
+// EventStore defines the interface for persisting events
+type EventStore interface {
+        // Save an event to storage
+        Save(ctx context.Context, event *StoredEvent) error
+
+        // Load events from storage within a range
+        Load(ctx context.Context, from, to int64) ([]*StoredEvent, error)
+
+        // Get the current position (highest event number)
+        GetPosition(ctx context.Context) (int64, error)
+
+        // Save subscription position for resumable subscriptions
+        SaveSubscriptionPosition(ctx context.Context, subscriptionID string, position int64) error
+
+        // Load subscription position
+        LoadSubscriptionPosition(ctx context.Context, subscriptionID string) (int64, error)
+}
+
+// StoredEvent represents an event in storage
+type StoredEvent struct {
+        Position  int64           `json:"position"`
+        Type      string          `json:"type"`
+        Data      json.RawMessage `json:"data"`
+        Timestamp time.Time       `json:"timestamp"`
+}
+
+// WithStore enables persistence with the given store
+func WithStore(store EventStore) BusOption <span class="cov8" title="1">{
+        return func(bus *EventBus) </span><span class="cov8" title="1">{
+                bus.store = store
+
+                // Load current position
+                ctx := context.Background()
+                if pos, err := store.GetPosition(ctx); err == nil </span><span class="cov8" title="1">{
+                        bus.storePosition = pos
+                }</span>
+
+                // Chain the persistence hook with any existing hook
+                <span class="cov8" title="1">existingHook := bus.beforePublish
+                bus.beforePublish = func(eventType reflect.Type, event any) </span><span class="cov8" title="1">{
+                        // Call existing hook first if any
+                        if existingHook != nil </span><span class="cov8" title="1">{
+                                existingHook(eventType, event)
+                        }</span>
+                        // Then persist the event
+                        <span class="cov8" title="1">bus.persistEvent(eventType, event)</span>
+                }
+        }
+}
+
+// persistEvent saves an event to storage (only if store is configured)
+func (bus *EventBus) persistEvent(eventType reflect.Type, event any) <span class="cov8" title="1">{
+        if bus.store == nil </span><span class="cov8" title="1">{
+                return // No persistence configured
+        }</span>
+
+        <span class="cov8" title="1">bus.storeMu.Lock()
+        bus.storePosition++
+        position := bus.storePosition
+        bus.storeMu.Unlock()
+
+        data, err := json.Marshal(event)
+        if err != nil </span><span class="cov8" title="1">{
+                // Silent fail for now, could add error handler option
+                return
+        }</span>
+
+        // Build full type name with package path
+        <span class="cov8" title="1">typeName := eventType.String()
+        if pkg := eventType.PkgPath(); pkg != "" </span><span class="cov8" title="1">{
+                typeName = pkg + "/" + eventType.Name()
+        }</span>
+
+        <span class="cov8" title="1">stored := &amp;StoredEvent{
+                Position:  position,
+                Type:      typeName,
+                Data:      data,
+                Timestamp: time.Now(),
+        }
+
+        ctx := context.Background()
+        bus.store.Save(ctx, stored)</span>
+}
+
+// Replay replays events from a position
+func (bus *EventBus) Replay(ctx context.Context, from int64, handler func(*StoredEvent) error) error <span class="cov8" title="1">{
+        if bus.store == nil </span><span class="cov8" title="1">{
+                return fmt.Errorf("replay requires persistence (use WithStore option)")
+        }</span>
+
+        <span class="cov8" title="1">bus.storeMu.RLock()
+        to := bus.storePosition
+        bus.storeMu.RUnlock()
+
+        events, err := bus.store.Load(ctx, from, to)
+        if err != nil </span><span class="cov8" title="1">{
+                return fmt.Errorf("load events: %w", err)
+        }</span>
+
+        <span class="cov8" title="1">for _, event := range events </span><span class="cov8" title="1">{
+                if err := handler(event); err != nil </span><span class="cov8" title="1">{
+                        return fmt.Errorf("handle event at position %d: %w", event.Position, err)
+                }</span>
+        }
+
+        <span class="cov8" title="1">return nil</span>
+}
+
+// IsPersistent returns true if persistence is enabled
+func (bus *EventBus) IsPersistent() bool <span class="cov8" title="1">{
+        return bus.store != nil
+}</span>
+
+// GetStore returns the event store (or nil if not persistent)
+func (bus *EventBus) GetStore() EventStore <span class="cov8" title="1">{
+        return bus.store
+}</span>
+
+// SubscribeWithReplay subscribes and replays missed events
+func SubscribeWithReplay[T any](
+        bus *EventBus,
+        subscriptionID string,
+        handler Handler[T],
+        opts ...SubscribeOption,
+) error <span class="cov8" title="1">{
+        if bus.store == nil </span><span class="cov8" title="1">{
+                return fmt.Errorf("SubscribeWithReplay requires persistence (use WithStore option)")
+        }</span>
+
+        <span class="cov8" title="1">ctx := context.Background()
+
+        // Load last position for this subscription
+        lastPos, _ := bus.store.LoadSubscriptionPosition(ctx, subscriptionID)
+
+        // Replay missed events
+        var eventType = reflect.TypeOf((*T)(nil)).Elem()
+        // Build full type name with package path for comparison
+        typeName := eventType.String()
+        if pkg := eventType.PkgPath(); pkg != "" </span><span class="cov8" title="1">{
+                typeName = pkg + "/" + eventType.Name()
+        }</span>
+        <span class="cov8" title="1">err := bus.Replay(ctx, lastPos+1, func(stored *StoredEvent) error </span><span class="cov8" title="1">{
+                // Only replay events of the correct type
+                if stored.Type != typeName </span><span class="cov8" title="1">{
+                        return nil
+                }</span>
+
+                <span class="cov8" title="1">var event T
+                if err := json.Unmarshal(stored.Data, &amp;event); err != nil </span><span class="cov8" title="1">{
+                        return err
+                }</span>
+
+                <span class="cov8" title="1">handler(event)
+
+                // Update position
+                bus.store.SaveSubscriptionPosition(ctx, subscriptionID, stored.Position)
+                return nil</span>
+        })
+
+        <span class="cov8" title="1">if err != nil </span><span class="cov8" title="1">{
+                return fmt.Errorf("replay events: %w", err)
+        }</span>
+
+        // Subscribe for future events with position tracking
+        <span class="cov8" title="1">wrappedHandler := func(event T) </span><span class="cov8" title="1">{
+                handler(event)
+
+                // Update position after handling
+                bus.storeMu.RLock()
+                pos := bus.storePosition
+                bus.storeMu.RUnlock()
+
+                bus.store.SaveSubscriptionPosition(ctx, subscriptionID, pos)
+        }</span>
+
+        <span class="cov8" title="1">return Subscribe(bus, wrappedHandler, opts...)</span>
+}
+
+// MemoryStore is a simple in-memory implementation of EventStore
+type MemoryStore struct {
+        events        []*StoredEvent
+        subscriptions map[string]int64
+        mu            sync.RWMutex
+}
+
+// NewMemoryStore creates a new in-memory event store
+func NewMemoryStore() *MemoryStore <span class="cov8" title="1">{
+        return &amp;MemoryStore{
+                events:        make([]*StoredEvent, 0),
+                subscriptions: make(map[string]int64),
+        }
+}</span>
+
+// Save implements EventStore
+func (m *MemoryStore) Save(ctx context.Context, event *StoredEvent) error <span class="cov8" title="1">{
+        m.mu.Lock()
+        defer m.mu.Unlock()
+
+        // Set position for the event
+        event.Position = int64(len(m.events)) + 1
+        m.events = append(m.events, event)
+        return nil
+}</span>
+
+// Load implements EventStore
+func (m *MemoryStore) Load(ctx context.Context, from, to int64) ([]*StoredEvent, error) <span class="cov8" title="1">{
+        m.mu.RLock()
+        defer m.mu.RUnlock()
+
+        var result []*StoredEvent
+        for _, event := range m.events </span><span class="cov8" title="1">{
+                if event.Position &gt;= from &amp;&amp; (to == -1 || event.Position &lt;= to) </span><span class="cov8" title="1">{
+                        result = append(result, event)
+                }</span>
+        }
+
+        <span class="cov8" title="1">return result, nil</span>
+}
+
+// GetPosition implements EventStore
+func (m *MemoryStore) GetPosition(ctx context.Context) (int64, error) <span class="cov8" title="1">{
+        m.mu.RLock()
+        defer m.mu.RUnlock()
+
+        if len(m.events) == 0 </span><span class="cov8" title="1">{
+                return 0, nil
+        }</span>
+
+        <span class="cov8" title="1">return m.events[len(m.events)-1].Position, nil</span>
+}
+
+// SaveSubscriptionPosition implements EventStore
+func (m *MemoryStore) SaveSubscriptionPosition(ctx context.Context, subscriptionID string, position int64) error <span class="cov8" title="1">{
+        m.mu.Lock()
+        defer m.mu.Unlock()
+
+        m.subscriptions[subscriptionID] = position
+        return nil
+}</span>
+
+// LoadSubscriptionPosition implements EventStore
+func (m *MemoryStore) LoadSubscriptionPosition(ctx context.Context, subscriptionID string) (int64, error) <span class="cov8" title="1">{
+        m.mu.RLock()
+        defer m.mu.RUnlock()
+
+        pos, ok := m.subscriptions[subscriptionID]
+        if !ok </span><span class="cov8" title="1">{
+                return 0, nil
+        }</span>
+
+        <span class="cov8" title="1">return pos, nil</span>
+}
+</pre>
+		
+		<pre class="file" id="file3" style="display: none">package eventbus
+
+import (
+        "context"
+        "encoding/json"
+        "errors"
+        "fmt"
+        "sync"
+        "time"
+)
+
+// Snapshot represents a point-in-time state of an aggregate
+type Snapshot struct {
+        AggregateID   string          `json:"aggregate_id"`
+        AggregateType string          `json:"aggregate_type"`
+        Version       int64           `json:"version"`
+        Data          json.RawMessage `json:"data"`
+        Timestamp     time.Time       `json:"timestamp"`
+}
+
+// SnapshotStore defines the interface for storing and retrieving snapshots
+type SnapshotStore interface {
+        // Save stores a snapshot
+        Save(ctx context.Context, snapshot *Snapshot) error
+        // Load retrieves the latest snapshot for an aggregate
+        Load(ctx context.Context, aggregateID string) (*Snapshot, error)
+        // Delete removes all snapshots for an aggregate (optional cleanup)
+        Delete(ctx context.Context, aggregateID string) error
+}
+
+// SnapshotPolicy determines when to create snapshots
+type SnapshotPolicy interface {
+        // ShouldSnapshot returns true if a snapshot should be created
+        ShouldSnapshot(version int64, lastSnapshotVersion int64, lastSnapshotTime time.Time) bool
+}
+
+// SnapshottableAggregate extends Aggregate with snapshot capabilities
+type SnapshottableAggregate[E any] interface {
+        Aggregate[E]
+        // CreateSnapshot serializes the current state
+        CreateSnapshot() ([]byte, error)
+        // RestoreFromSnapshot deserializes state from a snapshot
+        RestoreFromSnapshot(data []byte, version int64) error
+}
+
+// PolicyFunc is a function that implements SnapshotPolicy
+type PolicyFunc func(version int64, lastSnapshotVersion int64, lastSnapshotTime time.Time) bool
+
+func (f PolicyFunc) ShouldSnapshot(version int64, lastSnapshotVersion int64, lastSnapshotTime time.Time) bool <span class="cov8" title="1">{
+        return f(version, lastSnapshotVersion, lastSnapshotTime)
+}</span>
+
+// EveryNEvents creates a policy that snapshots after N events
+func EveryNEvents(n int64) SnapshotPolicy <span class="cov8" title="1">{
+        if n &lt;= 0 </span><span class="cov8" title="1">{
+                n = 1
+        }</span>
+        <span class="cov8" title="1">return PolicyFunc(func(version int64, lastSnapshotVersion int64, lastSnapshotTime time.Time) bool </span><span class="cov8" title="1">{
+                return version-lastSnapshotVersion &gt;= n
+        }</span>)
+}
+
+// TimeInterval creates a policy that snapshots after a time interval
+func TimeInterval(interval time.Duration) SnapshotPolicy <span class="cov8" title="1">{
+        return PolicyFunc(func(version int64, lastSnapshotVersion int64, lastSnapshotTime time.Time) bool </span><span class="cov8" title="1">{
+                return time.Since(lastSnapshotTime) &gt;= interval
+        }</span>)
+}
+
+// Never creates a policy that never takes snapshots
+func Never() SnapshotPolicy <span class="cov8" title="1">{
+        return PolicyFunc(func(version int64, lastSnapshotVersion int64, lastSnapshotTime time.Time) bool </span><span class="cov8" title="1">{
+                return false
+        }</span>)
+}
+
+// Combined creates a policy that triggers when ANY condition is met
+func Combined(policies ...SnapshotPolicy) SnapshotPolicy <span class="cov8" title="1">{
+        return PolicyFunc(func(version int64, lastSnapshotVersion int64, lastSnapshotTime time.Time) bool </span><span class="cov8" title="1">{
+                for _, policy := range policies </span><span class="cov8" title="1">{
+                        if policy.ShouldSnapshot(version, lastSnapshotVersion, lastSnapshotTime) </span><span class="cov8" title="1">{
+                                return true
+                        }</span>
+                }
+                <span class="cov8" title="1">return false</span>
+        })
+}
+
+// SnapshotManager handles snapshot creation and loading
+type SnapshotManager struct {
+        store  SnapshotStore
+        policy SnapshotPolicy
+        mu     sync.RWMutex
+        // Track last snapshot info per aggregate
+        lastSnapshots map[string]*snapshotInfo
+}
+
+type snapshotInfo struct {
+        version   int64
+        timestamp time.Time
+}
+
+// NewSnapshotManager creates a new snapshot manager
+func NewSnapshotManager(store SnapshotStore, policy SnapshotPolicy) *SnapshotManager <span class="cov8" title="1">{
+        if policy == nil </span><span class="cov8" title="1">{
+                policy = Never()
+        }</span>
+        <span class="cov8" title="1">return &amp;SnapshotManager{
+                store:         store,
+                policy:        policy,
+                lastSnapshots: make(map[string]*snapshotInfo),
+        }</span>
+}
+
+// MaybeSnapshot checks if a snapshot should be taken and creates it if needed
+func (sm *SnapshotManager) MaybeSnapshot(ctx context.Context, aggregateID string, version int64, createSnapshot func() ([]byte, error)) error <span class="cov8" title="1">{
+        if sm.store == nil </span><span class="cov8" title="1">{
+                return nil // No snapshot store configured
+        }</span>
+
+        <span class="cov8" title="1">sm.mu.RLock()
+        lastInfo, exists := sm.lastSnapshots[aggregateID]
+        sm.mu.RUnlock()
+
+        if !exists </span><span class="cov8" title="1">{
+                lastInfo = &amp;snapshotInfo{version: 0, timestamp: time.Time{}}
+        }</span>
+
+        <span class="cov8" title="1">if !sm.policy.ShouldSnapshot(version, lastInfo.version, lastInfo.timestamp) </span><span class="cov8" title="1">{
+                return nil
+        }</span>
+
+        // Create snapshot
+        <span class="cov8" title="1">data, err := createSnapshot()
+        if err != nil </span><span class="cov8" title="1">{
+                return fmt.Errorf("failed to create snapshot: %w", err)
+        }</span>
+
+        <span class="cov8" title="1">snapshot := &amp;Snapshot{
+                AggregateID:   aggregateID,
+                AggregateType: "aggregate",
+                Version:       version,
+                Data:          data,
+                Timestamp:     time.Now(),
+        }
+
+        if err := sm.store.Save(ctx, snapshot); err != nil </span><span class="cov8" title="1">{
+                return fmt.Errorf("failed to save snapshot: %w", err)
+        }</span>
+
+        // Update tracking
+        <span class="cov8" title="1">sm.mu.Lock()
+        sm.lastSnapshots[aggregateID] = &amp;snapshotInfo{
+                version:   version,
+                timestamp: snapshot.Timestamp,
+        }
+        sm.mu.Unlock()
+
+        return nil</span>
+}
+
+// LoadSnapshot loads the latest snapshot for an aggregate
+func (sm *SnapshotManager) LoadSnapshot(ctx context.Context, aggregateID string) (*Snapshot, error) <span class="cov8" title="1">{
+        if sm.store == nil </span><span class="cov8" title="1">{
+                return nil, errors.New("no snapshot store configured")
+        }</span>
+        <span class="cov8" title="1">return sm.store.Load(ctx, aggregateID)</span>
+}
+
+// MemorySnapshotStore is an in-memory implementation of SnapshotStore
+type MemorySnapshotStore struct {
+        snapshots map[string]*Snapshot
+        mu        sync.RWMutex
+}
+
+// NewMemorySnapshotStore creates a new in-memory snapshot store
+func NewMemorySnapshotStore() *MemorySnapshotStore <span class="cov8" title="1">{
+        return &amp;MemorySnapshotStore{
+                snapshots: make(map[string]*Snapshot),
+        }
+}</span>
+
+// Save stores a snapshot
+func (s *MemorySnapshotStore) Save(ctx context.Context, snapshot *Snapshot) error <span class="cov8" title="1">{
+        if snapshot == nil </span><span class="cov8" title="1">{
+                return errors.New("snapshot cannot be nil")
+        }</span>
+        <span class="cov8" title="1">if snapshot.AggregateID == "" </span><span class="cov8" title="1">{
+                return errors.New("aggregate ID is required")
+        }</span>
+
+        <span class="cov8" title="1">s.mu.Lock()
+        defer s.mu.Unlock()
+
+        // Only keep the latest snapshot per aggregate
+        s.snapshots[snapshot.AggregateID] = snapshot
+        return nil</span>
+}
+
+// Load retrieves the latest snapshot for an aggregate
+func (s *MemorySnapshotStore) Load(ctx context.Context, aggregateID string) (*Snapshot, error) <span class="cov8" title="1">{
+        if aggregateID == "" </span><span class="cov8" title="1">{
+                return nil, errors.New("aggregate ID is required")
+        }</span>
+
+        <span class="cov8" title="1">s.mu.RLock()
+        defer s.mu.RUnlock()
+
+        snapshot, exists := s.snapshots[aggregateID]
+        if !exists </span><span class="cov8" title="1">{
+                return nil, fmt.Errorf("snapshot not found for aggregate %s", aggregateID)
+        }</span>
+
+        // Return a copy to prevent external modifications
+        <span class="cov8" title="1">snapshotCopy := *snapshot
+        return &amp;snapshotCopy, nil</span>
+}
+
+// Delete removes all snapshots for an aggregate
+func (s *MemorySnapshotStore) Delete(ctx context.Context, aggregateID string) error <span class="cov8" title="1">{
+        if aggregateID == "" </span><span class="cov8" title="1">{
+                return errors.New("aggregate ID is required")
+        }</span>
+
+        <span class="cov8" title="1">s.mu.Lock()
+        defer s.mu.Unlock()
+
+        delete(s.snapshots, aggregateID)
+        return nil</span>
+}
+
+// WithSnapshots is a BusOption that enables aggregate snapshots
+func WithSnapshots(store SnapshotStore, policy SnapshotPolicy) BusOption <span class="cov8" title="1">{
+        return func(bus *EventBus) </span><span class="cov8" title="1">{
+                // Store snapshot manager in bus for access by CQRS
+                if bus.extensions == nil </span><span class="cov8" title="1">{
+                        bus.extensions = make(map[string]interface{})
+                }</span>
+                <span class="cov8" title="1">bus.extensions["snapshot_manager"] = NewSnapshotManager(store, policy)</span>
+        }
+}
+
+// GetSnapshotManager retrieves the snapshot manager from the bus
+func GetSnapshotManager(bus *EventBus) *SnapshotManager <span class="cov8" title="1">{
+        if bus.extensions == nil </span><span class="cov8" title="1">{
+                return nil
+        }</span>
+        <span class="cov8" title="1">if sm, ok := bus.extensions["snapshot_manager"].(*SnapshotManager); ok </span><span class="cov8" title="1">{
+                return sm
+        }</span>
+        <span class="cov8" title="1">return nil</span>
+}
+
+// LoadAggregate loads an aggregate using snapshot + events since snapshot
+func LoadAggregate[A SnapshottableAggregate[E], E any](
+        ctx context.Context,
+        aggregateID string,
+        createAggregate func() A,
+        eventStore EventStore,
+        snapshotStore SnapshotStore,
+) (A, error) <span class="cov8" title="1">{
+        var zero A
+        if aggregateID == "" </span><span class="cov8" title="1">{
+                return zero, errors.New("aggregate ID is required")
+        }</span>
+
+        // Create new aggregate instance
+        <span class="cov8" title="1">aggregate := createAggregate()
+
+        var fromVersion int64 = 0
+
+        // Try to load snapshot if store is available
+        if snapshotStore != nil </span><span class="cov8" title="1">{
+                snapshot, err := snapshotStore.Load(ctx, aggregateID)
+                if err == nil &amp;&amp; snapshot != nil </span><span class="cov8" title="1">{
+                        // Restore from snapshot
+                        if err := aggregate.RestoreFromSnapshot(snapshot.Data, snapshot.Version); err != nil </span><span class="cov8" title="1">{
+                                return zero, fmt.Errorf("failed to restore from snapshot: %w", err)
+                        }</span>
+                        <span class="cov8" title="1">fromVersion = snapshot.Version</span>
+                }
+                // If no snapshot found, we'll load all events from the beginning
+        }
+
+        // Load events after snapshot
+        <span class="cov8" title="1">if eventStore != nil </span><span class="cov8" title="1">{
+                events, err := eventStore.Load(ctx, fromVersion, -1)
+                if err != nil </span><span class="cov8" title="1">{
+                        return zero, fmt.Errorf("failed to load events: %w", err)
+                }</span>
+
+                // Filter events for this aggregate and unmarshal them
+                <span class="cov8" title="1">var aggregateEvents []E
+                for _, storedEvent := range events </span><span class="cov8" title="1">{
+                        // We need a way to determine if an event belongs to this aggregate
+                        // This is typically done by examining the event data
+                        // For now, we'll unmarshal and check if it has the aggregate ID
+                        var eventData map[string]interface{}
+                        if err := json.Unmarshal(storedEvent.Data, &amp;eventData); err != nil </span><span class="cov8" title="1">{
+                                continue</span> // Skip events that can't be unmarshaled
+                        }
+
+                        // Check if event belongs to this aggregate (implementation-specific)
+                        // This assumes events have an "aggregate_id" or similar field
+                        <span class="cov8" title="1">if aggID, ok := eventData["aggregate_id"].(string); ok &amp;&amp; aggID == aggregateID </span><span class="cov8" title="1">{
+                                // Reconstruct the actual event type
+                                // This requires type information to be stored with the event
+                                var event E
+                                if err := json.Unmarshal(storedEvent.Data, &amp;event); err == nil </span><span class="cov8" title="1">{
+                                        aggregateEvents = append(aggregateEvents, event)
+                                }</span>
+                        }
+                }
+
+                // Apply events to aggregate if there are any
+                <span class="cov8" title="1">if len(aggregateEvents) &gt; 0 </span><span class="cov8" title="1">{
+                        if err := aggregate.LoadFromHistory(aggregateEvents); err != nil </span><span class="cov8" title="1">{
+                                return zero, fmt.Errorf("failed to load from history: %w", err)
+                        }</span>
+                }
+        }
+
+        <span class="cov8" title="1">return aggregate, nil</span>
+}
+
+// SaveAggregate saves an aggregate's uncommitted events and optionally creates a snapshot
+func SaveAggregate[A SnapshottableAggregate[E], E any](
+        ctx context.Context,
+        aggregate A,
+        eventStore EventStore,
+        snapshotManager *SnapshotManager,
+) error <span class="cov8" title="1">{
+        // Save uncommitted events
+        events := aggregate.GetUncommittedEvents()
+        for _, event := range events </span><span class="cov8" title="1">{
+                // Marshal event
+                eventData, err := json.Marshal(event)
+                if err != nil </span><span class="cov8" title="1">{
+                        return fmt.Errorf("failed to marshal event: %w", err)
+                }</span>
+
+                // Create stored event
+                <span class="cov8" title="1">storedEvent := &amp;StoredEvent{
+                        Type:      fmt.Sprintf("%T", event),
+                        Data:      eventData,
+                        Timestamp: time.Now(),
+                        // Position will be set by the event store
+                }
+
+                // Save to event store
+                if err := eventStore.Save(ctx, storedEvent); err != nil </span><span class="cov8" title="1">{
+                        return fmt.Errorf("failed to save event: %w", err)
+                }</span>
+        }
+
+        // Mark events as committed
+        <span class="cov8" title="1">aggregate.MarkEventsAsCommitted()
+
+        // Check if we should create a snapshot
+        if snapshotManager != nil </span><span class="cov8" title="1">{
+                if err := snapshotManager.MaybeSnapshot(ctx, aggregate.GetID(), aggregate.GetVersion(), aggregate.CreateSnapshot); err != nil </span><span class="cov8" title="1">{
+                        // Log error but don't fail the save
+                        // Snapshots are optimization, not required for correctness
+                        fmt.Printf("Warning: failed to create snapshot: %v\n", err)
+                }</span>
+        }
+
+        <span class="cov8" title="1">return nil</span>
+}
+</pre>
+		
+		</div>
+	</body>
+	<script>
+	(function() {
+		var files = document.getElementById('files');
+		var visible;
+		files.addEventListener('change', onChange, false);
+		function select(part) {
+			if (visible)
+				visible.style.display = 'none';
+			visible = document.getElementById(part);
+			if (!visible)
+				return;
+			files.value = part;
+			visible.style.display = 'block';
+			location.hash = part;
+		}
+		function onChange() {
+			select(files.value);
+			window.scrollTo(0, 0);
+		}
+		if (location.hash != "") {
+			select(location.hash.substr(1));
+		}
+		if (!visible) {
+			select("file0");
+		}
+	})();
+	</script>
+</html>
