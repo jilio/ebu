@@ -170,7 +170,7 @@ type CommandBus[C Command, E any] struct {
 	handlers map[string]CommandHandler[C, E]
 	eventBus *EventBus
 	mu       sync.RWMutex
-	
+
 	// Options
 	preHandler  func(ctx context.Context, cmdType string, cmd C) error
 	postHandler func(ctx context.Context, cmdType string, cmd C, events []E, err error)
@@ -199,11 +199,11 @@ func NewCommandBus[C Command, E any](eventBus *EventBus, opts ...CommandBusOptio
 		handlers: make(map[string]CommandHandler[C, E]),
 		eventBus: eventBus,
 	}
-	
+
 	for _, opt := range opts {
 		opt(cb)
 	}
-	
+
 	return cb
 }
 
@@ -235,12 +235,12 @@ func (cb *CommandBus[C, E]) Execute(ctx context.Context, cmdType string, cmd C) 
 
 	// Execute command
 	events, err := handler(ctx, cmd)
-	
+
 	// Post-handler (always called, even on error)
 	if postHandler != nil {
 		postHandler(ctx, cmdType, cmd, events, err)
 	}
-	
+
 	if err != nil {
 		return err
 	}
@@ -257,7 +257,7 @@ func (cb *CommandBus[C, E]) Execute(ctx context.Context, cmdType string, cmd C) 
 type QueryBus[Q Query, R any] struct {
 	handlers map[string]QueryHandler[Q, R]
 	mu       sync.RWMutex
-	
+
 	// Options
 	cache        map[string]R
 	cacheTTL     time.Duration
@@ -289,11 +289,11 @@ func NewQueryBus[Q Query, R any](opts ...QueryBusOption[Q, R]) *QueryBus[Q, R] {
 	qb := &QueryBus[Q, R]{
 		handlers: make(map[string]QueryHandler[Q, R]),
 	}
-	
+
 	for _, opt := range opts {
 		opt(qb)
 	}
-	
+
 	return qb
 }
 
@@ -319,12 +319,12 @@ func (qb *QueryBus[Q, R]) Execute(ctx context.Context, queryType string, query Q
 	// TODO: Implement cache logic if needed
 	// For now, just execute the query
 	result, err := handler(ctx, query)
-	
+
 	// Log the query if logger is set
 	if queryLogger != nil {
 		queryLogger(ctx, queryType, query, result, err)
 	}
-	
+
 	return result, err
 }
 
@@ -333,7 +333,7 @@ type ProjectionManager[E any] struct {
 	projections map[string]Projection[E]
 	eventBus    *EventBus
 	mu          sync.RWMutex
-	
+
 	// Options
 	errorHandler func(error, Projection[E], E)
 	async        bool
@@ -362,11 +362,11 @@ func NewProjectionManager[E any](eventBus *EventBus, opts ...ProjectionManagerOp
 		projections: make(map[string]Projection[E]),
 		eventBus:    eventBus,
 	}
-	
+
 	for _, opt := range opts {
 		opt(pm)
 	}
-	
+
 	return pm
 }
 
@@ -376,11 +376,11 @@ func (pm *ProjectionManager[E]) Register(projection Projection[E]) error {
 	if projection == nil {
 		return errors.New("projection cannot be nil")
 	}
-	
+
 	if projection.GetID() == "" {
 		return errors.New("projection ID cannot be empty")
 	}
-	
+
 	pm.mu.Lock()
 	pm.projections[projection.GetID()] = projection
 	pm.mu.Unlock()
@@ -583,12 +583,12 @@ func SetupCQRSProjections[E any](
 			return fmt.Errorf("failed to register projection %s: %w", projection.GetID(), err)
 		}
 	}
-	
+
 	// Subscribe to all event types
 	for _, eventType := range eventTypes {
 		SubscribeProjection(bus, pm, eventType)
 	}
-	
+
 	return nil
 }
 
