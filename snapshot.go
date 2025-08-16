@@ -31,12 +31,12 @@ type SnapshotStore interface {
 // SnapshotPolicy determines when to create snapshots
 type SnapshotPolicy interface {
 	// ShouldSnapshot returns true if a snapshot should be created
-	ShouldSnapshot(aggregate Aggregate, lastSnapshotVersion int64, lastSnapshotTime time.Time) bool
+	ShouldSnapshot(version int64, lastSnapshotVersion int64, lastSnapshotTime time.Time) bool
 }
 
 // SnapshottableAggregate extends Aggregate with snapshot capabilities
-type SnapshottableAggregate interface {
-	Aggregate
+type SnapshottableAggregate[E any] interface {
+	Aggregate[E]
 	// CreateSnapshot serializes the current state
 	CreateSnapshot() ([]byte, error)
 	// RestoreFromSnapshot deserializes state from a snapshot
@@ -44,10 +44,10 @@ type SnapshottableAggregate interface {
 }
 
 // PolicyFunc is a function that implements SnapshotPolicy
-type PolicyFunc func(aggregate Aggregate, lastSnapshotVersion int64, lastSnapshotTime time.Time) bool
+type PolicyFunc func(version int64, lastSnapshotVersion int64, lastSnapshotTime time.Time) bool
 
-func (f PolicyFunc) ShouldSnapshot(aggregate Aggregate, lastSnapshotVersion int64, lastSnapshotTime time.Time) bool {
-	return f(aggregate, lastSnapshotVersion, lastSnapshotTime)
+func (f PolicyFunc) ShouldSnapshot(version int64, lastSnapshotVersion int64, lastSnapshotTime time.Time) bool {
+	return f(version, lastSnapshotVersion, lastSnapshotTime)
 }
 
 // EveryNEvents creates a policy that snapshots after N events
@@ -55,31 +55,30 @@ func EveryNEvents(n int64) SnapshotPolicy {
 	if n <= 0 {
 		n = 1
 	}
-	return PolicyFunc(func(aggregate Aggregate, lastSnapshotVersion int64, lastSnapshotTime time.Time) bool {
-		currentVersion := aggregate.GetVersion()
-		return currentVersion-lastSnapshotVersion >= n
+	return PolicyFunc(func(version int64, lastSnapshotVersion int64, lastSnapshotTime time.Time) bool {
+		return version-lastSnapshotVersion >= n
 	})
 }
 
 // TimeInterval creates a policy that snapshots after a time interval
 func TimeInterval(interval time.Duration) SnapshotPolicy {
-	return PolicyFunc(func(aggregate Aggregate, lastSnapshotVersion int64, lastSnapshotTime time.Time) bool {
+	return PolicyFunc(func(version int64, lastSnapshotVersion int64, lastSnapshotTime time.Time) bool {
 		return time.Since(lastSnapshotTime) >= interval
 	})
 }
 
 // Never creates a policy that never takes snapshots
 func Never() SnapshotPolicy {
-	return PolicyFunc(func(aggregate Aggregate, lastSnapshotVersion int64, lastSnapshotTime time.Time) bool {
+	return PolicyFunc(func(version int64, lastSnapshotVersion int64, lastSnapshotTime time.Time) bool {
 		return false
 	})
 }
 
 // Combined creates a policy that triggers when ANY condition is met
 func Combined(policies ...SnapshotPolicy) SnapshotPolicy {
-	return PolicyFunc(func(aggregate Aggregate, lastSnapshotVersion int64, lastSnapshotTime time.Time) bool {
+	return PolicyFunc(func(version int64, lastSnapshotVersion int64, lastSnapshotTime time.Time) bool {
 		for _, policy := range policies {
-			if policy.ShouldSnapshot(aggregate, lastSnapshotVersion, lastSnapshotTime) {
+			if policy.ShouldSnapshot(version, lastSnapshotVersion, lastSnapshotTime) {
 				return true
 			}
 		}
@@ -114,33 +113,33 @@ func NewSnapshotManager(store SnapshotStore, policy SnapshotPolicy) *SnapshotMan
 }
 
 // MaybeSnapshot checks if a snapshot should be taken and creates it if needed
-func (sm *SnapshotManager) MaybeSnapshot(ctx context.Context, aggregate SnapshottableAggregate) error {
+func (sm *SnapshotManager) MaybeSnapshot(ctx context.Context, aggregateID string, version int64, createSnapshot func() ([]byte, error)) error {
 	if sm.store == nil {
 		return nil // No snapshot store configured
 	}
 
 	sm.mu.RLock()
-	lastInfo, exists := sm.lastSnapshots[aggregate.GetID()]
+	lastInfo, exists := sm.lastSnapshots[aggregateID]
 	sm.mu.RUnlock()
 
 	if !exists {
 		lastInfo = &snapshotInfo{version: 0, timestamp: time.Time{}}
 	}
 
-	if !sm.policy.ShouldSnapshot(aggregate, lastInfo.version, lastInfo.timestamp) {
+	if !sm.policy.ShouldSnapshot(version, lastInfo.version, lastInfo.timestamp) {
 		return nil
 	}
 
 	// Create snapshot
-	data, err := aggregate.CreateSnapshot()
+	data, err := createSnapshot()
 	if err != nil {
 		return fmt.Errorf("failed to create snapshot: %w", err)
 	}
 
 	snapshot := &Snapshot{
-		AggregateID:   aggregate.GetID(),
-		AggregateType: fmt.Sprintf("%T", aggregate),
-		Version:       aggregate.GetVersion(),
+		AggregateID:   aggregateID,
+		AggregateType: "aggregate",
+		Version:       version,
 		Data:          data,
 		Timestamp:     time.Now(),
 	}
@@ -151,8 +150,8 @@ func (sm *SnapshotManager) MaybeSnapshot(ctx context.Context, aggregate Snapshot
 
 	// Update tracking
 	sm.mu.Lock()
-	sm.lastSnapshots[aggregate.GetID()] = &snapshotInfo{
-		version:   aggregate.GetVersion(),
+	sm.lastSnapshots[aggregateID] = &snapshotInfo{
+		version:   version,
 		timestamp: snapshot.Timestamp,
 	}
 	sm.mu.Unlock()
@@ -235,7 +234,7 @@ func WithSnapshots(store SnapshotStore, policy SnapshotPolicy) BusOption {
 	return func(bus *EventBus) {
 		// Store snapshot manager in bus for access by CQRS
 		if bus.extensions == nil {
-			bus.extensions = make(map[string]interface{})
+			bus.extensions = make(map[string]any)
 		}
 		bus.extensions["snapshot_manager"] = NewSnapshotManager(store, policy)
 	}
@@ -253,15 +252,16 @@ func GetSnapshotManager(bus *EventBus) *SnapshotManager {
 }
 
 // LoadAggregate loads an aggregate using snapshot + events since snapshot
-func LoadAggregate(
+func LoadAggregate[A SnapshottableAggregate[E], E any](
 	ctx context.Context,
 	aggregateID string,
-	createAggregate func() SnapshottableAggregate,
+	createAggregate func() A,
 	eventStore EventStore,
 	snapshotStore SnapshotStore,
-) (SnapshottableAggregate, error) {
+) (A, error) {
+	var zero A
 	if aggregateID == "" {
-		return nil, errors.New("aggregate ID is required")
+		return zero, errors.New("aggregate ID is required")
 	}
 
 	// Create new aggregate instance
@@ -275,7 +275,7 @@ func LoadAggregate(
 		if err == nil && snapshot != nil {
 			// Restore from snapshot
 			if err := aggregate.RestoreFromSnapshot(snapshot.Data, snapshot.Version); err != nil {
-				return nil, fmt.Errorf("failed to restore from snapshot: %w", err)
+				return zero, fmt.Errorf("failed to restore from snapshot: %w", err)
 			}
 			fromVersion = snapshot.Version
 		}
@@ -286,16 +286,16 @@ func LoadAggregate(
 	if eventStore != nil {
 		events, err := eventStore.Load(ctx, fromVersion, -1)
 		if err != nil {
-			return nil, fmt.Errorf("failed to load events: %w", err)
+			return zero, fmt.Errorf("failed to load events: %w", err)
 		}
 
 		// Filter events for this aggregate and unmarshal them
-		var aggregateEvents []any
+		var aggregateEvents []E
 		for _, storedEvent := range events {
 			// We need a way to determine if an event belongs to this aggregate
 			// This is typically done by examining the event data
 			// For now, we'll unmarshal and check if it has the aggregate ID
-			var eventData map[string]interface{}
+			var eventData map[string]any
 			if err := json.Unmarshal(storedEvent.Data, &eventData); err != nil {
 				continue // Skip events that can't be unmarshaled
 			}
@@ -305,14 +305,17 @@ func LoadAggregate(
 			if aggID, ok := eventData["aggregate_id"].(string); ok && aggID == aggregateID {
 				// Reconstruct the actual event type
 				// This requires type information to be stored with the event
-				aggregateEvents = append(aggregateEvents, eventData)
+				var event E
+				if err := json.Unmarshal(storedEvent.Data, &event); err == nil {
+					aggregateEvents = append(aggregateEvents, event)
+				}
 			}
 		}
 
 		// Apply events to aggregate if there are any
 		if len(aggregateEvents) > 0 {
 			if err := aggregate.LoadFromHistory(aggregateEvents); err != nil {
-				return nil, fmt.Errorf("failed to load from history: %w", err)
+				return zero, fmt.Errorf("failed to load from history: %w", err)
 			}
 		}
 	}
@@ -321,9 +324,9 @@ func LoadAggregate(
 }
 
 // SaveAggregate saves an aggregate's uncommitted events and optionally creates a snapshot
-func SaveAggregate(
+func SaveAggregate[A SnapshottableAggregate[E], E any](
 	ctx context.Context,
-	aggregate SnapshottableAggregate,
+	aggregate A,
 	eventStore EventStore,
 	snapshotManager *SnapshotManager,
 ) error {
@@ -355,7 +358,7 @@ func SaveAggregate(
 
 	// Check if we should create a snapshot
 	if snapshotManager != nil {
-		if err := snapshotManager.MaybeSnapshot(ctx, aggregate); err != nil {
+		if err := snapshotManager.MaybeSnapshot(ctx, aggregate.GetID(), aggregate.GetVersion(), aggregate.CreateSnapshot); err != nil {
 			// Log error but don't fail the save
 			// Snapshots are optimization, not required for correctness
 			fmt.Printf("Warning: failed to create snapshot: %v\n", err)

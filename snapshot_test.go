@@ -9,9 +9,20 @@ import (
 	"time"
 )
 
+// SnapshotTestEvent is a test event type for snapshot tests
+type SnapshotTestEvent any
+
+type DepositEvent struct {
+	Amount float64
+}
+
+type WithdrawEvent struct {
+	Amount float64
+}
+
 // TestAggregate is a test aggregate that supports snapshots
 type TestAggregate struct {
-	BaseAggregate
+	BaseAggregate[SnapshotTestEvent]
 	Balance float64 `json:"balance"`
 	Name    string  `json:"name"`
 }
@@ -20,7 +31,7 @@ func (a *TestAggregate) CreateSnapshot() ([]byte, error) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
-	snapshot := map[string]interface{}{
+	snapshot := map[string]any{
 		"id":      a.ID,
 		"version": a.Version,
 		"balance": a.Balance,
@@ -34,7 +45,7 @@ func (a *TestAggregate) RestoreFromSnapshot(data []byte, version int64) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	var snapshot map[string]interface{}
+	var snapshot map[string]any
 	if err := json.Unmarshal(data, &snapshot); err != nil {
 		return fmt.Errorf("failed to unmarshal snapshot: %w", err)
 	}
@@ -56,11 +67,15 @@ func (a *TestAggregate) RestoreFromSnapshot(data []byte, version int64) error {
 	return nil
 }
 
-func (a *TestAggregate) LoadFromHistory(events []any) error {
+func (a *TestAggregate) LoadFromHistory(events []SnapshotTestEvent) error {
 	for _, event := range events {
 		// Apply events to update state
 		switch e := event.(type) {
-		case map[string]interface{}:
+		case DepositEvent:
+			a.Balance += e.Amount
+		case WithdrawEvent:
+			a.Balance -= e.Amount
+		case map[string]any:
 			// Handle events from snapshot loading
 			if eventType, ok := e["type"].(string); ok {
 				switch eventType {
@@ -76,6 +91,16 @@ func (a *TestAggregate) LoadFromHistory(events []any) error {
 			}
 		}
 		a.Version++
+	}
+	return nil
+}
+
+func (a *TestAggregate) Apply(event SnapshotTestEvent) error {
+	switch e := event.(type) {
+	case DepositEvent:
+		a.Balance += e.Amount
+	case WithdrawEvent:
+		a.Balance -= e.Amount
 	}
 	return nil
 }
@@ -152,45 +177,41 @@ func TestMemorySnapshotStore(t *testing.T) {
 }
 
 func TestSnapshotPolicies(t *testing.T) {
-	agg := &TestAggregate{}
-	agg.ID = "test-1"
-	agg.Version = 100
-
 	// Test EveryNEvents
 	policy := EveryNEvents(50)
-	if !policy.ShouldSnapshot(agg, 0, time.Time{}) {
+	if !policy.ShouldSnapshot(100, 0, time.Time{}) {
 		t.Error("Expected snapshot after 100 events from version 0")
 	}
 
-	if !policy.ShouldSnapshot(agg, 50, time.Time{}) {
+	if !policy.ShouldSnapshot(100, 50, time.Time{}) {
 		t.Error("Expected snapshot after 50 events from version 50")
 	}
 
-	if policy.ShouldSnapshot(agg, 99, time.Time{}) {
+	if policy.ShouldSnapshot(100, 99, time.Time{}) {
 		t.Error("Should not snapshot after only 1 event")
 	}
 
 	// Test with zero/negative N
 	policy = EveryNEvents(0)
-	if !policy.ShouldSnapshot(agg, 99, time.Time{}) {
+	if !policy.ShouldSnapshot(100, 99, time.Time{}) {
 		t.Error("Expected snapshot with N=0 (becomes 1)")
 	}
 
 	// Test TimeInterval
 	policy = TimeInterval(1 * time.Hour)
 	oldTime := time.Now().Add(-2 * time.Hour)
-	if !policy.ShouldSnapshot(agg, 0, oldTime) {
+	if !policy.ShouldSnapshot(100, 0, oldTime) {
 		t.Error("Expected snapshot after 2 hours")
 	}
 
 	recentTime := time.Now().Add(-30 * time.Minute)
-	if policy.ShouldSnapshot(agg, 0, recentTime) {
+	if policy.ShouldSnapshot(100, 0, recentTime) {
 		t.Error("Should not snapshot after only 30 minutes")
 	}
 
 	// Test Never
 	policy = Never()
-	if policy.ShouldSnapshot(agg, 0, time.Time{}) {
+	if policy.ShouldSnapshot(100, 0, time.Time{}) {
 		t.Error("Never policy should never snapshot")
 	}
 
@@ -201,21 +222,18 @@ func TestSnapshotPolicies(t *testing.T) {
 	)
 
 	// Should trigger on event count
-	agg.Version = 50
-	if !policy.ShouldSnapshot(agg, 0, time.Now()) {
+	if !policy.ShouldSnapshot(50, 0, time.Now()) {
 		t.Error("Combined policy should trigger on event count")
 	}
 
 	// Should trigger on time
-	agg.Version = 10
 	oldTime = time.Now().Add(-2 * time.Hour)
-	if !policy.ShouldSnapshot(agg, 0, oldTime) {
+	if !policy.ShouldSnapshot(10, 0, oldTime) {
 		t.Error("Combined policy should trigger on time")
 	}
 
 	// Should not trigger when neither condition met
-	agg.Version = 10
-	if policy.ShouldSnapshot(agg, 0, time.Now()) {
+	if policy.ShouldSnapshot(10, 0, time.Now()) {
 		t.Error("Combined policy should not trigger when no condition met")
 	}
 }
@@ -234,7 +252,7 @@ func TestSnapshotManager(t *testing.T) {
 	agg.Name = "Test Account"
 
 	// Should create snapshot (version 15, last snapshot at 0)
-	err := manager.MaybeSnapshot(ctx, agg)
+	err := manager.MaybeSnapshot(ctx, agg.ID, agg.Version, agg.CreateSnapshot)
 	if err != nil {
 		t.Fatalf("Failed to create snapshot: %v", err)
 	}
@@ -251,7 +269,7 @@ func TestSnapshotManager(t *testing.T) {
 
 	// Should not create another snapshot immediately
 	agg.Version = 16
-	err = manager.MaybeSnapshot(ctx, agg)
+	err = manager.MaybeSnapshot(ctx, agg.ID, agg.Version, agg.CreateSnapshot)
 	if err != nil {
 		t.Fatalf("MaybeSnapshot failed: %v", err)
 	}
@@ -268,7 +286,7 @@ func TestSnapshotManager(t *testing.T) {
 
 	// Should create snapshot after 10 more events
 	agg.Version = 25
-	err = manager.MaybeSnapshot(ctx, agg)
+	err = manager.MaybeSnapshot(ctx, agg.ID, agg.Version, agg.CreateSnapshot)
 	if err != nil {
 		t.Fatalf("Failed to create snapshot: %v", err)
 	}
@@ -284,7 +302,7 @@ func TestSnapshotManager(t *testing.T) {
 
 	// Test with nil store
 	manager = NewSnapshotManager(nil, policy)
-	err = manager.MaybeSnapshot(ctx, agg)
+	err = manager.MaybeSnapshot(ctx, agg.ID, agg.Version, agg.CreateSnapshot)
 	if err != nil {
 		t.Errorf("MaybeSnapshot should not error with nil store: %v", err)
 	}
@@ -310,7 +328,7 @@ func TestSnapshotManager(t *testing.T) {
 	// Test with nil policy (should default to Never)
 	manager = NewSnapshotManager(store, nil)
 	agg.Version = 100
-	err = manager.MaybeSnapshot(ctx, agg)
+	err = manager.MaybeSnapshot(ctx, agg.ID, agg.Version, agg.CreateSnapshot)
 	if err != nil {
 		t.Fatalf("MaybeSnapshot failed: %v", err)
 	}
@@ -327,7 +345,7 @@ func TestSnapshotManager(t *testing.T) {
 }
 
 func TestBaseAggregateSnapshot(t *testing.T) {
-	agg := &BaseAggregate{
+	agg := &BaseAggregate[SnapshotTestEvent]{
 		ID:      "base-1",
 		Version: 42,
 	}
@@ -338,7 +356,7 @@ func TestBaseAggregateSnapshot(t *testing.T) {
 		t.Fatalf("Failed to create snapshot: %v", err)
 	}
 
-	var snapshot map[string]interface{}
+	var snapshot map[string]any
 	err = json.Unmarshal(data, &snapshot)
 	if err != nil {
 		t.Fatalf("Failed to unmarshal snapshot: %v", err)
@@ -353,7 +371,7 @@ func TestBaseAggregateSnapshot(t *testing.T) {
 	}
 
 	// Test RestoreFromSnapshot
-	newAgg := &BaseAggregate{}
+	newAgg := &BaseAggregate[SnapshotTestEvent]{}
 	err = newAgg.RestoreFromSnapshot(data, 42)
 	if err != nil {
 		t.Fatalf("Failed to restore from snapshot: %v", err)
@@ -402,7 +420,7 @@ func TestWithSnapshots(t *testing.T) {
 
 	// Test GetSnapshotManager with extensions but no snapshot manager
 	bus3 := New()
-	bus3.extensions = make(map[string]interface{})
+	bus3.extensions = make(map[string]any)
 	bus3.extensions["other"] = "value"
 	manager3 := GetSnapshotManager(bus3)
 	if manager3 != nil {
@@ -423,7 +441,7 @@ func TestSnapshotErrorCases(t *testing.T) {
 	policy := EveryNEvents(1)
 	manager := NewSnapshotManager(store, policy)
 
-	err := manager.MaybeSnapshot(ctx, failingAgg)
+	err := manager.MaybeSnapshot(ctx, failingAgg.ID, failingAgg.Version, failingAgg.CreateSnapshot)
 	if err == nil {
 		t.Error("Expected error when creating snapshot fails")
 	}
@@ -436,7 +454,7 @@ func TestSnapshotErrorCases(t *testing.T) {
 	agg.ID = "test-1"
 	agg.Version = 10
 
-	err = manager.MaybeSnapshot(ctx, agg)
+	err = manager.MaybeSnapshot(ctx, agg.ID, agg.Version, agg.CreateSnapshot)
 	if err == nil {
 		t.Error("Expected error when store fails to save")
 	}
@@ -444,14 +462,14 @@ func TestSnapshotErrorCases(t *testing.T) {
 
 // FailingAggregate for testing error cases
 type FailingAggregate struct {
-	BaseAggregate
+	BaseAggregate[SnapshotTestEvent]
 }
 
 func (a *FailingAggregate) CreateSnapshot() ([]byte, error) {
 	return nil, errors.New("snapshot creation failed")
 }
 
-func (a *FailingAggregate) LoadFromHistory(events []any) error {
+func (a *FailingAggregate) LoadFromHistory(events []SnapshotTestEvent) error {
 	return errors.New("load from history failed")
 }
 
@@ -477,7 +495,7 @@ func TestLoadSaveAggregate(t *testing.T) {
 	snapshotStore := NewMemorySnapshotStore()
 
 	// Test LoadAggregate with empty ID
-	_, err := LoadAggregate(ctx, "", func() SnapshottableAggregate {
+	_, err := LoadAggregate(ctx, "", func() *TestAggregate {
 		return &TestAggregate{}
 	}, eventStore, snapshotStore)
 	if err == nil {
@@ -485,7 +503,7 @@ func TestLoadSaveAggregate(t *testing.T) {
 	}
 
 	// Test LoadAggregate with no stores
-	agg, err := LoadAggregate(ctx, "agg-1", func() SnapshottableAggregate {
+	agg, err := LoadAggregate(ctx, "agg-1", func() *TestAggregate {
 		return &TestAggregate{}
 	}, nil, nil)
 	if err != nil {
@@ -501,10 +519,7 @@ func TestLoadSaveAggregate(t *testing.T) {
 	testAgg.ID = "agg-1"
 	testAgg.Version = 1
 	testAgg.Balance = 100
-	testAgg.RaiseEvent(map[string]interface{}{
-		"type":   "deposit",
-		"amount": 50,
-	})
+	testAgg.RaiseEvent(DepositEvent{Amount: 50})
 
 	policy := EveryNEvents(1)
 	manager := NewSnapshotManager(snapshotStore, policy)
@@ -536,10 +551,7 @@ func TestLoadSaveAggregate(t *testing.T) {
 
 	// Test SaveAggregate with failing event store
 	failEventStore := &FailingEventStore{}
-	testAgg.RaiseEvent(map[string]interface{}{
-		"type":   "deposit",
-		"amount": 25,
-	})
+	testAgg.RaiseEvent(DepositEvent{Amount: 25})
 
 	err = SaveAggregate(ctx, testAgg, failEventStore, manager)
 	if err == nil {
@@ -547,7 +559,10 @@ func TestLoadSaveAggregate(t *testing.T) {
 	}
 
 	// Test SaveAggregate with unmarshalable event
-	testAgg.RaiseEvent(make(chan int)) // Channels can't be marshaled
+	type unmarshalableEvent struct {
+		Ch chan int
+	}
+	testAgg.RaiseEvent(unmarshalableEvent{Ch: make(chan int)}) // Channels can't be marshaled
 
 	err = SaveAggregate(ctx, testAgg, eventStore, manager)
 	if err == nil {
@@ -558,10 +573,7 @@ func TestLoadSaveAggregate(t *testing.T) {
 	testAgg.MarkEventsAsCommitted()
 
 	// Test SaveAggregate with failing snapshot manager (should not fail save)
-	testAgg.RaiseEvent(map[string]interface{}{
-		"type":   "deposit",
-		"amount": 100,
-	})
+	testAgg.RaiseEvent(DepositEvent{Amount: 100})
 
 	failManager := NewSnapshotManager(&FailingSnapshotStore{}, EveryNEvents(1))
 	err = SaveAggregate(ctx, testAgg, eventStore, failManager)
@@ -617,7 +629,7 @@ func TestLoadAggregateWithSnapshot(t *testing.T) {
 	// But we need events with positions > 10 to be loaded after the snapshot
 	// So let's add dummy events first to get to position 10
 	for i := 0; i < 10; i++ {
-		dummyEvent := map[string]interface{}{
+		dummyEvent := map[string]any{
 			"aggregate_id": "dummy",
 			"type":         "dummy",
 		}
@@ -632,7 +644,7 @@ func TestLoadAggregateWithSnapshot(t *testing.T) {
 
 	// Now save the actual events after position 10
 	for i := 0; i < 5; i++ {
-		event := map[string]interface{}{
+		event := map[string]any{
 			"aggregate_id": "agg-1",
 			"type":         "deposit",
 			"amount":       float64(100),
@@ -652,14 +664,14 @@ func TestLoadAggregateWithSnapshot(t *testing.T) {
 	}
 
 	// Load aggregate with snapshot and events
-	agg, err := LoadAggregate(ctx, "agg-1", func() SnapshottableAggregate {
+	agg, err := LoadAggregate(ctx, "agg-1", func() *TestAggregate {
 		return &TestAggregate{}
 	}, eventStore, snapshotStore)
 	if err != nil {
 		t.Fatalf("Failed to load aggregate: %v", err)
 	}
 
-	testAgg := agg.(*TestAggregate)
+	testAgg := agg
 	if testAgg.ID != "agg-1" {
 		t.Errorf("Expected ID agg-1, got %s", testAgg.ID)
 	}
@@ -686,7 +698,7 @@ func TestLoadAggregateWithSnapshot(t *testing.T) {
 		t.Fatalf("Failed to save bad snapshot: %v", err)
 	}
 
-	_, err = LoadAggregate(ctx, "agg-2", func() SnapshottableAggregate {
+	_, err = LoadAggregate(ctx, "agg-2", func() *TestAggregate {
 		return &TestAggregate{}
 	}, eventStore, snapshotStore)
 	if err == nil {
@@ -694,7 +706,7 @@ func TestLoadAggregateWithSnapshot(t *testing.T) {
 	}
 
 	// Test loading with event store failure
-	_, err = LoadAggregate(ctx, "agg-3", func() SnapshottableAggregate {
+	_, err = LoadAggregate(ctx, "agg-3", func() *TestAggregate {
 		return &TestAggregate{}
 	}, &FailingEventStore{}, snapshotStore)
 	if err == nil {
@@ -702,7 +714,7 @@ func TestLoadAggregateWithSnapshot(t *testing.T) {
 	}
 
 	// Test loading with LoadFromHistory failure
-	_, err = LoadAggregate(ctx, "agg-4", func() SnapshottableAggregate {
+	_, err = LoadAggregate(ctx, "agg-4", func() *FailingAggregate {
 		return &FailingAggregate{}
 	}, eventStore, nil)
 	// This should not fail because there are no events for agg-4
@@ -719,7 +731,7 @@ func TestLoadAggregateWithSnapshot(t *testing.T) {
 	_ = eventStore.Save(ctx, invalidEvent)
 
 	// This should skip the invalid event and continue
-	agg5, err := LoadAggregate(ctx, "agg-5", func() SnapshottableAggregate {
+	agg5, err := LoadAggregate(ctx, "agg-5", func() *TestAggregate {
 		return &TestAggregate{}
 	}, eventStore, nil)
 	if err != nil {
@@ -732,7 +744,7 @@ func TestLoadAggregateWithSnapshot(t *testing.T) {
 
 	// Test loading with FailingAggregate when there ARE matching events
 	// This tests the LoadFromHistory error path
-	failEvent := map[string]interface{}{
+	failEvent := map[string]any{
 		"aggregate_id": "fail-agg",
 		"type":         "test",
 	}
@@ -744,7 +756,7 @@ func TestLoadAggregateWithSnapshot(t *testing.T) {
 	}
 	_ = eventStore.Save(ctx, failStoredEvent)
 
-	_, err = LoadAggregate(ctx, "fail-agg", func() SnapshottableAggregate {
+	_, err = LoadAggregate(ctx, "fail-agg", func() *FailingAggregate {
 		return &FailingAggregate{}
 	}, eventStore, nil)
 	if err == nil {

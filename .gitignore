@@ -1,0 +1,10 @@
+# Coverage files
+coverage.out
+coverage.html
+*.coverprofile
+
+# Test artifacts
+*.test
+
+# OS files
+.DS_Store
