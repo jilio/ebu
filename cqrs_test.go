@@ -1272,7 +1272,6 @@ func TestQueryBusOptions(t *testing.T) {
 	}
 }
 
-
 func TestSubscribeProjection(t *testing.T) {
 	bus := New()
 

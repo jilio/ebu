@@ -591,4 +591,3 @@ func SetupCQRSProjections[E any](
 
 	return nil
 }
-
