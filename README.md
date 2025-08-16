@@ -447,6 +447,43 @@ func main() {
 - Only one hook of each type can be set (setting a new one replaces the old)
 - Hooks receive the event type and event value, allowing for type-based routing
 
+### Event Type Helpers
+
+The `EventType` function provides a convenient way to get the fully qualified type name of an event, which is especially useful when working with event replay and persistence:
+
+```go
+package main
+
+import (
+    "encoding/json"
+    "github.com/jilio/ebu"
+)
+
+type OrderCreatedEvent struct {
+    OrderID string
+    Amount  float64
+}
+
+// Get the event type string for comparisons
+eventType := eventbus.EventType(OrderCreatedEvent{})
+// Returns: "main.OrderCreatedEvent"
+
+// Useful in replay scenarios
+bus.Replay(ctx, 0, func(event *eventbus.StoredEvent) error {
+    switch event.Type {
+    case eventbus.EventType(OrderCreatedEvent{}):
+        var order OrderCreatedEvent
+        json.Unmarshal(event.Data, &order)
+        // Process order event
+    case eventbus.EventType(UserCreatedEvent{}):
+        var user UserCreatedEvent
+        json.Unmarshal(event.Data, &user)
+        // Process user event
+    }
+    return nil
+})
+```
+
 ### Event Persistence
 
 ebu includes built-in support for event persistence, enabling event sourcing patterns, audit logs, and resumable subscriptions. The persistence layer is designed to be simple and pluggable.
@@ -487,6 +524,14 @@ func main() {
     err := bus.Replay(ctx, 0, func(event *eventbus.StoredEvent) error {
         fmt.Printf("Replaying event at position %d: %s\n", 
             event.Position, event.Type)
+        
+        // Use EventType helper for type-safe comparisons
+        if event.Type == eventbus.EventType(UserCreatedEvent{}) {
+            var userEvent UserCreatedEvent
+            json.Unmarshal(event.Data, &userEvent)
+            // Process the user event
+        }
+        
         return nil
     })
     if err != nil {

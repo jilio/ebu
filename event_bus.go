@@ -62,6 +62,25 @@ type EventBus struct {
 	extensions sync.Map
 }
 
+// EventType returns the fully qualified type name of an event.
+// This is useful for comparing with StoredEvent.Type during replay.
+//
+// Example:
+//
+//	eventType := EventType(MyEvent{})
+//	// Returns: "github.com/mypackage/MyEvent"
+//
+//	// Usage in replay:
+//	bus.Replay(ctx, 0, func(event *StoredEvent) error {
+//	    if event.Type == EventType(MyEvent{}) {
+//	        // Process MyEvent
+//	    }
+//	    return nil
+//	})
+func EventType(event any) string {
+	return reflect.TypeOf(event).String()
+}
+
 // Option is a function that configures the EventBus
 type Option func(*EventBus)
 

@@ -30,6 +30,54 @@ func TestNewEventBus(t *testing.T) {
 	}
 }
 
+func TestEventType(t *testing.T) {
+	tests := []struct {
+		name     string
+		event    any
+		expected string
+	}{
+		{
+			name:     "user event struct",
+			event:    UserEvent{UserID: "123"},
+			expected: "eventbus.UserEvent",
+		},
+		{
+			name:     "pointer to user event",
+			event:    &UserEvent{UserID: "456"},
+			expected: "*eventbus.UserEvent",
+		},
+		{
+			name:     "order event",
+			event:    OrderEvent{OrderID: "789"},
+			expected: "eventbus.OrderEvent",
+		},
+		{
+			name:     "int",
+			event:    42,
+			expected: "int",
+		},
+		{
+			name:     "string",
+			event:    "hello",
+			expected: "string",
+		},
+		{
+			name:     "slice",
+			event:    []string{"a", "b"},
+			expected: "[]string",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := EventType(tt.event)
+			if result != tt.expected {
+				t.Errorf("EventType() = %v, want %v", result, tt.expected)
+			}
+		})
+	}
+}
+
 func TestSubscribeAndPublish(t *testing.T) {
 	bus := New()
 	received := false
