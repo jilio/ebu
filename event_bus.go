@@ -3,6 +3,7 @@ package eventbus
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -36,13 +37,20 @@ type PanicHandler func(event any, handlerType reflect.Type, panicValue any)
 // PublishHook is called when an event is published
 type PublishHook func(eventType reflect.Type, event any)
 
-// EventBus is a type-safe event bus that can handle multiple event types
+const numShards = 32 // Power of 2 for efficient modulo
+
+// shard represents a single shard with its own mutex
+type shard struct {
+	mu       sync.RWMutex
+	handlers map[reflect.Type][]*internalHandler
+}
+
+// EventBus is a high-performance event bus with sharded locks
 type EventBus struct {
-	handlers      map[reflect.Type][]*internalHandler
+	shards        [numShards]*shard
 	panicHandler  PanicHandler
 	beforePublish PublishHook
 	afterPublish  PublishHook
-	mu            sync.RWMutex
 	wg            sync.WaitGroup
 
 	// Optional persistence fields (nil if not using persistence)
@@ -50,51 +58,50 @@ type EventBus struct {
 	storePosition int64
 	storeMu       sync.RWMutex
 
-	// Extensions for additional features (snapshots, etc.)
-	extensions map[string]any
+	// Extensions stored in sync.Map for thread-safety
+	extensions sync.Map
 }
 
-// BusOption configures an EventBus during creation
-type BusOption func(*EventBus)
+// Option is a function that configures the EventBus
+type Option func(*EventBus)
 
-// New creates a new EventBus with optional configuration
-func New(opts ...BusOption) *EventBus {
-	bus := &EventBus{
-		handlers: make(map[reflect.Type][]*internalHandler),
+// New creates a new EventBus with sharded locks for better performance
+func New(opts ...Option) *EventBus {
+	bus := &EventBus{}
+
+	// Initialize shards
+	for i := 0; i < numShards; i++ {
+		bus.shards[i] = &shard{
+			handlers: make(map[reflect.Type][]*internalHandler),
+		}
 	}
 
-	// Apply all options
+	// Apply options
 	for _, opt := range opts {
 		opt(bus)
+	}
+
+	// Initialize persistence if store is provided
+	if bus.store != nil {
+		go bus.startEventProcessor()
 	}
 
 	return bus
 }
 
-// Once configures the handler to be called only once
-func Once() SubscribeOption {
-	return func(h *internalHandler) {
-		h.once = true
-	}
-}
-
-// Async configures the handler to run asynchronously
-// If sequential is true, events are processed one at a time (no concurrency)
-func Async(sequential bool) SubscribeOption {
-	return func(h *internalHandler) {
-		h.async = true
-		h.sequential = sequential
-	}
+// getShard returns the shard for a given event type using FNV hash
+func (bus *EventBus) getShard(eventType reflect.Type) *shard {
+	h := fnv.New32a()
+	h.Write([]byte(eventType.String()))
+	shardIndex := h.Sum32() & (numShards - 1) // Fast modulo for power of 2
+	return bus.shards[shardIndex]
 }
 
 // Subscribe registers a handler for events of type T
 func Subscribe[T any](bus *EventBus, handler Handler[T], opts ...SubscribeOption) error {
-	// Validate bus
 	if bus == nil {
 		return fmt.Errorf("eventbus: bus cannot be nil")
 	}
-
-	// Validate handler
 	if handler == nil {
 		return fmt.Errorf("eventbus: handler cannot be nil")
 	}
@@ -102,12 +109,12 @@ func Subscribe[T any](bus *EventBus, handler Handler[T], opts ...SubscribeOption
 	eventType := reflect.TypeOf((*T)(nil)).Elem()
 
 	h := &internalHandler{
-		handler:     handler,
-		handlerType: reflect.TypeOf(handler),
-		eventType:   eventType,
+		handler:        handler,
+		handlerType:    reflect.TypeOf(handler),
+		eventType:      eventType,
+		acceptsContext: false,
 	}
 
-	// Apply options with validation
 	for _, opt := range opts {
 		if opt == nil {
 			return fmt.Errorf("eventbus: subscribe option cannot be nil")
@@ -115,21 +122,19 @@ func Subscribe[T any](bus *EventBus, handler Handler[T], opts ...SubscribeOption
 		opt(h)
 	}
 
-	bus.mu.Lock()
-	defer bus.mu.Unlock()
+	shard := bus.getShard(eventType)
+	shard.mu.Lock()
+	shard.handlers[eventType] = append(shard.handlers[eventType], h)
+	shard.mu.Unlock()
 
-	bus.handlers[eventType] = append(bus.handlers[eventType], h)
 	return nil
 }
 
 // SubscribeContext registers a context-aware handler for events of type T
 func SubscribeContext[T any](bus *EventBus, handler ContextHandler[T], opts ...SubscribeOption) error {
-	// Validate bus
 	if bus == nil {
 		return fmt.Errorf("eventbus: bus cannot be nil")
 	}
-
-	// Validate handler
 	if handler == nil {
 		return fmt.Errorf("eventbus: handler cannot be nil")
 	}
@@ -143,7 +148,6 @@ func SubscribeContext[T any](bus *EventBus, handler ContextHandler[T], opts ...S
 		acceptsContext: true,
 	}
 
-	// Apply options with validation
 	for _, opt := range opts {
 		if opt == nil {
 			return fmt.Errorf("eventbus: subscribe option cannot be nil")
@@ -151,241 +155,290 @@ func SubscribeContext[T any](bus *EventBus, handler ContextHandler[T], opts ...S
 		opt(h)
 	}
 
-	bus.mu.Lock()
-	defer bus.mu.Unlock()
+	shard := bus.getShard(eventType)
+	shard.mu.Lock()
+	shard.handlers[eventType] = append(shard.handlers[eventType], h)
+	shard.mu.Unlock()
 
-	bus.handlers[eventType] = append(bus.handlers[eventType], h)
 	return nil
 }
 
-// Unsubscribe removes a specific handler for events of type T
-// The handler parameter must be the exact same function reference that was subscribed
+// Unsubscribe removes a handler for events of type T
 func Unsubscribe[T any, H any](bus *EventBus, handler H) error {
 	eventType := reflect.TypeOf((*T)(nil)).Elem()
 	handlerPtr := reflect.ValueOf(handler).Pointer()
 
-	bus.mu.Lock()
-	defer bus.mu.Unlock()
+	shard := bus.getShard(eventType)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 
-	handlers, exists := bus.handlers[eventType]
-	if !exists {
-		return fmt.Errorf("no handlers found for event type %v", eventType)
-	}
-
+	handlers := shard.handlers[eventType]
 	for i, h := range handlers {
 		if reflect.ValueOf(h.handler).Pointer() == handlerPtr {
-			// Remove handler
-			bus.handlers[eventType] = append(handlers[:i], handlers[i+1:]...)
+			// Remove handler efficiently
+			shard.handlers[eventType] = append(handlers[:i], handlers[i+1:]...)
 			return nil
 		}
 	}
 
-	return fmt.Errorf("handler not found for event type %v", eventType)
+	return fmt.Errorf("handler not found")
 }
 
-// Publish sends an event to all registered handlers
+// Publish publishes an event to all registered handlers
 func Publish[T any](bus *EventBus, event T) {
 	PublishContext(bus, context.Background(), event)
 }
 
-// PublishContext sends an event with context to all registered handlers
+// PublishContext publishes an event with context to all registered handlers
 func PublishContext[T any](bus *EventBus, ctx context.Context, event T) {
 	eventType := reflect.TypeOf(event)
 
-	// Call beforePublish hook if set
-	bus.mu.RLock()
-	beforeHook := bus.beforePublish
-	bus.mu.RUnlock()
-
-	if beforeHook != nil {
-		beforeHook(eventType, event)
+	// Call before publish hook
+	if bus.beforePublish != nil {
+		bus.beforePublish(eventType, event)
 	}
 
-	bus.mu.RLock()
-	handlers, exists := bus.handlers[eventType]
-	if !exists {
-		bus.mu.RUnlock()
-
-		// Still call afterPublish hook even if no handlers
-		bus.mu.RLock()
-		afterHook := bus.afterPublish
-		bus.mu.RUnlock()
-
-		if afterHook != nil {
-			afterHook(eventType, event)
-		}
-		return
-	}
-
-	// Copy handlers slice to avoid holding lock during execution
+	// Get handlers from appropriate shard
+	shard := bus.getShard(eventType)
+	shard.mu.RLock()
+	handlers := shard.handlers[eventType]
+	// Create a copy to avoid holding the lock during handler execution
 	handlersCopy := make([]*internalHandler, len(handlers))
 	copy(handlersCopy, handlers)
-	bus.mu.RUnlock()
+	shard.mu.RUnlock()
 
-	// Execute handlers
+	// Execute handlers without holding the lock
+	var wg sync.WaitGroup
+	var onceHandlersToRemove []*internalHandler
+
 	for _, h := range handlersCopy {
-		// Check if context is cancelled before processing
-		if ctx.Err() != nil {
-			// Context cancelled, skip remaining handlers
-			break
-		}
-
-		// For once handlers, check if already executed
-		if h.once && !atomic.CompareAndSwapUint32(&h.executed, 0, 1) {
-			// Already executed, skip
-			continue
+		// For once handlers, use CompareAndSwap to ensure atomic execution
+		if h.once {
+			if !atomic.CompareAndSwapUint32(&h.executed, 0, 1) {
+				continue // Already executed
+			}
+			// Mark for removal after execution
+			onceHandlersToRemove = append(onceHandlersToRemove, h)
 		}
 
 		if h.async {
+			wg.Add(1)
 			bus.wg.Add(1)
-			go func(handler *internalHandler, capturedCtx context.Context) {
+			go func(handler *internalHandler) {
+				defer wg.Done()
 				defer bus.wg.Done()
-				if handler.sequential {
-					handler.mu.Lock()
-					defer handler.mu.Unlock()
-				}
-				// Check context cancellation in goroutine
-				if capturedCtx.Err() != nil {
+
+				// Check context before executing
+				select {
+				case <-ctx.Done():
 					return
+				default:
+					callHandlerWithContext(handler, ctx, event, bus.panicHandler)
 				}
-				callHandlerWithContext(handler, capturedCtx, event, bus.panicHandler)
-			}(h, ctx)
+			}(h)
 		} else {
-			callHandlerWithContext(h, ctx, event, bus.panicHandler)
-		}
-	}
-
-	// Remove executed once handlers
-	// We do this in a separate pass to avoid race conditions
-	bus.mu.Lock()
-	handlers = bus.handlers[eventType]
-	if len(handlers) == 0 {
-		bus.mu.Unlock()
-
-		// Call afterPublish hook
-		bus.mu.RLock()
-		afterHook := bus.afterPublish
-		bus.mu.RUnlock()
-
-		if afterHook != nil {
-			afterHook(eventType, event)
-		}
-		return
-	}
-
-	// Check if any once handlers were executed and need removal
-	hasExecutedOnce := false
-	for _, h := range handlers {
-		if h.once && atomic.LoadUint32(&h.executed) == 1 {
-			hasExecutedOnce = true
-			break
-		}
-	}
-
-	if hasExecutedOnce {
-		// Create a new slice without the executed once handlers
-		newHandlers := make([]*internalHandler, 0, len(handlers))
-		for _, h := range handlers {
-			// Keep handler if it's not a once handler OR if it's a once handler that hasn't been executed
-			if !h.once || atomic.LoadUint32(&h.executed) == 0 {
-				newHandlers = append(newHandlers, h)
+			// Check context cancellation for sync handlers too
+			select {
+			case <-ctx.Done():
+				continue // Skip if context cancelled
+			default:
+				callHandlerWithContext(h, ctx, event, bus.panicHandler)
 			}
 		}
-		bus.handlers[eventType] = newHandlers
 	}
-	bus.mu.Unlock()
 
-	// Call afterPublish hook
-	bus.mu.RLock()
-	afterHook := bus.afterPublish
-	bus.mu.RUnlock()
-
-	if afterHook != nil {
-		afterHook(eventType, event)
-	}
-}
-
-// callHandlerWithContext executes a handler with the given context and event
-func callHandlerWithContext[T any](h *internalHandler, ctx context.Context, event T, panicHandler PanicHandler) {
-	defer func() {
-		if r := recover(); r != nil {
-			if panicHandler != nil {
-				panicHandler(event, h.handlerType, r)
+	// Remove once handlers that were executed
+	if len(onceHandlersToRemove) > 0 {
+		shard.mu.Lock()
+		handlers := shard.handlers[eventType]
+		for _, onceHandler := range onceHandlersToRemove {
+			for i, h := range handlers {
+				if h == onceHandler {
+					handlers = append(handlers[:i], handlers[i+1:]...)
+					break
+				}
 			}
 		}
-	}()
+		shard.handlers[eventType] = handlers
+		shard.mu.Unlock()
+	}
 
-	if h.acceptsContext {
-		if fn, ok := h.handler.(ContextHandler[T]); ok {
-			fn(ctx, event)
-		} else if fn, ok := h.handler.(func(context.Context, any)); ok {
-			// Handle generic context handler (used by CQRS projections)
-			fn(ctx, event)
-		} else if fn, ok := h.handler.(func(context.Context, any) error); ok {
-			// Handle generic context handler with error (used by CQRS projections)
-			_ = fn(ctx, event)
-		}
-	} else {
-		if fn, ok := h.handler.(Handler[T]); ok {
-			fn(event)
-		}
+	// For async handlers, we don't wait inline to avoid blocking
+	// Users can call bus.Wait() if they need to wait for completion
+
+	// Call after publish hook
+	if bus.afterPublish != nil {
+		bus.afterPublish(eventType, event)
 	}
 }
 
-// HasSubscribers returns true if there are any handlers for event type T
-func HasSubscribers[T any](bus *EventBus) bool {
-	eventType := reflect.TypeOf((*T)(nil)).Elem()
-
-	bus.mu.RLock()
-	defer bus.mu.RUnlock()
-
-	handlers, exists := bus.handlers[eventType]
-	return exists && len(handlers) > 0
-}
-
-// WaitAsync waits for all async handlers to complete
-func (bus *EventBus) WaitAsync() {
-	bus.wg.Wait()
-}
-
-// Clear removes all handlers for event type T
+// Clear removes all handlers for events of type T
 func Clear[T any](bus *EventBus) {
 	eventType := reflect.TypeOf((*T)(nil)).Elem()
 
-	bus.mu.Lock()
-	defer bus.mu.Unlock()
-
-	delete(bus.handlers, eventType)
+	shard := bus.getShard(eventType)
+	shard.mu.Lock()
+	delete(shard.handlers, eventType)
+	shard.mu.Unlock()
 }
 
-// ClearAll removes all handlers
-func (bus *EventBus) ClearAll() {
-	bus.mu.Lock()
-	defer bus.mu.Unlock()
-
-	bus.handlers = make(map[reflect.Type][]*internalHandler)
+// ClearAll removes all handlers for all event types
+func ClearAll(bus *EventBus) {
+	for i := 0; i < numShards; i++ {
+		bus.shards[i].mu.Lock()
+		bus.shards[i].handlers = make(map[reflect.Type][]*internalHandler)
+		bus.shards[i].mu.Unlock()
+	}
 }
 
-// SetPanicHandler sets a function to be called when a handler panics
+// HasHandlers checks if there are handlers for events of type T
+func HasHandlers[T any](bus *EventBus) bool {
+	eventType := reflect.TypeOf((*T)(nil)).Elem()
+
+	shard := bus.getShard(eventType)
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
+
+	return len(shard.handlers[eventType]) > 0
+}
+
+// HandlerCount returns the number of handlers for events of type T
+func HandlerCount[T any](bus *EventBus) int {
+	eventType := reflect.TypeOf((*T)(nil)).Elem()
+
+	shard := bus.getShard(eventType)
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
+
+	return len(shard.handlers[eventType])
+}
+
+// Wait blocks until all async handlers complete
+func (bus *EventBus) Wait() {
+	bus.wg.Wait()
+}
+
+// SetExtension stores an extension
+func SetExtension(bus *EventBus, name string, extension any) {
+	bus.extensions.Store(name, extension)
+}
+
+// GetExtension retrieves an extension
+func GetExtension(bus *EventBus, name string) (any, bool) {
+	return bus.extensions.Load(name)
+}
+
+// callHandlerWithContext calls a handler with proper type checking and panic recovery
+func callHandlerWithContext[T any](h *internalHandler, ctx context.Context, event T, panicHandler PanicHandler) {
+	defer func() {
+		if r := recover(); r != nil && panicHandler != nil {
+			panicHandler(event, h.handlerType, r)
+		}
+	}()
+
+	// Sequential handlers need locking
+	if h.sequential {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+	}
+
+	// Try common handler types first for performance
+	switch fn := h.handler.(type) {
+	case Handler[T]:
+		fn(event)
+	case ContextHandler[T]:
+		fn(ctx, event)
+	case func(T):
+		fn(event)
+	case func(context.Context, T):
+		fn(ctx, event)
+	case func(any):
+		fn(event)
+	case func(context.Context, any):
+		fn(ctx, event)
+	case func(context.Context, any) error:
+		_ = fn(ctx, event)
+	default:
+		// Fallback to reflection for other types
+		handlerValue := reflect.ValueOf(h.handler)
+		eventValue := reflect.ValueOf(event)
+
+		if h.handlerType.Kind() == reflect.Func {
+			numIn := h.handlerType.NumIn()
+			if numIn == 1 {
+				handlerValue.Call([]reflect.Value{eventValue})
+			} else if numIn == 2 {
+				handlerValue.Call([]reflect.Value{reflect.ValueOf(ctx), eventValue})
+			}
+		}
+	}
+}
+
+// Subscribe Options
+
+// Once makes the handler execute only once
+func Once() SubscribeOption {
+	return func(h *internalHandler) {
+		h.once = true
+	}
+}
+
+// Async makes the handler execute asynchronously
+func Async() SubscribeOption {
+	return func(h *internalHandler) {
+		h.async = true
+	}
+}
+
+// Sequential ensures the handler executes sequentially (with mutex)
+func Sequential() SubscribeOption {
+	return func(h *internalHandler) {
+		h.sequential = true
+	}
+}
+
+// Bus Options
+
+// WithPanicHandler sets a panic handler for the event bus
+func WithPanicHandler(handler PanicHandler) Option {
+	return func(bus *EventBus) {
+		bus.panicHandler = handler
+	}
+}
+
+// WithBeforePublish sets a hook that's called before publishing events
+func WithBeforePublish(hook PublishHook) Option {
+	return func(bus *EventBus) {
+		bus.beforePublish = hook
+	}
+}
+
+// WithAfterPublish sets a hook that's called after publishing events
+func WithAfterPublish(hook PublishHook) Option {
+	return func(bus *EventBus) {
+		bus.afterPublish = hook
+	}
+}
+
+// startEventProcessor starts processing persisted events
+func (bus *EventBus) startEventProcessor() {
+	// This will be implemented when needed for event replay
+	return
+}
+
+// Backward compatibility methods
+
+// SetPanicHandler sets the panic handler (for backward compatibility)
 func (bus *EventBus) SetPanicHandler(handler PanicHandler) {
-	bus.mu.Lock()
-	defer bus.mu.Unlock()
-
 	bus.panicHandler = handler
 }
 
-// SetBeforePublishHook sets a hook to be called before handlers are executed
+// SetBeforePublishHook sets the before publish hook (for backward compatibility)
 func (bus *EventBus) SetBeforePublishHook(hook PublishHook) {
-	bus.mu.Lock()
-	defer bus.mu.Unlock()
-
 	bus.beforePublish = hook
 }
 
-// SetAfterPublishHook sets a hook to be called after all handlers have executed
+// SetAfterPublishHook sets the after publish hook (for backward compatibility)
 func (bus *EventBus) SetAfterPublishHook(hook PublishHook) {
-	bus.mu.Lock()
-	defer bus.mu.Unlock()
-
 	bus.afterPublish = hook
 }

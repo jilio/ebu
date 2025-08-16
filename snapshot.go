@@ -229,24 +229,20 @@ func (s *MemorySnapshotStore) Delete(ctx context.Context, aggregateID string) er
 	return nil
 }
 
-// WithSnapshots is a BusOption that enables aggregate snapshots
-func WithSnapshots(store SnapshotStore, policy SnapshotPolicy) BusOption {
+// WithSnapshots is an Option that enables aggregate snapshots
+func WithSnapshots(store SnapshotStore, policy SnapshotPolicy) Option {
 	return func(bus *EventBus) {
 		// Store snapshot manager in bus for access by CQRS
-		if bus.extensions == nil {
-			bus.extensions = make(map[string]any)
-		}
-		bus.extensions["snapshot_manager"] = NewSnapshotManager(store, policy)
+		bus.extensions.Store("snapshot_manager", NewSnapshotManager(store, policy))
 	}
 }
 
 // GetSnapshotManager retrieves the snapshot manager from the bus
 func GetSnapshotManager(bus *EventBus) *SnapshotManager {
-	if bus.extensions == nil {
-		return nil
-	}
-	if sm, ok := bus.extensions["snapshot_manager"].(*SnapshotManager); ok {
-		return sm
+	if val, ok := bus.extensions.Load("snapshot_manager"); ok {
+		if sm, ok := val.(*SnapshotManager); ok {
+			return sm
+		}
 	}
 	return nil
 }

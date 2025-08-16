@@ -420,8 +420,7 @@ func TestWithSnapshots(t *testing.T) {
 
 	// Test GetSnapshotManager with extensions but no snapshot manager
 	bus3 := New()
-	bus3.extensions = make(map[string]any)
-	bus3.extensions["other"] = "value"
+	bus3.extensions.Store("other", "value")
 	manager3 := GetSnapshotManager(bus3)
 	if manager3 != nil {
 		t.Error("Expected nil snapshot manager when not in extensions")
