@@ -74,6 +74,41 @@ func TestReflectionWithRawInterface(t *testing.T) {
 	}
 }
 
+// TestReflectionNumInTwoDirect tests the numIn == 2 reflection path (line 371-372)
+func TestReflectionNumInTwoDirect(t *testing.T) {
+	// Test handler with 2 parameters (context + event) via reflection
+	// We need to ensure T doesn't match the event type
+	type MyContextEvent struct {
+		Message string
+	}
+
+	called := false
+	// Use a handler with different event type than what we pass to callHandlerWithContext
+	// This will force the reflection path since the type assertion won't match
+	var rawHandler interface{} = func(ctx context.Context, e MyContextEvent) {
+		called = true
+		if e.Message != "hello" {
+			t.Errorf("expected Message='hello', got %s", e.Message)
+		}
+		if ctx == nil {
+			t.Error("expected non-nil context")
+		}
+	}
+
+	h := &internalHandler{
+		handler:     rawHandler,
+		handlerType: reflect.TypeOf(rawHandler),
+	}
+
+	// Call with interface{} type parameter to bypass type assertions
+	// This simulates the generic T being different from MyContextEvent
+	callHandlerWithContext[interface{}](h, context.Background(), MyContextEvent{Message: "hello"}, nil)
+
+	if !called {
+		t.Error("handler was not called")
+	}
+}
+
 // TestReflectionNumInOneDirect specifically tests line 369
 func TestReflectionNumInOneDirect(t *testing.T) {
 	// Create various handlers that will fall through to reflection
