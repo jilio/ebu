@@ -166,6 +166,219 @@ func TestUnsubscribe(t *testing.T) {
 	}
 }
 
+func TestWithFilter(t *testing.T) {
+	t.Run("BasicFilter", func(t *testing.T) {
+		bus := New()
+		var receivedEvents []UserEvent
+
+		// Subscribe with a filter that only accepts login actions
+		err := Subscribe(bus, func(event UserEvent) {
+			receivedEvents = append(receivedEvents, event)
+		}, WithFilter(func(event UserEvent) bool {
+			return event.Action == "login"
+		}))
+
+		if err != nil {
+			t.Fatalf("Subscribe failed: %v", err)
+		}
+
+		// Publish various events
+		Publish(bus, UserEvent{UserID: "1", Action: "login"})
+		Publish(bus, UserEvent{UserID: "2", Action: "logout"})
+		Publish(bus, UserEvent{UserID: "3", Action: "login"})
+		Publish(bus, UserEvent{UserID: "4", Action: "signup"})
+
+		// Should only receive login events
+		if len(receivedEvents) != 2 {
+			t.Errorf("Expected 2 events, got %d", len(receivedEvents))
+		}
+		for _, event := range receivedEvents {
+			if event.Action != "login" {
+				t.Errorf("Received non-login event: %+v", event)
+			}
+		}
+	})
+
+	t.Run("FilterWithContext", func(t *testing.T) {
+		bus := New()
+		var receivedEvents []OrderEvent
+
+		// Subscribe with context handler and filter
+		err := SubscribeContext(bus, func(ctx context.Context, event OrderEvent) {
+			receivedEvents = append(receivedEvents, event)
+		}, WithFilter(func(event OrderEvent) bool {
+			return event.Amount > 100
+		}))
+
+		if err != nil {
+			t.Fatalf("SubscribeContext failed: %v", err)
+		}
+
+		// Publish various events
+		PublishContext(bus, context.Background(), OrderEvent{OrderID: "1", Amount: 50})
+		PublishContext(bus, context.Background(), OrderEvent{OrderID: "2", Amount: 150})
+		PublishContext(bus, context.Background(), OrderEvent{OrderID: "3", Amount: 200})
+		PublishContext(bus, context.Background(), OrderEvent{OrderID: "4", Amount: 75})
+
+		// Should only receive events with amount > 100
+		if len(receivedEvents) != 2 {
+			t.Errorf("Expected 2 events, got %d", len(receivedEvents))
+		}
+		for _, event := range receivedEvents {
+			if event.Amount <= 100 {
+				t.Errorf("Received event with amount <= 100: %+v", event)
+			}
+		}
+	})
+
+	t.Run("FilterWithAsync", func(t *testing.T) {
+		bus := New()
+		var receivedCount int32
+		done := make(chan bool, 2)
+
+		// Subscribe with async handler and filter
+		err := Subscribe(bus, func(event UserEvent) {
+			atomic.AddInt32(&receivedCount, 1)
+			done <- true
+		}, Async(), WithFilter(func(event UserEvent) bool {
+			return strings.HasPrefix(event.UserID, "admin-")
+		}))
+
+		if err != nil {
+			t.Fatalf("Subscribe failed: %v", err)
+		}
+
+		// Publish various events
+		Publish(bus, UserEvent{UserID: "admin-1", Action: "login"})
+		Publish(bus, UserEvent{UserID: "user-1", Action: "login"})
+		Publish(bus, UserEvent{UserID: "admin-2", Action: "logout"})
+		Publish(bus, UserEvent{UserID: "user-2", Action: "logout"})
+
+		// Wait for async handlers
+		bus.Wait()
+
+		// Should only receive admin events
+		count := atomic.LoadInt32(&receivedCount)
+		if count != 2 {
+			t.Errorf("Expected 2 events, got %d", count)
+		}
+	})
+
+	t.Run("FilterWithOnce", func(t *testing.T) {
+		bus := New()
+		var callCount int
+
+		// Subscribe with once handler and filter
+		err := Subscribe(bus, func(event OrderEvent) {
+			callCount++
+		}, Once(), WithFilter(func(event OrderEvent) bool {
+			return event.Amount > 500
+		}))
+
+		if err != nil {
+			t.Fatalf("Subscribe failed: %v", err)
+		}
+
+		// Publish various events
+		Publish(bus, OrderEvent{OrderID: "1", Amount: 100})
+		Publish(bus, OrderEvent{OrderID: "2", Amount: 600}) // Should trigger
+		Publish(bus, OrderEvent{OrderID: "3", Amount: 700}) // Should not trigger (once)
+		Publish(bus, OrderEvent{OrderID: "4", Amount: 800}) // Should not trigger (once)
+
+		if callCount != 1 {
+			t.Errorf("Expected handler to be called once, got %d", callCount)
+		}
+	})
+
+	t.Run("MultipleHandlersWithDifferentFilters", func(t *testing.T) {
+		bus := New()
+		var highPriorityEvents []UserEvent
+		var adminEvents []UserEvent
+
+		// First handler: filter for high priority
+		err := Subscribe(bus, func(event UserEvent) {
+			highPriorityEvents = append(highPriorityEvents, event)
+		}, WithFilter(func(event UserEvent) bool {
+			return event.Action == "urgent"
+		}))
+		if err != nil {
+			t.Fatalf("Subscribe failed: %v", err)
+		}
+
+		// Second handler: filter for admin users
+		err = Subscribe(bus, func(event UserEvent) {
+			adminEvents = append(adminEvents, event)
+		}, WithFilter(func(event UserEvent) bool {
+			return strings.HasPrefix(event.UserID, "admin-")
+		}))
+		if err != nil {
+			t.Fatalf("Subscribe failed: %v", err)
+		}
+
+		// Publish various events
+		Publish(bus, UserEvent{UserID: "user-1", Action: "urgent"})
+		Publish(bus, UserEvent{UserID: "admin-1", Action: "normal"})
+		Publish(bus, UserEvent{UserID: "admin-2", Action: "urgent"})
+		Publish(bus, UserEvent{UserID: "user-2", Action: "normal"})
+
+		// Check results
+		if len(highPriorityEvents) != 2 {
+			t.Errorf("Expected 2 high priority events, got %d", len(highPriorityEvents))
+		}
+		if len(adminEvents) != 2 {
+			t.Errorf("Expected 2 admin events, got %d", len(adminEvents))
+		}
+	})
+
+	t.Run("FilterAllowsNone", func(t *testing.T) {
+		bus := New()
+		var called bool
+
+		// Subscribe with a filter that rejects all events
+		err := Subscribe(bus, func(event UserEvent) {
+			called = true
+		}, WithFilter(func(event UserEvent) bool {
+			return false // Reject all
+		}))
+
+		if err != nil {
+			t.Fatalf("Subscribe failed: %v", err)
+		}
+
+		// Publish events
+		Publish(bus, UserEvent{UserID: "1", Action: "login"})
+		Publish(bus, UserEvent{UserID: "2", Action: "logout"})
+
+		if called {
+			t.Error("Handler should not have been called with filter that rejects all")
+		}
+	})
+
+	t.Run("FilterAllowsAll", func(t *testing.T) {
+		bus := New()
+		var callCount int
+
+		// Subscribe with a filter that accepts all events
+		err := Subscribe(bus, func(event UserEvent) {
+			callCount++
+		}, WithFilter(func(event UserEvent) bool {
+			return true // Accept all
+		}))
+
+		if err != nil {
+			t.Fatalf("Subscribe failed: %v", err)
+		}
+
+		// Publish events
+		Publish(bus, UserEvent{UserID: "1", Action: "login"})
+		Publish(bus, UserEvent{UserID: "2", Action: "logout"})
+
+		if callCount != 2 {
+			t.Errorf("Expected 2 calls with filter that accepts all, got %d", callCount)
+		}
+	})
+}
+
 func TestAsyncSubscribe(t *testing.T) {
 	bus := New()
 	var callCount int32

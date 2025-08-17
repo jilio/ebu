@@ -176,6 +176,80 @@ func main() {
 }
 ```
 
+### Event Filtering
+
+Filter events before they reach your handlers using predicate functions:
+
+```go
+import (
+    "fmt"
+    "math"
+    
+    eventbus "github.com/jilio/ebu"
+)
+
+type PriceUpdateEvent struct {
+    Symbol string
+    Price  float64
+    Change float64
+}
+
+func main() {
+    bus := eventbus.New()
+    
+    // Only handle price updates with significant changes
+    err := eventbus.Subscribe(bus, func(event PriceUpdateEvent) {
+        fmt.Printf("ALERT: %s moved %.2f%% to $%.2f\n", 
+            event.Symbol, event.Change, event.Price)
+    }, eventbus.WithFilter(func(event PriceUpdateEvent) bool {
+        // Only process events where price changed more than 5%
+        return math.Abs(event.Change) > 5.0
+    }))
+    if err != nil {
+        panic(err)
+    }
+    
+    // Only handle specific symbols
+    err = eventbus.Subscribe(bus, func(event PriceUpdateEvent) {
+        fmt.Printf("Tech stock update: %s at $%.2f\n", 
+            event.Symbol, event.Price)
+    }, eventbus.WithFilter(func(event PriceUpdateEvent) bool {
+        // Only process tech stocks
+        techStocks := []string{"AAPL", "GOOGL", "MSFT", "AMZN"}
+        for _, stock := range techStocks {
+            if event.Symbol == stock {
+                return true
+            }
+        }
+        return false
+    }))
+    if err != nil {
+        panic(err)
+    }
+    
+    // Publish various price updates
+    eventbus.Publish(bus, PriceUpdateEvent{Symbol: "AAPL", Price: 150.00, Change: 0.5})   // Tech stock only
+    eventbus.Publish(bus, PriceUpdateEvent{Symbol: "GOOGL", Price: 2800.00, Change: 10.2}) // Both handlers
+    eventbus.Publish(bus, PriceUpdateEvent{Symbol: "TSLA", Price: 850.00, Change: -7.5})   // Alert only
+    eventbus.Publish(bus, PriceUpdateEvent{Symbol: "F", Price: 12.00, Change: 1.2})        // Neither
+}
+```
+
+Filters can be combined with other options:
+
+```go
+// Filter + Async + Once
+err := eventbus.Subscribe(bus, func(event UserEvent) {
+    sendWelcomeEmail(event.UserID)
+}, 
+    eventbus.WithFilter(func(event UserEvent) bool {
+        return event.IsNewUser
+    }),
+    eventbus.Async(),
+    eventbus.Once(), // Only send welcome email once per app lifetime
+)
+```
+
 ### Dynamic Handler Management
 
 ```go
