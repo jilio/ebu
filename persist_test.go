@@ -336,11 +336,8 @@ func TestSubscribeWithReplayUnmarshalError(t *testing.T) {
 	// Now manually insert an event with invalid JSON that will cause unmarshal to fail
 	ctx := context.Background()
 	eventType := reflect.TypeOf((*TestEvent)(nil)).Elem()
-	// Build full type name with package path
+	// Use consistent type naming
 	typeName := eventType.String()
-	if pkg := eventType.PkgPath(); pkg != "" {
-		typeName = pkg + "/" + eventType.Name()
-	}
 
 	// This JSON is syntactically invalid
 	store.Save(ctx, &StoredEvent{
@@ -562,4 +559,52 @@ func (e *errorStore) SaveSubscriptionPosition(ctx context.Context, subscriptionI
 
 func (e *errorStore) LoadSubscriptionPosition(ctx context.Context, subscriptionID string) (int64, error) {
 	return 0, nil
+}
+
+// TestTypeNameConsistency verifies that EventType() and persistEvent use the same type naming
+func TestTypeNameConsistency(t *testing.T) {
+	store := NewMemoryStore()
+	bus := New(WithStore(store))
+
+	// Test events from different packages and types
+	testCases := []struct {
+		name  string
+		event any
+	}{
+		{"struct", TestEvent{ID: 1}},
+		{"pointer", &TestEvent{ID: 2}},
+		{"string", "test string"},
+		{"int", 42},
+		{"slice", []string{"a", "b"}},
+		{"map", map[string]int{"key": 1}},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Get expected type name from EventType
+			expectedType := EventType(tc.event)
+
+			// Publish the event to trigger persistence
+			Publish(bus, tc.event)
+
+			// Retrieve the last stored event
+			ctx := context.Background()
+			events, err := store.Load(ctx, 0, 100)
+			if err != nil {
+				t.Fatalf("Failed to load events: %v", err)
+			}
+
+			// Find the event we just published (should be the last one)
+			if len(events) == 0 {
+				t.Fatal("No events were persisted")
+			}
+			storedEvent := events[len(events)-1]
+
+			// Verify the type name matches
+			if storedEvent.Type != expectedType {
+				t.Errorf("Type name mismatch: persisted=%q, EventType()=%q",
+					storedEvent.Type, expectedType)
+			}
+		})
+	}
 }
