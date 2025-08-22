@@ -58,9 +58,6 @@ type EventBus struct {
 	store         EventStore
 	storePosition int64
 	storeMu       sync.RWMutex
-
-	// Extensions stored in sync.Map for thread-safety
-	extensions sync.Map
 }
 
 // EventType returns the fully qualified type name of an event.
@@ -345,16 +342,6 @@ func HandlerCount[T any](bus *EventBus) int {
 // Wait blocks until all async handlers complete
 func (bus *EventBus) Wait() {
 	bus.wg.Wait()
-}
-
-// SetExtension stores an extension
-func SetExtension(bus *EventBus, name string, extension any) {
-	bus.extensions.Store(name, extension)
-}
-
-// GetExtension retrieves an extension
-func GetExtension(bus *EventBus, name string) (any, bool) {
-	return bus.extensions.Load(name)
 }
 
 // callHandlerWithContext calls a handler with proper type checking and panic recovery
