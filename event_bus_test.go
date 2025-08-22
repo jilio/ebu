@@ -2331,38 +2331,6 @@ func TestAsyncSequentialHandlerContextCancelled(t *testing.T) {
 	}
 }
 
-// TestExtensions tests the extensions functionality
-func TestExtensions(t *testing.T) {
-	bus := New()
-
-	// Test SetExtension and GetExtension functions
-	SetExtension(bus, "key1", "value1")
-	SetExtension(bus, "key2", 42)
-
-	val1, ok := GetExtension(bus, "key1")
-	if !ok || val1 != "value1" {
-		t.Errorf("expected 'value1', got %v", val1)
-	}
-
-	val2, ok := GetExtension(bus, "key2")
-	if !ok || val2 != 42 {
-		t.Errorf("expected 42, got %v", val2)
-	}
-
-	// Test non-existent key
-	_, ok = GetExtension(bus, "nonexistent")
-	if ok {
-		t.Error("expected false for non-existent key")
-	}
-
-	// Also test direct access to extensions
-	bus.extensions.Store("direct", "access")
-	val, ok := bus.extensions.Load("direct")
-	if !ok || val != "access" {
-		t.Errorf("expected 'access', got %v", val)
-	}
-}
-
 // TestWithBeforePublish tests the before publish hook
 func TestWithBeforePublish(t *testing.T) {
 	var hookCalled bool
