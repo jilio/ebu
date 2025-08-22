@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Handler is a generic event handler function
@@ -35,6 +36,9 @@ type internalHandler struct {
 // PanicHandler is called when a handler panics
 type PanicHandler func(event any, handlerType reflect.Type, panicValue any)
 
+// PersistenceErrorHandler is called when event persistence fails
+type PersistenceErrorHandler func(event any, eventType reflect.Type, err error)
+
 // PublishHook is called when an event is published
 type PublishHook func(eventType reflect.Type, event any)
 
@@ -55,9 +59,11 @@ type EventBus struct {
 	wg            sync.WaitGroup
 
 	// Optional persistence fields (nil if not using persistence)
-	store         EventStore
-	storePosition int64
-	storeMu       sync.RWMutex
+	store                   EventStore
+	storePosition           int64
+	storeMu                 sync.RWMutex
+	persistenceErrorHandler PersistenceErrorHandler
+	persistenceTimeout      time.Duration
 }
 
 // EventType returns the fully qualified type name of an event.
@@ -443,6 +449,20 @@ func WithAfterPublish(hook PublishHook) Option {
 	}
 }
 
+// WithPersistenceErrorHandler sets the error handler for persistence failures
+func WithPersistenceErrorHandler(handler PersistenceErrorHandler) Option {
+	return func(bus *EventBus) {
+		bus.persistenceErrorHandler = handler
+	}
+}
+
+// WithPersistenceTimeout sets the timeout for persistence operations
+func WithPersistenceTimeout(timeout time.Duration) Option {
+	return func(bus *EventBus) {
+		bus.persistenceTimeout = timeout
+	}
+}
+
 // startEventProcessor starts processing persisted events
 func (bus *EventBus) startEventProcessor() {
 	// This will be implemented when needed for event replay
@@ -464,4 +484,9 @@ func (bus *EventBus) SetBeforePublishHook(hook PublishHook) {
 // SetAfterPublishHook sets the after publish hook (for backward compatibility)
 func (bus *EventBus) SetAfterPublishHook(hook PublishHook) {
 	bus.afterPublish = hook
+}
+
+// SetPersistenceErrorHandler sets the persistence error handler (for runtime configuration)
+func (bus *EventBus) SetPersistenceErrorHandler(handler PersistenceErrorHandler) {
+	bus.persistenceErrorHandler = handler
 }
