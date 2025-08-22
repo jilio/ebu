@@ -536,9 +536,13 @@ func TestPersistEventWithUnmarshalableData(t *testing.T) {
 // errorStore is a mock store that returns errors
 type errorStore struct {
 	failLoad bool
+	failSave bool
 }
 
 func (e *errorStore) Save(ctx context.Context, event *StoredEvent) error {
+	if e.failSave {
+		return errors.New("save failed")
+	}
 	return nil
 }
 
@@ -607,4 +611,205 @@ func TestTypeNameConsistency(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestPersistenceErrorHandler tests that persistence errors are handled properly
+func TestPersistenceErrorHandler(t *testing.T) {
+	var capturedEvent any
+	var capturedType reflect.Type
+	var capturedError error
+
+	store := &errorStore{failSave: true}
+	bus := New(
+		WithStore(store),
+		WithPersistenceErrorHandler(func(event any, eventType reflect.Type, err error) {
+			capturedEvent = event
+			capturedType = eventType
+			capturedError = err
+		}),
+	)
+
+	// Publish an event that will fail to save
+	testEvent := TestEvent{ID: 1, Value: "test"}
+	Publish(bus, testEvent)
+
+	// Verify error handler was called
+	if capturedEvent == nil {
+		t.Fatal("Error handler was not called")
+	}
+
+	if e, ok := capturedEvent.(TestEvent); !ok || e.ID != 1 {
+		t.Errorf("Wrong event captured: %v", capturedEvent)
+	}
+
+	if capturedType.String() != "eventbus.TestEvent" {
+		t.Errorf("Wrong type captured: %v", capturedType)
+	}
+
+	if !strings.Contains(capturedError.Error(), "save failed") {
+		t.Errorf("Wrong error captured: %v", capturedError)
+	}
+
+	// Verify position didn't increment on failure
+	if bus.storePosition != 0 {
+		t.Errorf("Position should not increment on save failure, got %d", bus.storePosition)
+	}
+}
+
+// TestPersistenceMarshalError tests handling of marshal errors
+func TestPersistenceMarshalError(t *testing.T) {
+	var capturedError error
+
+	store := NewMemoryStore()
+	bus := New(
+		WithStore(store),
+		WithPersistenceErrorHandler(func(event any, eventType reflect.Type, err error) {
+			capturedError = err
+		}),
+	)
+
+	// Create an unmarshalable event (channel)
+	type UnmarshalableEvent struct {
+		Ch chan int
+	}
+
+	Publish(bus, UnmarshalableEvent{Ch: make(chan int)})
+
+	// Verify error handler was called
+	if capturedError == nil {
+		t.Fatal("Error handler was not called for marshal error")
+	}
+
+	if !strings.Contains(capturedError.Error(), "marshal") {
+		t.Errorf("Expected marshal error, got: %v", capturedError)
+	}
+
+	// Verify position didn't increment
+	if bus.storePosition != 0 {
+		t.Errorf("Position should not increment on marshal failure, got %d", bus.storePosition)
+	}
+}
+
+// TestPersistenceTimeout tests timeout handling
+func TestPersistenceTimeout(t *testing.T) {
+	var capturedError error
+
+	// Create a store that sleeps longer than timeout
+	slowStore := &slowStore{delay: 100 * time.Millisecond}
+	bus := New(
+		WithStore(slowStore),
+		WithPersistenceTimeout(10*time.Millisecond),
+		WithPersistenceErrorHandler(func(event any, eventType reflect.Type, err error) {
+			capturedError = err
+		}),
+	)
+
+	Publish(bus, TestEvent{ID: 1, Value: "test"})
+
+	// Give it time to timeout
+	time.Sleep(50 * time.Millisecond)
+
+	// Verify timeout error was captured
+	if capturedError == nil {
+		t.Fatal("Error handler was not called for timeout")
+	}
+
+	if !strings.Contains(capturedError.Error(), "context deadline exceeded") &&
+		!strings.Contains(capturedError.Error(), "context canceled") {
+		t.Errorf("Expected timeout error, got: %v", capturedError)
+	}
+}
+
+// TestSetPersistenceErrorHandler tests runtime configuration
+func TestSetPersistenceErrorHandler(t *testing.T) {
+	var handlerCalled bool
+
+	store := &errorStore{failSave: true}
+	bus := New(WithStore(store))
+
+	// Set error handler at runtime
+	bus.SetPersistenceErrorHandler(func(event any, eventType reflect.Type, err error) {
+		handlerCalled = true
+	})
+
+	Publish(bus, TestEvent{ID: 1})
+
+	if !handlerCalled {
+		t.Error("Runtime-configured error handler was not called")
+	}
+}
+
+// TestPersistenceSuccessIncrementsPosition tests that position only increments on success
+func TestPersistenceSuccessIncrementsPosition(t *testing.T) {
+	store := NewMemoryStore()
+	bus := New(WithStore(store))
+
+	// Publish multiple events successfully
+	for i := 1; i <= 3; i++ {
+		Publish(bus, TestEvent{ID: i})
+	}
+
+	// Verify position incremented correctly
+	if bus.storePosition != 3 {
+		t.Errorf("Expected position 3, got %d", bus.storePosition)
+	}
+
+	// Verify all events were stored
+	ctx := context.Background()
+	events, _ := store.Load(ctx, 0, 100)
+	if len(events) != 3 {
+		t.Errorf("Expected 3 events stored, got %d", len(events))
+	}
+
+	// Verify positions are sequential
+	for i, event := range events {
+		expectedPos := int64(i + 1)
+		if event.Position != expectedPos {
+			t.Errorf("Event %d has position %d, expected %d", i, event.Position, expectedPos)
+		}
+	}
+}
+
+// TestPersistenceWithoutErrorHandler tests that errors don't crash when no handler is set
+func TestPersistenceWithoutErrorHandler(t *testing.T) {
+	store := &errorStore{failSave: true}
+	bus := New(WithStore(store))
+
+	// This should not panic even without error handler
+	Publish(bus, TestEvent{ID: 1})
+
+	// Verify position didn't increment
+	if bus.storePosition != 0 {
+		t.Errorf("Position should not increment on failure, got %d", bus.storePosition)
+	}
+}
+
+// slowStore is a mock store that delays operations
+type slowStore struct {
+	delay time.Duration
+}
+
+func (s *slowStore) Save(ctx context.Context, event *StoredEvent) error {
+	select {
+	case <-time.After(s.delay):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *slowStore) Load(ctx context.Context, from, to int64) ([]*StoredEvent, error) {
+	return []*StoredEvent{}, nil
+}
+
+func (s *slowStore) GetPosition(ctx context.Context) (int64, error) {
+	return 0, nil
+}
+
+func (s *slowStore) SaveSubscriptionPosition(ctx context.Context, subscriptionID string, position int64) error {
+	return nil
+}
+
+func (s *slowStore) LoadSubscriptionPosition(ctx context.Context, subscriptionID string) (int64, error) {
+	return 0, nil
 }

@@ -65,16 +65,19 @@ func (bus *EventBus) persistEvent(eventType reflect.Type, event any) {
 		return // No persistence configured
 	}
 
-	bus.storeMu.Lock()
-	bus.storePosition++
-	position := bus.storePosition
-	bus.storeMu.Unlock()
-
+	// Marshal the event first
 	data, err := json.Marshal(event)
 	if err != nil {
-		// Silent fail for now, could add error handler option
+		if bus.persistenceErrorHandler != nil {
+			bus.persistenceErrorHandler(event, eventType, fmt.Errorf("failed to marshal event: %w", err))
+		}
 		return
 	}
+
+	// Only increment position after successful marshaling
+	bus.storeMu.Lock()
+	position := bus.storePosition + 1
+	bus.storeMu.Unlock()
 
 	// Use consistent type naming with EventType() function
 	typeName := eventType.String()
@@ -86,8 +89,26 @@ func (bus *EventBus) persistEvent(eventType reflect.Type, event any) {
 		Timestamp: time.Now(),
 	}
 
+	// Create context with timeout if configured
 	ctx := context.Background()
-	bus.store.Save(ctx, stored)
+	var cancel context.CancelFunc
+	if bus.persistenceTimeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, bus.persistenceTimeout)
+		defer cancel()
+	}
+
+	// Try to save the event
+	if err := bus.store.Save(ctx, stored); err != nil {
+		if bus.persistenceErrorHandler != nil {
+			bus.persistenceErrorHandler(event, eventType, fmt.Errorf("failed to save event: %w", err))
+		}
+		return
+	}
+
+	// Only increment position after successful save
+	bus.storeMu.Lock()
+	bus.storePosition = position
+	bus.storeMu.Unlock()
 }
 
 // Replay replays events from a position
