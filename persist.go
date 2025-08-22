@@ -135,6 +135,28 @@ func (bus *EventBus) Replay(ctx context.Context, from int64, handler func(*Store
 	return nil
 }
 
+// ReplayWithUpcast replays events from a position, applying upcasts before passing to handler
+func (bus *EventBus) ReplayWithUpcast(ctx context.Context, from int64, handler func(*StoredEvent) error) error {
+	return bus.Replay(ctx, from, func(event *StoredEvent) error {
+		// Apply upcasts if available
+		if bus.upcastRegistry != nil {
+			upcastedData, upcastedType, err := bus.upcastRegistry.apply(event.Data, event.Type)
+			if err == nil {
+				// Create a new StoredEvent with upcasted data
+				upcastedEvent := &StoredEvent{
+					Position:  event.Position,
+					Type:      upcastedType,
+					Data:      upcastedData,
+					Timestamp: event.Timestamp,
+				}
+				return handler(upcastedEvent)
+			}
+			// If upcast fails, pass original event
+		}
+		return handler(event)
+	})
+}
+
 // IsPersistent returns true if persistence is enabled
 func (bus *EventBus) IsPersistent() bool {
 	return bus.store != nil
@@ -166,13 +188,24 @@ func SubscribeWithReplay[T any](
 	// Use consistent type naming with EventType() function
 	typeName := eventType.String()
 	err := bus.Replay(ctx, lastPos+1, func(stored *StoredEvent) error {
+		// Apply upcasts if available
+		eventData, eventTypeName := stored.Data, stored.Type
+		if bus.upcastRegistry != nil {
+			upcastedData, upcastedType, err := bus.upcastRegistry.apply(eventData, eventTypeName)
+			if err == nil {
+				eventData = upcastedData
+				eventTypeName = upcastedType
+			}
+			// Continue even if upcast fails, let the type check handle it
+		}
+
 		// Only replay events of the correct type
-		if stored.Type != typeName {
+		if eventTypeName != typeName {
 			return nil
 		}
 
 		var event T
-		if err := json.Unmarshal(stored.Data, &event); err != nil {
+		if err := json.Unmarshal(eventData, &event); err != nil {
 			return err
 		}
 
