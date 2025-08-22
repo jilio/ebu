@@ -64,6 +64,9 @@ type EventBus struct {
 	storeMu                 sync.RWMutex
 	persistenceErrorHandler PersistenceErrorHandler
 	persistenceTimeout      time.Duration
+
+	// Upcast registry for event migration
+	upcastRegistry *upcastRegistry
 }
 
 // EventType returns the fully qualified type name of an event.
@@ -90,7 +93,9 @@ type Option func(*EventBus)
 
 // New creates a new EventBus with sharded locks for better performance
 func New(opts ...Option) *EventBus {
-	bus := &EventBus{}
+	bus := &EventBus{
+		upcastRegistry: newUpcastRegistry(),
+	}
 
 	// Initialize shards
 	for i := 0; i < numShards; i++ {
