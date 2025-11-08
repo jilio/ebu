@@ -69,15 +69,49 @@ type EventBus struct {
 	upcastRegistry *upcastRegistry
 }
 
-// EventType returns the fully qualified type name of an event.
-// This is useful for comparing with StoredEvent.Type during replay.
+// TypeNamer is an optional interface that events can implement to provide
+// their own type name. This gives explicit control over event type naming,
+// which is useful for:
+//   - Stable type names across package refactoring
+//   - Custom versioning schemes (e.g., "UserCreated.v2")
+//   - Compatibility with external event stores
+//
+// If an event implements TypeNamer, EventType() will use the provided name
+// instead of the reflection-based package-qualified name.
 //
 // Example:
+//
+//	type UserCreatedEvent struct {
+//	    UserID string
+//	}
+//
+//	func (e UserCreatedEvent) EventTypeName() string {
+//	    return "user.created.v1"
+//	}
+type TypeNamer interface {
+	EventTypeName() string
+}
+
+// EventType returns the type name of an event.
+// If the event implements TypeNamer, it returns the custom name.
+// Otherwise, it returns the reflection-based package-qualified name.
+//
+// This is useful for comparing with StoredEvent.Type during replay.
+//
+// Example with reflection (default):
 //
 //	eventType := EventType(MyEvent{})
 //	// Returns: "github.com/mypackage/MyEvent"
 //
-//	// Usage in replay:
+// Example with TypeNamer:
+//
+//	type MyEvent struct{}
+//	func (e MyEvent) EventTypeName() string { return "my-event.v1" }
+//	eventType := EventType(MyEvent{})
+//	// Returns: "my-event.v1"
+//
+// Usage in replay:
+//
 //	bus.Replay(ctx, 0, func(event *StoredEvent) error {
 //	    if event.Type == EventType(MyEvent{}) {
 //	        // Process MyEvent
@@ -85,6 +119,11 @@ type EventBus struct {
 //	    return nil
 //	})
 func EventType(event any) string {
+	// Check if event implements TypeNamer
+	if namer, ok := event.(TypeNamer); ok {
+		return namer.EventTypeName()
+	}
+	// Fall back to reflection-based name
 	return reflect.TypeOf(event).String()
 }
 

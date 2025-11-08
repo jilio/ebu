@@ -23,6 +23,33 @@ type OrderEvent struct {
 	Amount  float64
 }
 
+// CustomNamedEvent implements TypeNamer
+type CustomNamedEvent struct {
+	ID string
+}
+
+func (e CustomNamedEvent) EventTypeName() string {
+	return "custom.event.v1"
+}
+
+// VersionedEvent implements TypeNamer with versioning
+type VersionedEvent struct {
+	Data string
+}
+
+func (e VersionedEvent) EventTypeName() string {
+	return "versioned-event.v2"
+}
+
+// PointerNamedEvent implements TypeNamer on pointer receiver
+type PointerNamedEvent struct {
+	Value int
+}
+
+func (e *PointerNamedEvent) EventTypeName() string {
+	return "pointer.named.event"
+}
+
 func TestNewEventBus(t *testing.T) {
 	bus := New()
 	if bus == nil {
@@ -65,6 +92,26 @@ func TestEventType(t *testing.T) {
 			name:     "slice",
 			event:    []string{"a", "b"},
 			expected: "[]string",
+		},
+		{
+			name:     "custom named event with TypeNamer",
+			event:    CustomNamedEvent{ID: "abc"},
+			expected: "custom.event.v1",
+		},
+		{
+			name:     "versioned event with TypeNamer",
+			event:    VersionedEvent{Data: "test"},
+			expected: "versioned-event.v2",
+		},
+		{
+			name:     "pointer to custom named event",
+			event:    &CustomNamedEvent{ID: "def"},
+			expected: "custom.event.v1",
+		},
+		{
+			name:     "pointer named event (TypeNamer on pointer receiver)",
+			event:    &PointerNamedEvent{Value: 42},
+			expected: "pointer.named.event",
 		},
 	}
 
@@ -2958,4 +3005,164 @@ func TestContextAnyHandlers(t *testing.T) {
 			t.Errorf("Event was not passed correctly: got %v", receivedEvent)
 		}
 	})
+}
+
+// TestTypeNamerWithPublish verifies that TypeNamer works correctly with event publishing
+func TestTypeNamerWithPublish(t *testing.T) {
+	bus := New()
+	var received []string
+
+	// Subscribe to CustomNamedEvent
+	err := Subscribe(bus, func(event CustomNamedEvent) {
+		received = append(received, event.ID)
+	})
+	if err != nil {
+		t.Fatalf("Subscribe failed: %v", err)
+	}
+
+	// Publish event
+	Publish(bus, CustomNamedEvent{ID: "test1"})
+
+	// Verify
+	if len(received) != 1 || received[0] != "test1" {
+		t.Errorf("Expected to receive event with ID 'test1', got %v", received)
+	}
+}
+
+// TestTypeNamerWithPersistence verifies that TypeNamer is used for event type in persistence
+func TestTypeNamerWithPersistence(t *testing.T) {
+	store := NewMemoryStore()
+	bus := New(WithStore(store))
+
+	// Publish events with TypeNamer
+	Publish(bus, CustomNamedEvent{ID: "event1"})
+	Publish(bus, VersionedEvent{Data: "event2"})
+	Publish(bus, UserEvent{UserID: "event3"}) // Regular event without TypeNamer
+
+	bus.Wait()
+
+	// Load events from store
+	ctx := context.Background()
+	events, err := store.Load(ctx, 0, -1)
+	if err != nil {
+		t.Fatalf("Failed to load events: %v", err)
+	}
+
+	// Verify event types
+	if len(events) != 3 {
+		t.Fatalf("Expected 3 events, got %d", len(events))
+	}
+
+	// CustomNamedEvent should use TypeNamer
+	if events[0].Type != "custom.event.v1" {
+		t.Errorf("Expected type 'custom.event.v1', got '%s'", events[0].Type)
+	}
+
+	// VersionedEvent should use TypeNamer
+	if events[1].Type != "versioned-event.v2" {
+		t.Errorf("Expected type 'versioned-event.v2', got '%s'", events[1].Type)
+	}
+
+	// UserEvent should use reflection-based type
+	if events[2].Type != "eventbus.UserEvent" {
+		t.Errorf("Expected type 'eventbus.UserEvent', got '%s'", events[2].Type)
+	}
+}
+
+// TestTypeNamerWithReplay verifies that events can be filtered by custom type name during replay
+func TestTypeNamerWithReplay(t *testing.T) {
+	store := NewMemoryStore()
+	bus := New(WithStore(store))
+
+	// Publish mixed events
+	Publish(bus, CustomNamedEvent{ID: "custom1"})
+	Publish(bus, UserEvent{UserID: "user1"})
+	Publish(bus, CustomNamedEvent{ID: "custom2"})
+	Publish(bus, VersionedEvent{Data: "versioned1"})
+
+	bus.Wait()
+
+	// Replay and count events by type
+	ctx := context.Background()
+	customCount := 0
+	versionedCount := 0
+	userCount := 0
+
+	err := bus.Replay(ctx, 0, func(event *StoredEvent) error {
+		switch event.Type {
+		case EventType(CustomNamedEvent{}):
+			customCount++
+		case EventType(VersionedEvent{}):
+			versionedCount++
+		case EventType(UserEvent{}):
+			userCount++
+		}
+		return nil
+	})
+
+	if err != nil {
+		t.Fatalf("Replay failed: %v", err)
+	}
+
+	// Verify counts
+	if customCount != 2 {
+		t.Errorf("Expected 2 CustomNamedEvent, got %d", customCount)
+	}
+	if versionedCount != 1 {
+		t.Errorf("Expected 1 VersionedEvent, got %d", versionedCount)
+	}
+	if userCount != 1 {
+		t.Errorf("Expected 1 UserEvent, got %d", userCount)
+	}
+}
+
+// TestTypeNamerStability verifies that TypeNamer provides stable type names
+func TestTypeNamerStability(t *testing.T) {
+	// Create multiple instances and verify they all return the same type name
+	event1 := CustomNamedEvent{ID: "1"}
+	event2 := CustomNamedEvent{ID: "2"}
+	event3 := &CustomNamedEvent{ID: "3"}
+
+	type1 := EventType(event1)
+	type2 := EventType(event2)
+	type3 := EventType(event3)
+
+	// All should return the same custom name
+	if type1 != type2 || type1 != type3 {
+		t.Errorf("TypeNamer should return stable names: got %s, %s, %s", type1, type2, type3)
+	}
+
+	if type1 != "custom.event.v1" {
+		t.Errorf("Expected 'custom.event.v1', got '%s'", type1)
+	}
+}
+
+// TestTypeNamerWithHooks verifies that TypeNamer works correctly with publish hooks
+func TestTypeNamerWithHooks(t *testing.T) {
+	var capturedTypes []string
+	var capturedEvents []any
+
+	bus := New(
+		WithBeforePublish(func(eventType reflect.Type, event any) {
+			capturedTypes = append(capturedTypes, EventType(event))
+			capturedEvents = append(capturedEvents, event)
+		}),
+	)
+
+	// Publish events
+	Publish(bus, CustomNamedEvent{ID: "test1"})
+	Publish(bus, VersionedEvent{Data: "test2"})
+	Publish(bus, UserEvent{UserID: "test3"})
+
+	// Verify captured types use TypeNamer where available
+	expected := []string{"custom.event.v1", "versioned-event.v2", "eventbus.UserEvent"}
+	if len(capturedTypes) != len(expected) {
+		t.Fatalf("Expected %d types, got %d", len(expected), len(capturedTypes))
+	}
+
+	for i, exp := range expected {
+		if capturedTypes[i] != exp {
+			t.Errorf("Type %d: expected '%s', got '%s'", i, exp, capturedTypes[i])
+		}
+	}
 }

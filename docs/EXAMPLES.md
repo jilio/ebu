@@ -462,6 +462,148 @@ bus.Replay(ctx, 0, func(event *eventbus.StoredEvent) error {
 })
 ```
 
+## Custom Event Type Names (TypeNamer)
+
+The `TypeNamer` interface provides explicit control over event type naming, which is useful for:
+- Stable type names across package refactoring
+- Custom versioning schemes
+- Compatibility with external event stores
+
+### Basic TypeNamer Usage
+
+```go
+import eventbus "github.com/jilio/ebu"
+
+// Define an event that implements TypeNamer
+type UserCreatedEvent struct {
+    UserID   string
+    Username string
+    Email    string
+}
+
+// Implement the TypeNamer interface
+func (e UserCreatedEvent) EventTypeName() string {
+    return "user.created.v1"
+}
+
+func main() {
+    bus := eventbus.New()
+
+    // The event type will use the custom name
+    typeName := eventbus.EventType(UserCreatedEvent{})
+    // Returns: "user.created.v1" (not "main.UserCreatedEvent")
+
+    // Works seamlessly with publishing and persistence
+    eventbus.Publish(bus, UserCreatedEvent{
+        UserID:   "123",
+        Username: "john_doe",
+        Email:    "john@example.com",
+    })
+}
+```
+
+### Versioned Events
+
+Use TypeNamer to implement event versioning:
+
+```go
+// Version 1 of the event
+type UserCreatedV1 struct {
+    UserID string
+    Name   string // Full name in one field
+}
+
+func (e UserCreatedV1) EventTypeName() string {
+    return "user.created.v1"
+}
+
+// Version 2 with split name fields
+type UserCreatedV2 struct {
+    UserID    string
+    FirstName string
+    LastName  string
+}
+
+func (e UserCreatedV2) EventTypeName() string {
+    return "user.created.v2"
+}
+
+func main() {
+    store := eventbus.NewMemoryStore()
+    bus := eventbus.New(eventbus.WithStore(store))
+
+    // Both versions can coexist
+    eventbus.Publish(bus, UserCreatedV1{UserID: "1", Name: "John Doe"})
+    eventbus.Publish(bus, UserCreatedV2{
+        UserID:    "2",
+        FirstName: "Jane",
+        LastName:  "Smith",
+    })
+
+    bus.Wait()
+
+    // Replay and handle different versions
+    bus.Replay(ctx, 0, func(event *eventbus.StoredEvent) error {
+        switch event.Type {
+        case "user.created.v1":
+            var v1 UserCreatedV1
+            json.Unmarshal(event.Data, &v1)
+            // Handle V1 format
+        case "user.created.v2":
+            var v2 UserCreatedV2
+            json.Unmarshal(event.Data, &v2)
+            // Handle V2 format
+        }
+        return nil
+    })
+}
+```
+
+### Stable Names Across Refactoring
+
+TypeNamer prevents breaking changes when you reorganize code:
+
+```go
+// Before refactoring: package.OrderCreated
+// After refactoring: newpackage.OrderCreatedEvent
+// Without TypeNamer: Type name changes, breaks replays!
+
+// With TypeNamer: Type name stays stable
+type OrderCreatedEvent struct {
+    OrderID string
+    Amount  float64
+}
+
+func (e OrderCreatedEvent) EventTypeName() string {
+    // This name remains stable regardless of package/type renaming
+    return "order.created"
+}
+```
+
+### External System Compatibility
+
+Use TypeNamer to match external event naming conventions:
+
+```go
+// Events from Kafka or other systems with specific naming
+type PaymentProcessedEvent struct {
+    PaymentID string
+    Status    string
+}
+
+// Match the external system's event type format
+func (e PaymentProcessedEvent) EventTypeName() string {
+    return "com.example.payment.ProcessedEvent"
+}
+```
+
+### Best Practices
+
+1. **Use semantic versioning** in type names (e.g., "user.created.v1")
+2. **Keep names immutable** once events are persisted
+3. **Document type name changes** in migration guides
+4. **Use dot notation** for hierarchical namespacing (e.g., "domain.entity.action.version")
+
 ## Best Practices Summary
 
 1. **Define clear event types** - Use structs with descriptive names
