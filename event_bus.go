@@ -392,9 +392,10 @@ func callHandlerWithContext[T any](h *internalHandler, ctx context.Context, even
 
 		if h.handlerType.Kind() == reflect.Func {
 			numIn := h.handlerType.NumIn()
-			if numIn == 1 {
+			switch numIn {
+			case 1:
 				handlerValue.Call([]reflect.Value{eventValue})
-			} else if numIn == 2 {
+			case 2:
 				handlerValue.Call([]reflect.Value{reflect.ValueOf(ctx), eventValue})
 			}
 		}
@@ -471,7 +472,6 @@ func WithPersistenceTimeout(timeout time.Duration) Option {
 // startEventProcessor starts processing persisted events
 func (bus *EventBus) startEventProcessor() {
 	// This will be implemented when needed for event replay
-	return
 }
 
 // Backward compatibility methods
