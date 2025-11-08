@@ -3,8 +3,10 @@ package eventbus
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -812,4 +814,277 @@ func (s *slowStore) SaveSubscriptionPosition(ctx context.Context, subscriptionID
 
 func (s *slowStore) LoadSubscriptionPosition(ctx context.Context, subscriptionID string) (int64, error) {
 	return 0, nil
+}
+
+// TestConcurrentPersistPositionRace tests for race condition in position assignment
+func TestConcurrentPersistPositionRace(t *testing.T) {
+	store := NewMemoryStore()
+	bus := New(WithStore(store))
+
+	const numGoroutines = 100
+	const eventsPerGoroutine = 10
+	totalEvents := numGoroutines * eventsPerGoroutine
+
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines)
+
+	// Publish events concurrently from multiple goroutines
+	for g := 0; g < numGoroutines; g++ {
+		go func(goroutineID int) {
+			defer wg.Done()
+			for i := 0; i < eventsPerGoroutine; i++ {
+				Publish(bus, TestEvent{
+					ID:    goroutineID*eventsPerGoroutine + i,
+					Value: fmt.Sprintf("goroutine-%d-event-%d", goroutineID, i),
+				})
+			}
+		}(g)
+	}
+
+	wg.Wait()
+
+	// Verify all events were persisted
+	ctx := context.Background()
+	events, err := store.Load(ctx, 0, int64(totalEvents))
+	if err != nil {
+		t.Fatalf("Failed to load events: %v", err)
+	}
+
+	if len(events) != totalEvents {
+		t.Errorf("Expected %d events, got %d", totalEvents, len(events))
+	}
+
+	// Check for duplicate positions (the race condition symptom)
+	positions := make(map[int64]bool)
+	duplicates := []int64{}
+
+	for _, event := range events {
+		if positions[event.Position] {
+			duplicates = append(duplicates, event.Position)
+		}
+		positions[event.Position] = true
+	}
+
+	if len(duplicates) > 0 {
+		t.Errorf("Found duplicate positions (race condition): %v", duplicates)
+	}
+
+	// Check that positions are sequential from 1 to totalEvents
+	for i := int64(1); i <= int64(totalEvents); i++ {
+		if !positions[i] {
+			t.Errorf("Missing position %d in sequence", i)
+		}
+	}
+
+	// Verify final position matches expected
+	finalPos, _ := store.GetPosition(ctx)
+	if finalPos != int64(totalEvents) {
+		t.Errorf("Expected final position %d, got %d", totalEvents, finalPos)
+	}
+}
+
+// slowSaveStore introduces delays to expose race conditions
+type slowSaveStore struct {
+	MemoryStore
+	saveDelay time.Duration
+}
+
+func (s *slowSaveStore) Save(ctx context.Context, event *StoredEvent) error {
+	// Add delay between reading position and saving
+	time.Sleep(s.saveDelay)
+	return s.MemoryStore.Save(ctx, event)
+}
+
+// TestConcurrentPersistPositionRaceWithDelay uses a slow store to expose the race
+func TestConcurrentPersistPositionRaceWithDelay(t *testing.T) {
+	slowStore := &slowSaveStore{
+		MemoryStore: MemoryStore{
+			events:        make([]*StoredEvent, 0),
+			subscriptions: make(map[string]int64),
+		},
+		saveDelay: 1 * time.Millisecond, // Small delay to widen race window
+	}
+
+	bus := New(WithStore(slowStore))
+
+	const numGoroutines = 50
+	totalEvents := numGoroutines
+
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines)
+
+	// Publish one event from each goroutine simultaneously
+	startChan := make(chan struct{})
+	for g := 0; g < numGoroutines; g++ {
+		go func(goroutineID int) {
+			defer wg.Done()
+			<-startChan // Wait for signal to start all at once
+			Publish(bus, TestEvent{
+				ID:    goroutineID,
+				Value: fmt.Sprintf("event-%d", goroutineID),
+			})
+		}(g)
+	}
+
+	// Release all goroutines at once to maximize contention
+	close(startChan)
+	wg.Wait()
+
+	// Verify all events were persisted
+	ctx := context.Background()
+	events, err := slowStore.Load(ctx, 0, int64(totalEvents))
+	if err != nil {
+		t.Fatalf("Failed to load events: %v", err)
+	}
+
+	if len(events) != totalEvents {
+		t.Errorf("Expected %d events, got %d", totalEvents, len(events))
+	}
+
+	// Check for duplicate positions (the race condition symptom)
+	positions := make(map[int64]bool)
+	duplicates := []int64{}
+
+	for _, event := range events {
+		if positions[event.Position] {
+			duplicates = append(duplicates, event.Position)
+			t.Logf("Duplicate position found: %d", event.Position)
+		}
+		positions[event.Position] = true
+	}
+
+	if len(duplicates) > 0 {
+		t.Errorf("RACE DETECTED: Found %d duplicate positions: %v", len(duplicates), duplicates)
+	}
+
+	// Check that positions are sequential from 1 to totalEvents
+	missing := []int64{}
+	for i := int64(1); i <= int64(totalEvents); i++ {
+		if !positions[i] {
+			missing = append(missing, i)
+		}
+	}
+
+	if len(missing) > 0 {
+		t.Errorf("Missing positions in sequence: %v", missing)
+	}
+
+	// Verify final position matches expected
+	finalPos, _ := slowStore.GetPosition(ctx)
+	if finalPos != int64(totalEvents) {
+		t.Errorf("Expected final position %d, got %d", totalEvents, finalPos)
+	}
+}
+
+// realisticStore mimics a real database that respects the position from the event
+type realisticStore struct {
+	mu            sync.Mutex
+	events        []*StoredEvent
+	subscriptions map[string]int64
+}
+
+func (r *realisticStore) Save(ctx context.Context, event *StoredEvent) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// A real database would use the position from the event, not overwrite it
+	// This is the key difference from MemoryStore
+	r.events = append(r.events, event)
+	return nil
+}
+
+func (r *realisticStore) Load(ctx context.Context, from, to int64) ([]*StoredEvent, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var result []*StoredEvent
+	for _, event := range r.events {
+		if event.Position >= from && (to == -1 || event.Position <= to) {
+			result = append(result, event)
+		}
+	}
+	return result, nil
+}
+
+func (r *realisticStore) GetPosition(ctx context.Context) (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if len(r.events) == 0 {
+		return 0, nil
+	}
+	return r.events[len(r.events)-1].Position, nil
+}
+
+func (r *realisticStore) SaveSubscriptionPosition(ctx context.Context, subscriptionID string, position int64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.subscriptions[subscriptionID] = position
+	return nil
+}
+
+func (r *realisticStore) LoadSubscriptionPosition(ctx context.Context, subscriptionID string) (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	pos, _ := r.subscriptions[subscriptionID]
+	return pos, nil
+}
+
+// TestPositionRaceWithRealisticStore exposes the actual race condition
+func TestPositionRaceWithRealisticStore(t *testing.T) {
+	store := &realisticStore{
+		events:        make([]*StoredEvent, 0),
+		subscriptions: make(map[string]int64),
+	}
+
+	bus := New(WithStore(store))
+
+	const numGoroutines = 100
+	totalEvents := numGoroutines
+
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines)
+
+	// Publish one event from each goroutine simultaneously
+	startChan := make(chan struct{})
+	for g := 0; g < numGoroutines; g++ {
+		go func(goroutineID int) {
+			defer wg.Done()
+			<-startChan
+			Publish(bus, TestEvent{
+				ID:    goroutineID,
+				Value: fmt.Sprintf("event-%d", goroutineID),
+			})
+		}(g)
+	}
+
+	// Release all at once
+	close(startChan)
+	wg.Wait()
+
+	// Check for the race condition
+	ctx := context.Background()
+	events, _ := store.Load(ctx, 0, 1000)
+
+	if len(events) != totalEvents {
+		t.Errorf("Expected %d events, got %d", totalEvents, len(events))
+	}
+
+	// Check for duplicate positions - THIS SHOULD FAIL
+	positions := make(map[int64]int) // position -> count
+	for _, event := range events {
+		positions[event.Position]++
+	}
+
+	duplicates := []int64{}
+	for pos, count := range positions {
+		if count > 1 {
+			duplicates = append(duplicates, pos)
+			t.Logf("Position %d appears %d times", pos, count)
+		}
+	}
+
+	if len(duplicates) > 0 {
+		t.Errorf("RACE CONDITION DETECTED: %d positions have duplicates: %v", len(duplicates), duplicates)
+	}
 }

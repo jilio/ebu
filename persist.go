@@ -74,10 +74,9 @@ func (bus *EventBus) persistEvent(eventType reflect.Type, event any) {
 		return
 	}
 
-	// Only increment position after successful marshaling
+	// Lock for the entire position assignment and save operation to prevent race
 	bus.storeMu.Lock()
 	position := bus.storePosition + 1
-	bus.storeMu.Unlock()
 
 	// Use consistent type naming with EventType() function
 	typeName := eventType.String()
@@ -99,6 +98,7 @@ func (bus *EventBus) persistEvent(eventType reflect.Type, event any) {
 
 	// Try to save the event
 	if err := bus.store.Save(ctx, stored); err != nil {
+		bus.storeMu.Unlock() // Unlock before calling error handler
 		if bus.persistenceErrorHandler != nil {
 			bus.persistenceErrorHandler(event, eventType, fmt.Errorf("failed to save event: %w", err))
 		}
@@ -106,7 +106,6 @@ func (bus *EventBus) persistEvent(eventType reflect.Type, event any) {
 	}
 
 	// Only increment position after successful save
-	bus.storeMu.Lock()
 	bus.storePosition = position
 	bus.storeMu.Unlock()
 }
