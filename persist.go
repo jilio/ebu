@@ -78,8 +78,8 @@ func (bus *EventBus) persistEvent(eventType reflect.Type, event any) {
 	bus.storeMu.Lock()
 	position := bus.storePosition + 1
 
-	// Use consistent type naming with EventType() function
-	typeName := eventType.String()
+	// Use EventType() to respect TypeNamer interface if implemented
+	typeName := EventType(event)
 
 	stored := &StoredEvent{
 		Position:  position,

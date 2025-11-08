@@ -256,6 +256,31 @@ bus.SetAfterPublishHook(func(eventType reflect.Type, event any) {
 })
 ```
 
+### Custom Event Type Names
+
+Control event type naming explicitly with the `TypeNamer` interface for stable names across refactoring:
+
+```go
+type UserCreatedEvent struct {
+    UserID string
+}
+
+// Implement TypeNamer for explicit type control
+func (e UserCreatedEvent) EventTypeName() string {
+    return "user.created.v1"
+}
+
+// Now EventType() returns "user.created.v1" instead of package-qualified name
+eventbus.Publish(bus, UserCreatedEvent{UserID: "123"})
+```
+
+Benefits:
+- **Stable event names** across package reorganization
+- **Version control** for event schema evolution
+- **External compatibility** with other event systems
+
+See [TypeNamer examples](docs/EXAMPLES.md#custom-event-type-names-typenamer) for versioning and migration patterns.
+
 ## Documentation
 
 - 📖 [**Complete Examples**](docs/EXAMPLES.md) - Comprehensive usage examples
