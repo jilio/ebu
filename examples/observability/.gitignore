@@ -1,0 +1,27 @@
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+
+# Docker volumes
+prometheus-data/
+grafana-data/
+
+# Generator binary
+generator/load-generator
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

@@ -2449,7 +2449,7 @@ func TestDirectHandlerCalls(t *testing.T) {
 			handlerType: reflect.TypeOf(handler),
 		}
 
-		callHandlerWithContext(h, context.Background(), "test", nil)
+		callHandlerWithContext(h, context.Background(), "test", nil, nil, "", false)
 
 		if !called {
 			t.Error("handler was not called")
@@ -2474,7 +2474,7 @@ func TestDirectHandlerCalls(t *testing.T) {
 			handlerType: reflect.TypeOf(handler),
 		}
 
-		callHandlerWithContext(h, context.Background(), "test", nil)
+		callHandlerWithContext(h, context.Background(), "test", nil, nil, "", false)
 
 		if !called {
 			t.Error("handler was not called")
@@ -2496,7 +2496,7 @@ func TestDirectHandlerCalls(t *testing.T) {
 			handlerType: reflect.TypeOf(handler),
 		}
 
-		callHandlerWithContext(h, context.Background(), "test", nil)
+		callHandlerWithContext(h, context.Background(), "test", nil, nil, "", false)
 
 		if !called {
 			t.Error("handler was not called")
@@ -2521,7 +2521,7 @@ func TestDirectHandlerCalls(t *testing.T) {
 			handlerType: reflect.TypeOf(handler),
 		}
 
-		callHandlerWithContext(h, context.Background(), "test", nil)
+		callHandlerWithContext(h, context.Background(), "test", nil, nil, "", false)
 
 		if !called {
 			t.Error("handler was not called")
@@ -2547,7 +2547,7 @@ func TestDirectHandlerCalls(t *testing.T) {
 			handlerType: reflect.TypeOf(handler),
 		}
 
-		callHandlerWithContext(h, context.Background(), "test", nil)
+		callHandlerWithContext(h, context.Background(), "test", nil, nil, "", false)
 
 		if !called {
 			t.Error("handler was not called")
@@ -2569,7 +2569,7 @@ func TestDirectHandlerCalls(t *testing.T) {
 			handlerType: reflect.TypeOf(handler),
 		}
 
-		callHandlerWithContext(h, context.Background(), "test", nil)
+		callHandlerWithContext(h, context.Background(), "test", nil, nil, "", false)
 
 		if !called {
 			t.Error("handler was not called")
@@ -2594,7 +2594,7 @@ func TestDirectHandlerCalls(t *testing.T) {
 			handlerType: reflect.TypeOf(handler),
 		}
 
-		callHandlerWithContext(h, context.Background(), "test", nil)
+		callHandlerWithContext(h, context.Background(), "test", nil, nil, "", false)
 
 		if !called {
 			t.Error("handler was not called")
@@ -2623,7 +2623,7 @@ func TestReflectionHandlers(t *testing.T) {
 			handlerType: reflect.TypeOf(rawHandler),
 		}
 
-		callHandlerWithContext(h, context.Background(), CustomStruct{Value: "test"}, nil)
+		callHandlerWithContext(h, context.Background(), CustomStruct{Value: "test"}, nil, nil, "", false)
 
 		if !called {
 			t.Error("handler was not called")
@@ -2653,7 +2653,7 @@ func TestReflectionHandlers(t *testing.T) {
 		}
 
 		// Call with interface{} type parameter to bypass type assertions
-		callHandlerWithContext[interface{}](h, context.Background(), MyContextEvent{Message: "hello"}, nil)
+		callHandlerWithContext[interface{}](h, context.Background(), MyContextEvent{Message: "hello"}, nil, nil, "", false)
 
 		if !called {
 			t.Error("handler was not called")
@@ -2668,7 +2668,7 @@ func TestReflectionHandlers(t *testing.T) {
 		}
 
 		// Should not panic
-		callHandlerWithContext(h, context.Background(), "event", nil)
+		callHandlerWithContext(h, context.Background(), "event", nil, nil, "", false)
 	})
 
 	t.Run("zero_parameter_handler", func(t *testing.T) {
@@ -2683,7 +2683,7 @@ func TestReflectionHandlers(t *testing.T) {
 			handlerType: reflect.TypeOf(rawHandler),
 		}
 
-		callHandlerWithContext(h, context.Background(), "event", nil)
+		callHandlerWithContext(h, context.Background(), "event", nil, nil, "", false)
 
 		// Should not be called since it has 0 parameters
 		if called {
@@ -2703,7 +2703,7 @@ func TestReflectionHandlers(t *testing.T) {
 			handlerType: reflect.TypeOf(rawHandler),
 		}
 
-		callHandlerWithContext(h, context.Background(), "event", nil)
+		callHandlerWithContext(h, context.Background(), "event", nil, nil, "", false)
 
 		// Should not be called since it has 3 parameters
 		if called {
@@ -2734,7 +2734,7 @@ func TestReflectionHandlers(t *testing.T) {
 			wg.Add(1)
 			go func(id int) {
 				defer wg.Done()
-				callHandlerWithContext(h, context.Background(), SeqEvent{ID: id}, nil)
+				callHandlerWithContext(h, context.Background(), SeqEvent{ID: id}, nil, nil, "", false)
 			}(i)
 		}
 		wg.Wait()
@@ -2826,7 +2826,7 @@ func TestEdgeCases(t *testing.T) {
 					handlerType: reflect.TypeOf(tc.handler),
 				}
 
-				callHandlerWithContext(h, context.Background(), tc.event, nil)
+				callHandlerWithContext(h, context.Background(), tc.event, nil, nil, "", false)
 			})
 		}
 	})
@@ -2840,7 +2840,7 @@ func TestReflectionNumInBranches(t *testing.T) {
 			handler:     func() { called.Store(true) },
 			handlerType: reflect.TypeOf(func() {}),
 		}
-		callHandlerWithContext(h, context.Background(), "event", nil)
+		callHandlerWithContext(h, context.Background(), "event", nil, nil, "", false)
 		if called.Load() {
 			t.Error("handler with 0 parameters should not be called")
 		}
@@ -2854,7 +2854,7 @@ func TestReflectionNumInBranches(t *testing.T) {
 			handler:     interface{}(func(c CustomType) { called.Store(true) }),
 			handlerType: reflect.TypeOf(func(c CustomType) {}),
 		}
-		callHandlerWithContext(h, context.Background(), CustomType{Value: "test"}, nil)
+		callHandlerWithContext(h, context.Background(), CustomType{Value: "test"}, nil, nil, "", false)
 		if !called.Load() {
 			t.Error("handler with 1 parameter should be called")
 		}
@@ -2871,7 +2871,7 @@ func TestReflectionNumInBranches(t *testing.T) {
 			}),
 			handlerType: reflect.TypeOf(func(context.Context, string) {}),
 		}
-		callHandlerWithContext[interface{}](h, context.Background(), "test", nil)
+		callHandlerWithContext[interface{}](h, context.Background(), "test", nil, nil, "", false)
 		if !called.Load() {
 			t.Error("handler with 2 parameters should be called")
 		}
@@ -2883,7 +2883,7 @@ func TestReflectionNumInBranches(t *testing.T) {
 			handler:     interface{}(func(ctx context.Context, s string, extra int) { called.Store(true) }),
 			handlerType: reflect.TypeOf(func(context.Context, string, int) {}),
 		}
-		callHandlerWithContext(h, context.Background(), "test", nil)
+		callHandlerWithContext(h, context.Background(), "test", nil, nil, "", false)
 		if called.Load() {
 			t.Error("handler with 3 parameters should not be called")
 		}
@@ -2916,7 +2916,7 @@ func TestContextAnyHandlers(t *testing.T) {
 		ctx := context.WithValue(context.Background(), "key", "value")
 
 		// Call the handler
-		callHandlerWithContext(h, ctx, testEvent, nil)
+		callHandlerWithContext(h, ctx, testEvent, nil, nil, "", false)
 
 		// Verify
 		if !called {
@@ -2955,7 +2955,7 @@ func TestContextAnyHandlers(t *testing.T) {
 		ctx := context.WithValue(context.Background(), "test", "data")
 
 		// Call the handler
-		callHandlerWithContext(h, ctx, testEvent, nil)
+		callHandlerWithContext(h, ctx, testEvent, nil, nil, "", false)
 
 		// Verify
 		if !called {
@@ -2995,7 +2995,7 @@ func TestContextAnyHandlers(t *testing.T) {
 		testEvent := TestEvent{Message: "hello"}
 
 		// Call the handler
-		callHandlerWithContext(h, context.Background(), testEvent, nil)
+		callHandlerWithContext(h, context.Background(), testEvent, nil, nil, "", false)
 
 		// Verify
 		if !called {
@@ -3164,5 +3164,139 @@ func TestTypeNamerWithHooks(t *testing.T) {
 		if capturedTypes[i] != exp {
 			t.Errorf("Type %d: expected '%s', got '%s'", i, exp, capturedTypes[i])
 		}
+	}
+}
+
+// TestWithObservability tests the WithObservability option
+func TestWithObservability(t *testing.T) {
+	// Mock observability implementation
+	type mockObservability struct {
+		publishStartCalled    bool
+		publishCompleteCalled bool
+		handlerStartCalled    bool
+		handlerCompleteCalled bool
+		persistStartCalled    bool
+		persistCompleteCalled bool
+	}
+
+	mock := &mockObservability{}
+
+	// Create custom observability implementation
+	obs := &testObservability{
+		onPublishStart: func(ctx context.Context, eventType string) context.Context {
+			mock.publishStartCalled = true
+			return ctx
+		},
+		onPublishComplete: func(ctx context.Context, eventType string) {
+			mock.publishCompleteCalled = true
+		},
+		onHandlerStart: func(ctx context.Context, eventType string, async bool) context.Context {
+			mock.handlerStartCalled = true
+			return ctx
+		},
+		onHandlerComplete: func(ctx context.Context, duration time.Duration, err error) {
+			mock.handlerCompleteCalled = true
+		},
+		onPersistStart: func(ctx context.Context, eventType string, position int64) context.Context {
+			mock.persistStartCalled = true
+			return ctx
+		},
+		onPersistComplete: func(ctx context.Context, duration time.Duration, err error) {
+			mock.persistCompleteCalled = true
+		},
+	}
+
+	// Create bus with observability
+	bus := New(WithObservability(obs))
+
+	type TestEvent struct {
+		Message string
+	}
+
+	// Subscribe to event
+	Subscribe(bus, func(e TestEvent) {
+		// Handler body
+	})
+
+	// Publish event
+	Publish(bus, TestEvent{Message: "test"})
+
+	// Verify observability hooks were called
+	if !mock.publishStartCalled {
+		t.Error("OnPublishStart was not called")
+	}
+	if !mock.publishCompleteCalled {
+		t.Error("OnPublishComplete was not called")
+	}
+	if !mock.handlerStartCalled {
+		t.Error("OnHandlerStart was not called")
+	}
+	if !mock.handlerCompleteCalled {
+		t.Error("OnHandlerComplete was not called")
+	}
+
+	// Test with persistence
+	store := NewMemoryStore()
+	bus2 := New(WithStore(store), WithObservability(obs))
+
+	mock.persistStartCalled = false
+	mock.persistCompleteCalled = false
+
+	Publish(bus2, TestEvent{Message: "test"})
+
+	if !mock.persistStartCalled {
+		t.Error("OnPersistStart was not called")
+	}
+	if !mock.persistCompleteCalled {
+		t.Error("OnPersistComplete was not called")
+	}
+}
+
+// testObservability is a test implementation of Observability
+type testObservability struct {
+	onPublishStart    func(ctx context.Context, eventType string) context.Context
+	onPublishComplete func(ctx context.Context, eventType string)
+	onHandlerStart    func(ctx context.Context, eventType string, async bool) context.Context
+	onHandlerComplete func(ctx context.Context, duration time.Duration, err error)
+	onPersistStart    func(ctx context.Context, eventType string, position int64) context.Context
+	onPersistComplete func(ctx context.Context, duration time.Duration, err error)
+}
+
+func (t *testObservability) OnPublishStart(ctx context.Context, eventType string) context.Context {
+	if t.onPublishStart != nil {
+		return t.onPublishStart(ctx, eventType)
+	}
+	return ctx
+}
+
+func (t *testObservability) OnPublishComplete(ctx context.Context, eventType string) {
+	if t.onPublishComplete != nil {
+		t.onPublishComplete(ctx, eventType)
+	}
+}
+
+func (t *testObservability) OnHandlerStart(ctx context.Context, eventType string, async bool) context.Context {
+	if t.onHandlerStart != nil {
+		return t.onHandlerStart(ctx, eventType, async)
+	}
+	return ctx
+}
+
+func (t *testObservability) OnHandlerComplete(ctx context.Context, duration time.Duration, err error) {
+	if t.onHandlerComplete != nil {
+		t.onHandlerComplete(ctx, duration, err)
+	}
+}
+
+func (t *testObservability) OnPersistStart(ctx context.Context, eventType string, position int64) context.Context {
+	if t.onPersistStart != nil {
+		return t.onPersistStart(ctx, eventType, position)
+	}
+	return ctx
+}
+
+func (t *testObservability) OnPersistComplete(ctx context.Context, duration time.Duration, err error) {
+	if t.onPersistComplete != nil {
+		t.onPersistComplete(ctx, duration, err)
 	}
 }

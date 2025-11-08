@@ -96,11 +96,26 @@ func (bus *EventBus) persistEvent(eventType reflect.Type, event any) {
 		defer cancel()
 	}
 
+	// Observability: Track persistence start
+	if bus.observability != nil {
+		ctx = bus.observability.OnPersistStart(ctx, typeName, position)
+	}
+
+	start := time.Now()
+	var saveErr error
+
 	// Try to save the event
-	if err := bus.store.Save(ctx, stored); err != nil {
+	saveErr = bus.store.Save(ctx, stored)
+
+	// Observability: Track persistence complete
+	if bus.observability != nil {
+		bus.observability.OnPersistComplete(ctx, time.Since(start), saveErr)
+	}
+
+	if saveErr != nil {
 		bus.storeMu.Unlock() // Unlock before calling error handler
 		if bus.persistenceErrorHandler != nil {
-			bus.persistenceErrorHandler(event, eventType, fmt.Errorf("failed to save event: %w", err))
+			bus.persistenceErrorHandler(event, eventType, fmt.Errorf("failed to save event: %w", saveErr))
 		}
 		return
 	}

@@ -67,6 +67,9 @@ type EventBus struct {
 
 	// Upcast registry for event migration
 	upcastRegistry *upcastRegistry
+
+	// Optional observability (metrics & tracing)
+	observability Observability
 }
 
 // TypeNamer is an optional interface that events can implement to provide
@@ -125,6 +128,41 @@ func EventType(event any) string {
 	}
 	// Fall back to reflection-based name
 	return reflect.TypeOf(event).String()
+}
+
+// Observability is an optional interface for metrics and tracing.
+// Implementations can track event publishing, handler execution, and errors.
+//
+// This interface is designed to be zero-cost when not used - if no
+// observability is configured, there is no performance overhead.
+//
+// The context returned from each method can be used to propagate trace
+// spans and other context-specific data through the event processing pipeline.
+//
+// Example implementation: see github.com/jilio/ebu/otel package for
+// OpenTelemetry integration.
+type Observability interface {
+	// OnPublishStart is called when an event is about to be published.
+	// Returns a context that will be passed to handlers and subsequent hooks.
+	OnPublishStart(ctx context.Context, eventType string) context.Context
+
+	// OnPublishComplete is called after all synchronous handlers complete.
+	// Note: This is called before async handlers complete.
+	OnPublishComplete(ctx context.Context, eventType string)
+
+	// OnHandlerStart is called before a handler executes.
+	// Returns a context for the handler execution.
+	OnHandlerStart(ctx context.Context, eventType string, async bool) context.Context
+
+	// OnHandlerComplete is called after a handler completes.
+	// The error parameter is non-nil if the handler panicked.
+	OnHandlerComplete(ctx context.Context, duration time.Duration, err error)
+
+	// OnPersistStart is called before persisting an event.
+	OnPersistStart(ctx context.Context, eventType string, position int64) context.Context
+
+	// OnPersistComplete is called after persisting an event.
+	OnPersistComplete(ctx context.Context, duration time.Duration, err error)
 }
 
 // Option is a function that configures the EventBus
@@ -259,6 +297,12 @@ func Publish[T any](bus *EventBus, event T) {
 // PublishContext publishes an event with context to all registered handlers
 func PublishContext[T any](bus *EventBus, ctx context.Context, event T) {
 	eventType := reflect.TypeOf(event)
+	eventTypeName := EventType(event)
+
+	// Observability: Track publish start
+	if bus.observability != nil {
+		ctx = bus.observability.OnPublishStart(ctx, eventTypeName)
+	}
 
 	// Call before publish hook
 	if bus.beforePublish != nil {
@@ -309,7 +353,7 @@ func PublishContext[T any](bus *EventBus, ctx context.Context, event T) {
 				case <-ctx.Done():
 					return
 				default:
-					callHandlerWithContext(handler, ctx, event, bus.panicHandler)
+					callHandlerWithContext(handler, ctx, event, bus.panicHandler, bus.observability, eventTypeName, true)
 				}
 			}(h)
 		} else {
@@ -318,7 +362,7 @@ func PublishContext[T any](bus *EventBus, ctx context.Context, event T) {
 			case <-ctx.Done():
 				continue // Skip if context cancelled
 			default:
-				callHandlerWithContext(h, ctx, event, bus.panicHandler)
+				callHandlerWithContext(h, ctx, event, bus.panicHandler, bus.observability, eventTypeName, false)
 			}
 		}
 	}
@@ -345,6 +389,11 @@ func PublishContext[T any](bus *EventBus, ctx context.Context, event T) {
 	// Call after publish hook
 	if bus.afterPublish != nil {
 		bus.afterPublish(eventType, event)
+	}
+
+	// Observability: Track publish complete (sync handlers done)
+	if bus.observability != nil {
+		bus.observability.OnPublishComplete(ctx, eventTypeName)
 	}
 }
 
@@ -395,12 +444,28 @@ func (bus *EventBus) Wait() {
 }
 
 // callHandlerWithContext calls a handler with proper type checking and panic recovery
-func callHandlerWithContext[T any](h *internalHandler, ctx context.Context, event T, panicHandler PanicHandler) {
+func callHandlerWithContext[T any](h *internalHandler, ctx context.Context, event T, panicHandler PanicHandler, obs Observability, eventTypeName string, async bool) {
+	start := time.Now()
+	var panicErr error
+
 	defer func() {
-		if r := recover(); r != nil && panicHandler != nil {
-			panicHandler(event, h.handlerType, r)
+		duration := time.Since(start)
+		if r := recover(); r != nil {
+			panicErr = fmt.Errorf("handler panic: %v", r)
+			if panicHandler != nil {
+				panicHandler(event, h.handlerType, r)
+			}
+		}
+		// Observability: Track handler complete
+		if obs != nil {
+			obs.OnHandlerComplete(ctx, duration, panicErr)
 		}
 	}()
+
+	// Observability: Track handler start
+	if obs != nil {
+		ctx = obs.OnHandlerStart(ctx, eventTypeName, async)
+	}
 
 	// Sequential handlers need locking
 	if h.sequential {
@@ -505,6 +570,13 @@ func WithPersistenceErrorHandler(handler PersistenceErrorHandler) Option {
 func WithPersistenceTimeout(timeout time.Duration) Option {
 	return func(bus *EventBus) {
 		bus.persistenceTimeout = timeout
+	}
+}
+
+// WithObservability sets the observability implementation for metrics and tracing
+func WithObservability(obs Observability) Option {
+	return func(bus *EventBus) {
+		bus.observability = obs
 	}
 }
 

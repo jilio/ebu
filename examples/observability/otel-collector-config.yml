@@ -1,0 +1,42 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 10s
+    send_batch_size: 1024
+
+exporters:
+  # Export traces to Jaeger via OTLP
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+
+  # Export metrics to Prometheus
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+    namespace: ebu
+    const_labels:
+      service: eventbus
+
+  # Debug for debugging
+  debug:
+    verbosity: detailed
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/jaeger, debug]
+
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [prometheus, debug]

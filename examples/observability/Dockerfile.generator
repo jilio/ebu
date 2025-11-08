@@ -1,0 +1,27 @@
+FROM golang:1.24-alpine AS builder
+
+WORKDIR /build
+
+# Copy go mod files
+COPY go.mod ./
+COPY otel/go.mod ./otel/
+COPY examples/observability/generator/go.mod ./examples/observability/generator/
+
+# Copy source code
+COPY . .
+
+# Build the generator
+WORKDIR /build/examples/observability/generator
+RUN go mod download
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o load-generator .
+
+# Final stage
+FROM alpine:latest
+
+RUN apk --no-cache add ca-certificates
+
+WORKDIR /root/
+
+COPY --from=builder /build/examples/observability/generator/load-generator .
+
+CMD ["./load-generator"]

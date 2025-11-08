@@ -188,6 +188,37 @@ eventbus.SubscribeWithReplay(bus, "email-sender",
 
 See [**Persistence Guide**](docs/PERSISTENCE.md) for custom stores and advanced patterns.
 
+### Observability
+
+Add metrics and distributed tracing with OpenTelemetry:
+
+```go
+import (
+    eventbus "github.com/jilio/ebu"
+    "github.com/jilio/ebu/otel"
+)
+
+// Create observability implementation
+obs, err := otel.New(
+    otel.WithTracerProvider(tracerProvider),
+    otel.WithMeterProvider(meterProvider),
+)
+
+// Create bus with observability
+bus := eventbus.New(eventbus.WithObservability(obs))
+
+// Events, handlers, and persistence are automatically tracked
+eventbus.Publish(bus, UserCreatedEvent{UserID: "123"})
+```
+
+The `otel` package provides:
+- **Metrics**: Event counts, handler duration, error rates, persistence metrics
+- **Tracing**: Distributed tracing with spans for publish, handlers, and persistence
+- **Zero overhead**: Optional - no performance impact if not used
+- **Vendor-neutral**: Built on OpenTelemetry standards
+
+See [**examples/observability**](examples/observability) for a complete example.
+
 ### Event Upcasting
 
 Migrate event schemas seamlessly without breaking existing handlers:
