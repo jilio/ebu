@@ -13,7 +13,7 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
 
 type UserCreatedEvent struct {
@@ -33,7 +33,7 @@ func main() {
 	res, err := resource.Merge(
 		resource.Default(),
 		resource.NewWithAttributes(
-			semconv.SchemaURL,
+			"", // Empty schema URL to avoid conflicts
 			semconv.ServiceName("ebu-example"),
 			semconv.ServiceVersion("1.0.0"),
 		),

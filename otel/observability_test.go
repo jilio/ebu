@@ -290,8 +290,8 @@ func TestPublishTracing(t *testing.T) {
 	}
 
 	span := spans[0]
-	if span.Name != "eventbus.publish" {
-		t.Errorf("expected span name 'eventbus.publish', got %q", span.Name)
+	if span.Name != "eventbus.publish: TestEvent" {
+		t.Errorf("expected span name 'eventbus.publish: TestEvent', got %q", span.Name)
 	}
 
 	// Check attributes
@@ -333,8 +333,8 @@ func TestHandlerTracing(t *testing.T) {
 		}
 
 		span := spans[0]
-		if span.Name != "eventbus.handler" {
-			t.Errorf("expected span name 'eventbus.handler', got %q", span.Name)
+		if span.Name != "eventbus.handler: TestEvent" {
+			t.Errorf("expected span name 'eventbus.handler: TestEvent', got %q", span.Name)
 		}
 
 		// Check async attribute
@@ -365,8 +365,8 @@ func TestHandlerTracing(t *testing.T) {
 		}
 
 		span := spans[0]
-		if span.Name != "eventbus.handler.async" {
-			t.Errorf("expected span name 'eventbus.handler.async', got %q", span.Name)
+		if span.Name != "eventbus.handler.async: TestEvent" {
+			t.Errorf("expected span name 'eventbus.handler.async: TestEvent', got %q", span.Name)
 		}
 	})
 
@@ -423,8 +423,8 @@ func TestPersistTracing(t *testing.T) {
 		}
 
 		span := spans[0]
-		if span.Name != "eventbus.persist" {
-			t.Errorf("expected span name 'eventbus.persist', got %q", span.Name)
+		if span.Name != "eventbus.persist: TestEvent" {
+			t.Errorf("expected span name 'eventbus.persist: TestEvent', got %q", span.Name)
 		}
 
 		// Check position attribute

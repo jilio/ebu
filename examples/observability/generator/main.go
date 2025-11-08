@@ -17,7 +17,7 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
 
 // Event types
@@ -105,7 +105,7 @@ func setupOTel(ctx context.Context) (func(context.Context) error, error) {
 	res, err := resource.Merge(
 		resource.Default(),
 		resource.NewWithAttributes(
-			semconv.SchemaURL,
+			"", // Empty schema URL to avoid conflicts
 			semconv.ServiceName("ebu-load-generator"),
 			semconv.ServiceVersion("1.0.0"),
 		),
@@ -218,10 +218,11 @@ func registerHandlers(bus *eventbus.EventBus) {
 		time.Sleep(time.Duration(rand.Intn(20)) * time.Millisecond)
 	})
 
-	eventbus.Subscribe(bus, func(e UserCreatedEvent) {
+	eventbus.SubscribeContext(bus, func(ctx context.Context, e UserCreatedEvent) {
 		// Send welcome email (async)
 		time.Sleep(time.Duration(rand.Intn(50)) * time.Millisecond)
-		eventbus.Publish(bus, NotificationSentEvent{
+		// Use PublishContext to propagate trace context
+		eventbus.PublishContext(bus, ctx, NotificationSentEvent{
 			NotificationID: fmt.Sprintf("notif-%d", rand.Int63()),
 			UserID:         e.UserID,
 			Channel:        "email",
@@ -230,10 +231,11 @@ func registerHandlers(bus *eventbus.EventBus) {
 	}, eventbus.Async())
 
 	// Order placed handlers
-	eventbus.Subscribe(bus, func(e OrderPlacedEvent) {
+	eventbus.SubscribeContext(bus, func(ctx context.Context, e OrderPlacedEvent) {
 		// Process payment
 		time.Sleep(time.Duration(rand.Intn(100)) * time.Millisecond)
-		eventbus.Publish(bus, PaymentProcessedEvent{
+		// Use PublishContext to propagate trace context
+		eventbus.PublishContext(bus, ctx, PaymentProcessedEvent{
 			PaymentID:     fmt.Sprintf("pay-%d", rand.Int63()),
 			OrderID:       e.OrderID,
 			Amount:        e.TotalPrice,
@@ -241,10 +243,11 @@ func registerHandlers(bus *eventbus.EventBus) {
 		})
 	})
 
-	eventbus.Subscribe(bus, func(e OrderPlacedEvent) {
+	eventbus.SubscribeContext(bus, func(ctx context.Context, e OrderPlacedEvent) {
 		// Update inventory (async)
 		time.Sleep(time.Duration(rand.Intn(30)) * time.Millisecond)
-		eventbus.Publish(bus, InventoryUpdatedEvent{
+		// Use PublishContext to propagate trace context
+		eventbus.PublishContext(bus, ctx, InventoryUpdatedEvent{
 			ProductID: fmt.Sprintf("prod-%d", rand.Intn(100)),
 			Quantity:  -e.ItemCount,
 			Warehouse: "main",

@@ -4,6 +4,7 @@ go 1.24.2
 
 require (
 	github.com/jilio/ebu v0.0.0
+	github.com/jilio/ebu/otel v0.0.0
 	go.opentelemetry.io/otel v1.38.0
 	go.opentelemetry.io/otel/exporters/stdout/stdoutmetric v1.38.0
 	go.opentelemetry.io/otel/exporters/stdout/stdouttrace v1.38.0
@@ -22,3 +23,5 @@ require (
 )
 
 replace github.com/jilio/ebu => ../..
+
+replace github.com/jilio/ebu/otel => ../../otel

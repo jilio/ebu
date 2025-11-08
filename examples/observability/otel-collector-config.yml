@@ -12,9 +12,9 @@ processors:
     send_batch_size: 1024
 
 exporters:
-  # Export traces to Jaeger
-  jaeger:
-    endpoint: jaeger:14250
+  # Export traces to Jaeger via OTLP
+  otlp/jaeger:
+    endpoint: jaeger:4317
     tls:
       insecure: true
 
@@ -25,18 +25,18 @@ exporters:
     const_labels:
       service: eventbus
 
-  # Logging for debugging
-  logging:
-    loglevel: info
+  # Debug for debugging
+  debug:
+    verbosity: detailed
 
 service:
   pipelines:
     traces:
       receivers: [otlp]
       processors: [batch]
-      exporters: [jaeger, logging]
+      exporters: [otlp/jaeger, debug]
 
     metrics:
       receivers: [otlp]
       processors: [batch]
-      exporters: [prometheus, logging]
+      exporters: [prometheus, debug]

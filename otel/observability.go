@@ -132,7 +132,7 @@ func New(opts ...Option) (*Observability, error) {
 // OnPublishStart is called when an event starts publishing
 func (o *Observability) OnPublishStart(ctx context.Context, eventType string) context.Context {
 	// Start a span for the publish operation
-	ctx, _ = o.tracer.Start(ctx, "eventbus.publish",
+	ctx, _ = o.tracer.Start(ctx, "eventbus.publish: "+eventType,
 		trace.WithAttributes(
 			attribute.String("event.type", eventType),
 		),
@@ -158,9 +158,9 @@ func (o *Observability) OnPublishComplete(ctx context.Context, eventType string)
 // OnHandlerStart is called when a handler starts executing
 func (o *Observability) OnHandlerStart(ctx context.Context, eventType string, async bool) context.Context {
 	// Start a span for the handler
-	spanName := "eventbus.handler"
+	spanName := "eventbus.handler: " + eventType
 	if async {
-		spanName = "eventbus.handler.async"
+		spanName = "eventbus.handler.async: " + eventType
 	}
 
 	ctx, _ = o.tracer.Start(ctx, spanName,
@@ -212,7 +212,7 @@ func (o *Observability) OnHandlerComplete(ctx context.Context, duration time.Dur
 // OnPersistStart is called when event persistence starts
 func (o *Observability) OnPersistStart(ctx context.Context, eventType string, position int64) context.Context {
 	// Start a span for persistence
-	ctx, _ = o.tracer.Start(ctx, "eventbus.persist",
+	ctx, _ = o.tracer.Start(ctx, "eventbus.persist: "+eventType,
 		trace.WithAttributes(
 			attribute.String("event.type", eventType),
 			attribute.Int64("position", position),
