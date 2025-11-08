@@ -3,17 +3,107 @@ package otel
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	eventbus "github.com/jilio/ebu"
 	"go.opentelemetry.io/otel/codes"
-	"go.opentelemetry.io/otel/metric/noop"
+	"go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
+
+// errorMeterProvider wraps a real MeterProvider and returns an errorMeter
+type errorMeterProvider struct {
+	metric.MeterProvider
+	base   metric.MeterProvider
+	failOn string
+}
+
+func (e *errorMeterProvider) Meter(name string, opts ...metric.MeterOption) metric.Meter {
+	baseMeter := e.base.Meter(name, opts...)
+	return &errorMeter{
+		Meter:  baseMeter,
+		base:   baseMeter,
+		failOn: e.failOn,
+	}
+}
+
+// errorMeter wraps a real Meter and returns errors for specific metric names
+type errorMeter struct {
+	metric.Meter
+	base   metric.Meter
+	failOn string
+}
+
+func (e *errorMeter) Int64Counter(name string, options ...metric.Int64CounterOption) (metric.Int64Counter, error) {
+	if name == e.failOn {
+		return nil, fmt.Errorf("failed to create counter: %s", name)
+	}
+	return e.base.Int64Counter(name, options...)
+}
+
+func (e *errorMeter) Int64UpDownCounter(name string, options ...metric.Int64UpDownCounterOption) (metric.Int64UpDownCounter, error) {
+	return e.base.Int64UpDownCounter(name, options...)
+}
+
+func (e *errorMeter) Int64Histogram(name string, options ...metric.Int64HistogramOption) (metric.Int64Histogram, error) {
+	return e.base.Int64Histogram(name, options...)
+}
+
+func (e *errorMeter) Int64Gauge(name string, options ...metric.Int64GaugeOption) (metric.Int64Gauge, error) {
+	return e.base.Int64Gauge(name, options...)
+}
+
+func (e *errorMeter) Int64ObservableCounter(name string, options ...metric.Int64ObservableCounterOption) (metric.Int64ObservableCounter, error) {
+	return e.base.Int64ObservableCounter(name, options...)
+}
+
+func (e *errorMeter) Int64ObservableUpDownCounter(name string, options ...metric.Int64ObservableUpDownCounterOption) (metric.Int64ObservableUpDownCounter, error) {
+	return e.base.Int64ObservableUpDownCounter(name, options...)
+}
+
+func (e *errorMeter) Int64ObservableGauge(name string, options ...metric.Int64ObservableGaugeOption) (metric.Int64ObservableGauge, error) {
+	return e.base.Int64ObservableGauge(name, options...)
+}
+
+func (e *errorMeter) Float64Counter(name string, options ...metric.Float64CounterOption) (metric.Float64Counter, error) {
+	return e.base.Float64Counter(name, options...)
+}
+
+func (e *errorMeter) Float64UpDownCounter(name string, options ...metric.Float64UpDownCounterOption) (metric.Float64UpDownCounter, error) {
+	return e.base.Float64UpDownCounter(name, options...)
+}
+
+func (e *errorMeter) Float64Histogram(name string, options ...metric.Float64HistogramOption) (metric.Float64Histogram, error) {
+	if name == e.failOn {
+		return nil, fmt.Errorf("failed to create histogram: %s", name)
+	}
+	return e.base.Float64Histogram(name, options...)
+}
+
+func (e *errorMeter) Float64Gauge(name string, options ...metric.Float64GaugeOption) (metric.Float64Gauge, error) {
+	return e.base.Float64Gauge(name, options...)
+}
+
+func (e *errorMeter) Float64ObservableCounter(name string, options ...metric.Float64ObservableCounterOption) (metric.Float64ObservableCounter, error) {
+	return e.base.Float64ObservableCounter(name, options...)
+}
+
+func (e *errorMeter) Float64ObservableUpDownCounter(name string, options ...metric.Float64ObservableUpDownCounterOption) (metric.Float64ObservableUpDownCounter, error) {
+	return e.base.Float64ObservableUpDownCounter(name, options...)
+}
+
+func (e *errorMeter) Float64ObservableGauge(name string, options ...metric.Float64ObservableGaugeOption) (metric.Float64ObservableGauge, error) {
+	return e.base.Float64ObservableGauge(name, options...)
+}
+
+func (e *errorMeter) RegisterCallback(callback metric.Callback, instruments ...metric.Observable) (metric.Registration, error) {
+	return e.base.RegisterCallback(callback, instruments...)
+}
 
 func TestNew(t *testing.T) {
 	t.Run("default_providers", func(t *testing.T) {
@@ -45,6 +135,125 @@ func TestNew(t *testing.T) {
 		}
 		if obs.meter == nil {
 			t.Fatal("meter not set")
+		}
+	})
+
+	t.Run("metric_creation_errors", func(t *testing.T) {
+		// Test error on first metric (publishCounter)
+		base := sdkmetric.NewMeterProvider()
+		mp := &errorMeterProvider{
+			MeterProvider: base,
+			base:          base,
+			failOn:        "eventbus.publish.count",
+		}
+		obs, err := New(WithMeterProvider(mp))
+		if err == nil {
+			t.Fatal("expected error when creating publishCounter")
+		}
+		if obs != nil {
+			t.Fatal("expected nil observability on error")
+		}
+	})
+
+	t.Run("metric_creation_errors_handler_counter", func(t *testing.T) {
+		// Test error on second metric (handlerCounter)
+		base := sdkmetric.NewMeterProvider()
+		mp := &errorMeterProvider{
+			MeterProvider: base,
+			base:          base,
+			failOn:        "eventbus.handler.count",
+		}
+		obs, err := New(WithMeterProvider(mp))
+		if err == nil {
+			t.Fatal("expected error when creating handlerCounter")
+		}
+		if obs != nil {
+			t.Fatal("expected nil observability on error")
+		}
+	})
+
+	t.Run("metric_creation_errors_handler_duration", func(t *testing.T) {
+		// Test error on third metric (handlerDuration)
+		base := sdkmetric.NewMeterProvider()
+		mp := &errorMeterProvider{
+			MeterProvider: base,
+			base:          base,
+			failOn:        "eventbus.handler.duration",
+		}
+		obs, err := New(WithMeterProvider(mp))
+		if err == nil {
+			t.Fatal("expected error when creating handlerDuration")
+		}
+		if obs != nil {
+			t.Fatal("expected nil observability on error")
+		}
+	})
+
+	t.Run("metric_creation_errors_handler_errors", func(t *testing.T) {
+		// Test error on fourth metric (handlerErrors)
+		base := sdkmetric.NewMeterProvider()
+		mp := &errorMeterProvider{
+			MeterProvider: base,
+			base:          base,
+			failOn:        "eventbus.handler.errors",
+		}
+		obs, err := New(WithMeterProvider(mp))
+		if err == nil {
+			t.Fatal("expected error when creating handlerErrors")
+		}
+		if obs != nil {
+			t.Fatal("expected nil observability on error")
+		}
+	})
+
+	t.Run("metric_creation_errors_persist_counter", func(t *testing.T) {
+		// Test error on fifth metric (persistCounter)
+		base := sdkmetric.NewMeterProvider()
+		mp := &errorMeterProvider{
+			MeterProvider: base,
+			base:          base,
+			failOn:        "eventbus.persist.count",
+		}
+		obs, err := New(WithMeterProvider(mp))
+		if err == nil {
+			t.Fatal("expected error when creating persistCounter")
+		}
+		if obs != nil {
+			t.Fatal("expected nil observability on error")
+		}
+	})
+
+	t.Run("metric_creation_errors_persist_duration", func(t *testing.T) {
+		// Test error on sixth metric (persistDuration)
+		base := sdkmetric.NewMeterProvider()
+		mp := &errorMeterProvider{
+			MeterProvider: base,
+			base:          base,
+			failOn:        "eventbus.persist.duration",
+		}
+		obs, err := New(WithMeterProvider(mp))
+		if err == nil {
+			t.Fatal("expected error when creating persistDuration")
+		}
+		if obs != nil {
+			t.Fatal("expected nil observability on error")
+		}
+	})
+
+	t.Run("metric_creation_errors_persist_errors", func(t *testing.T) {
+		// Test error on seventh metric (persistErrors)
+		base := sdkmetric.NewMeterProvider()
+		mp := &errorMeterProvider{
+			MeterProvider: base,
+			base:          base,
+			failOn:        "eventbus.persist.errors",
+		}
+		obs, err := New(WithMeterProvider(mp))
+		if err == nil {
+			t.Fatal("expected error when creating persistErrors")
+		}
+		if obs != nil {
+			t.Fatal("expected nil observability on error")
 		}
 	})
 }
@@ -319,7 +528,7 @@ func TestMetrics(t *testing.T) {
 func TestIntegrationWithEventBus(t *testing.T) {
 	// Create observability with in-memory providers
 	tp := sdktrace.NewTracerProvider()
-	mp := noop.NewMeterProvider()
+	mp := sdkmetric.NewMeterProvider()
 
 	obs, err := New(
 		WithTracerProvider(tp),
