@@ -16,6 +16,15 @@ const (
 	instrumentationName = "github.com/jilio/ebu"
 )
 
+// Context keys for storing event metadata
+type contextKey int
+
+const (
+	eventTypeKey contextKey = iota
+	asyncKey
+	positionKey
+)
+
 // Observability implements eventbus.Observability using OpenTelemetry
 type Observability struct {
 	tracer trace.Tracer
@@ -157,6 +166,10 @@ func (o *Observability) OnPublishComplete(ctx context.Context, eventType string)
 
 // OnHandlerStart is called when a handler starts executing
 func (o *Observability) OnHandlerStart(ctx context.Context, eventType string, async bool) context.Context {
+	// Store event metadata in context for later retrieval
+	ctx = context.WithValue(ctx, eventTypeKey, eventType)
+	ctx = context.WithValue(ctx, asyncKey, async)
+
 	// Start a span for the handler
 	spanName := "eventbus.handler: " + eventType
 	if async {
@@ -185,12 +198,13 @@ func (o *Observability) OnHandlerStart(ctx context.Context, eventType string, as
 func (o *Observability) OnHandlerComplete(ctx context.Context, duration time.Duration, err error) {
 	span := trace.SpanFromContext(ctx)
 
-	// Extract attributes from span
+	// Extract event metadata from context
 	var attrs []attribute.KeyValue
-	if span.SpanContext().IsValid() {
-		// Get event type and async flag from span attributes
-		// We'll use metric options with empty attributes for now
-		// as we can't easily extract them from the span
+	if eventType, ok := ctx.Value(eventTypeKey).(string); ok {
+		attrs = append(attrs, attribute.String("event.type", eventType))
+	}
+	if async, ok := ctx.Value(asyncKey).(bool); ok {
+		attrs = append(attrs, attribute.Bool("async", async))
 	}
 
 	// Record duration
@@ -211,6 +225,10 @@ func (o *Observability) OnHandlerComplete(ctx context.Context, duration time.Dur
 
 // OnPersistStart is called when event persistence starts
 func (o *Observability) OnPersistStart(ctx context.Context, eventType string, position int64) context.Context {
+	// Store event metadata in context for later retrieval
+	ctx = context.WithValue(ctx, eventTypeKey, eventType)
+	ctx = context.WithValue(ctx, positionKey, position)
+
 	// Start a span for persistence
 	ctx, _ = o.tracer.Start(ctx, "eventbus.persist: "+eventType,
 		trace.WithAttributes(
@@ -233,11 +251,10 @@ func (o *Observability) OnPersistStart(ctx context.Context, eventType string, po
 func (o *Observability) OnPersistComplete(ctx context.Context, duration time.Duration, err error) {
 	span := trace.SpanFromContext(ctx)
 
-	// Extract attributes from span
+	// Extract event metadata from context
 	var attrs []attribute.KeyValue
-	if span.SpanContext().IsValid() {
-		// Get event type from span attributes
-		// We'll use metric options with empty attributes for now
+	if eventType, ok := ctx.Value(eventTypeKey).(string); ok {
+		attrs = append(attrs, attribute.String("event.type", eventType))
 	}
 
 	// Record duration

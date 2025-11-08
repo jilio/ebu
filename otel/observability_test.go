@@ -556,3 +556,226 @@ func TestIntegrationWithEventBus(t *testing.T) {
 		t.Error("handler was not called")
 	}
 }
+
+func TestAttributePropagation(t *testing.T) {
+	t.Run("handler_attributes", func(t *testing.T) {
+		// Create a metric reader to verify attributes
+		reader := sdkmetric.NewManualReader()
+		mp := sdkmetric.NewMeterProvider(
+			sdkmetric.WithReader(reader),
+		)
+
+		obs, err := New(WithMeterProvider(mp))
+		if err != nil {
+			t.Fatalf("New() failed: %v", err)
+		}
+
+		ctx := context.Background()
+
+		// Test sync handler
+		ctx = obs.OnHandlerStart(ctx, "TestEvent", false)
+		time.Sleep(10 * time.Millisecond)
+		obs.OnHandlerComplete(ctx, 10*time.Millisecond, nil)
+
+		// Collect metrics
+		var rm metricdata.ResourceMetrics
+		if err := reader.Collect(ctx, &rm); err != nil {
+			t.Fatalf("Collect failed: %v", err)
+		}
+
+		// Verify metrics have correct attributes
+		found := false
+		for _, scopeMetric := range rm.ScopeMetrics {
+			for _, m := range scopeMetric.Metrics {
+				if m.Name == "eventbus.handler.duration" {
+					// Check that histogram has data points with attributes
+					if histo, ok := m.Data.(metricdata.Histogram[float64]); ok {
+						for _, dp := range histo.DataPoints {
+							hasEventType := false
+							hasAsync := false
+							for _, attr := range dp.Attributes.ToSlice() {
+								if attr.Key == "event.type" && attr.Value.AsString() == "TestEvent" {
+									hasEventType = true
+								}
+								if attr.Key == "async" && !attr.Value.AsBool() {
+									hasAsync = true
+								}
+							}
+							if hasEventType && hasAsync {
+								found = true
+							}
+						}
+					}
+				}
+			}
+		}
+
+		if !found {
+			t.Error("handler duration metric missing event.type and async attributes")
+		}
+	})
+
+	t.Run("async_handler_attributes", func(t *testing.T) {
+		// Create a metric reader to verify attributes
+		reader := sdkmetric.NewManualReader()
+		mp := sdkmetric.NewMeterProvider(
+			sdkmetric.WithReader(reader),
+		)
+
+		obs, err := New(WithMeterProvider(mp))
+		if err != nil {
+			t.Fatalf("New() failed: %v", err)
+		}
+
+		ctx := context.Background()
+
+		// Test async handler
+		ctx = obs.OnHandlerStart(ctx, "AsyncEvent", true)
+		time.Sleep(10 * time.Millisecond)
+		obs.OnHandlerComplete(ctx, 10*time.Millisecond, nil)
+
+		// Collect metrics
+		var rm metricdata.ResourceMetrics
+		if err := reader.Collect(ctx, &rm); err != nil {
+			t.Fatalf("Collect failed: %v", err)
+		}
+
+		// Verify async=true attribute
+		found := false
+		for _, scopeMetric := range rm.ScopeMetrics {
+			for _, m := range scopeMetric.Metrics {
+				if m.Name == "eventbus.handler.duration" {
+					if histo, ok := m.Data.(metricdata.Histogram[float64]); ok {
+						for _, dp := range histo.DataPoints {
+							for _, attr := range dp.Attributes.ToSlice() {
+								if attr.Key == "async" && attr.Value.AsBool() {
+									found = true
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		if !found {
+			t.Error("async handler duration metric missing async=true attribute")
+		}
+	})
+
+	t.Run("handler_error_attributes", func(t *testing.T) {
+		// Create a metric reader
+		reader := sdkmetric.NewManualReader()
+		mp := sdkmetric.NewMeterProvider(
+			sdkmetric.WithReader(reader),
+		)
+
+		obs, err := New(WithMeterProvider(mp))
+		if err != nil {
+			t.Fatalf("New() failed: %v", err)
+		}
+
+		ctx := context.Background()
+
+		// Test handler with error
+		ctx = obs.OnHandlerStart(ctx, "ErrorEvent", false)
+		testErr := errors.New("test error")
+		obs.OnHandlerComplete(ctx, 10*time.Millisecond, testErr)
+
+		// Collect metrics
+		var rm metricdata.ResourceMetrics
+		if err := reader.Collect(ctx, &rm); err != nil {
+			t.Fatalf("Collect failed: %v", err)
+		}
+
+		// Verify error counter has attributes
+		found := false
+		for _, scopeMetric := range rm.ScopeMetrics {
+			for _, m := range scopeMetric.Metrics {
+				if m.Name == "eventbus.handler.errors" {
+					if sum, ok := m.Data.(metricdata.Sum[int64]); ok {
+						for _, dp := range sum.DataPoints {
+							for _, attr := range dp.Attributes.ToSlice() {
+								if attr.Key == "event.type" && attr.Value.AsString() == "ErrorEvent" {
+									found = true
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		if !found {
+			t.Error("handler error metric missing event.type attribute")
+		}
+	})
+
+	t.Run("persist_attributes", func(t *testing.T) {
+		// Create a metric reader
+		reader := sdkmetric.NewManualReader()
+		mp := sdkmetric.NewMeterProvider(
+			sdkmetric.WithReader(reader),
+		)
+
+		obs, err := New(WithMeterProvider(mp))
+		if err != nil {
+			t.Fatalf("New() failed: %v", err)
+		}
+
+		ctx := context.Background()
+
+		// Test persistence
+		ctx = obs.OnPersistStart(ctx, "PersistEvent", 123)
+		time.Sleep(5 * time.Millisecond)
+		obs.OnPersistComplete(ctx, 5*time.Millisecond, nil)
+
+		// Collect metrics
+		var rm metricdata.ResourceMetrics
+		if err := reader.Collect(ctx, &rm); err != nil {
+			t.Fatalf("Collect failed: %v", err)
+		}
+
+		// Verify persist duration has event type attribute
+		found := false
+		for _, scopeMetric := range rm.ScopeMetrics {
+			for _, m := range scopeMetric.Metrics {
+				if m.Name == "eventbus.persist.duration" {
+					if histo, ok := m.Data.(metricdata.Histogram[float64]); ok {
+						for _, dp := range histo.DataPoints {
+							for _, attr := range dp.Attributes.ToSlice() {
+								if attr.Key == "event.type" && attr.Value.AsString() == "PersistEvent" {
+									found = true
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		if !found {
+			t.Error("persist duration metric missing event.type attribute")
+		}
+	})
+
+	t.Run("context_value_propagation", func(t *testing.T) {
+		obs, err := New()
+		if err != nil {
+			t.Fatalf("New() failed: %v", err)
+		}
+
+		ctx := context.Background()
+
+		// Verify context values are set
+		ctx = obs.OnHandlerStart(ctx, "ContextTest", true)
+
+		if eventType := ctx.Value(eventTypeKey); eventType != "ContextTest" {
+			t.Errorf("expected eventTypeKey='ContextTest', got %v", eventType)
+		}
+
+		if async := ctx.Value(asyncKey); async != true {
+			t.Errorf("expected asyncKey=true, got %v", async)
+		}
+	})
+}
