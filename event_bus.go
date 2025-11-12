@@ -186,10 +186,6 @@ func New(opts ...Option) *EventBus {
 		opt(bus)
 	}
 
-	// Initialize persistence if store is provided
-	if bus.store != nil {
-		go bus.startEventProcessor()
-	}
 
 	return bus
 }
@@ -580,9 +576,21 @@ func WithObservability(obs Observability) Option {
 	}
 }
 
-// startEventProcessor starts processing persisted events
-func (bus *EventBus) startEventProcessor() {
-	// This will be implemented when needed for event replay
+// Shutdown gracefully shuts down the event bus, waiting for async handlers to complete.
+// It respects the context timeout/cancellation.
+func (bus *EventBus) Shutdown(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		bus.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Backward compatibility methods
