@@ -114,6 +114,27 @@ eventbus.Subscribe(bus, func(event PaymentEvent) {
 bus.Wait()
 ```
 
+
+### Graceful Shutdown
+
+Shutdown the event bus gracefully, waiting for async handlers to complete with timeout support:
+
+```go
+// Shutdown with timeout
+ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+
+if err := bus.Shutdown(ctx); err != nil {
+    log.Printf("Shutdown timed out: %v", err)
+}
+```
+
+The `Shutdown` method:
+- Waits for all async handlers to complete
+- Respects context timeout and cancellation
+- Returns `context.DeadlineExceeded` if handlers don't finish in time
+- Returns `nil` on successful graceful shutdown
+
 ### Context Support
 
 ```go

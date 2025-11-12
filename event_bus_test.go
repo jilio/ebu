@@ -3300,3 +3300,86 @@ func (t *testObservability) OnPersistComplete(ctx context.Context, duration time
 		t.onPersistComplete(ctx, duration, err)
 	}
 }
+
+func TestShutdown(t *testing.T) {
+	t.Run("waits for async handlers", func(t *testing.T) {
+		bus := New()
+		
+		var completed atomic.Bool
+		Subscribe(bus, func(e TestEvent) {
+			time.Sleep(100 * time.Millisecond)
+			completed.Store(true)
+		}, Async())
+		
+		Publish(bus, TestEvent{ID: 1})
+		
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		defer cancel()
+		
+		err := bus.Shutdown(ctx)
+		if err != nil {
+			t.Fatalf("Shutdown failed: %v", err)
+		}
+		
+		if !completed.Load() {
+			t.Error("Expected async handler to complete")
+		}
+	})
+	
+	t.Run("respects context timeout", func(t *testing.T) {
+		bus := New()
+		
+		Subscribe(bus, func(e TestEvent) {
+			time.Sleep(5 * time.Second) // Longer than timeout
+		}, Async())
+		
+		Publish(bus, TestEvent{ID: 1})
+		
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		
+		err := bus.Shutdown(ctx)
+		if err != context.DeadlineExceeded {
+			t.Errorf("Expected context.DeadlineExceeded, got: %v", err)
+		}
+	})
+	
+	t.Run("respects context cancellation", func(t *testing.T) {
+		bus := New()
+		
+		Subscribe(bus, func(e TestEvent) {
+			time.Sleep(5 * time.Second)
+		}, Async())
+		
+		Publish(bus, TestEvent{ID: 1})
+		
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			time.Sleep(50 * time.Millisecond)
+			cancel()
+		}()
+		
+		err := bus.Shutdown(ctx)
+		if err != context.Canceled {
+			t.Errorf("Expected context.Canceled, got: %v", err)
+		}
+	})
+	
+	t.Run("returns immediately when no async handlers", func(t *testing.T) {
+		bus := New()
+		
+		ctx := context.Background()
+		start := time.Now()
+		
+		err := bus.Shutdown(ctx)
+		duration := time.Since(start)
+		
+		if err != nil {
+			t.Fatalf("Shutdown failed: %v", err)
+		}
+		
+		if duration > 10*time.Millisecond {
+			t.Errorf("Shutdown took too long: %v", duration)
+		}
+	})
+}
