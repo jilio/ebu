@@ -207,7 +207,9 @@ func (o *Observability) OnHandlerComplete(ctx context.Context, duration time.Dur
 		attrs = append(attrs, attribute.Bool("async", async))
 	}
 
-	// Record duration
+	// Record duration with exemplar support
+	// Exemplars are automatically recorded when there's an active span in the context
+	// This allows linking from metrics to traces in observability tools like Grafana
 	durationMs := float64(duration.Milliseconds())
 	o.handlerDuration.Record(ctx, durationMs, metric.WithAttributes(attrs...))
 
@@ -257,7 +259,9 @@ func (o *Observability) OnPersistComplete(ctx context.Context, duration time.Dur
 		attrs = append(attrs, attribute.String("event.type", eventType))
 	}
 
-	// Record duration
+	// Record duration with exemplar support
+	// Exemplars are automatically recorded when there's an active span in the context
+	// This allows linking from metrics to traces in observability tools like Grafana
 	durationMs := float64(duration.Milliseconds())
 	o.persistDuration.Record(ctx, durationMs, metric.WithAttributes(attrs...))
 
