@@ -3304,82 +3304,151 @@ func (t *testObservability) OnPersistComplete(ctx context.Context, duration time
 func TestShutdown(t *testing.T) {
 	t.Run("waits for async handlers", func(t *testing.T) {
 		bus := New()
-		
+
 		var completed atomic.Bool
 		Subscribe(bus, func(e TestEvent) {
 			time.Sleep(100 * time.Millisecond)
 			completed.Store(true)
 		}, Async())
-		
+
 		Publish(bus, TestEvent{ID: 1})
-		
+
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 		defer cancel()
-		
+
 		err := bus.Shutdown(ctx)
 		if err != nil {
 			t.Fatalf("Shutdown failed: %v", err)
 		}
-		
+
 		if !completed.Load() {
 			t.Error("Expected async handler to complete")
 		}
 	})
-	
+
 	t.Run("respects context timeout", func(t *testing.T) {
 		bus := New()
-		
+
 		Subscribe(bus, func(e TestEvent) {
 			time.Sleep(5 * time.Second) // Longer than timeout
 		}, Async())
-		
+
 		Publish(bus, TestEvent{ID: 1})
-		
+
 		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 		defer cancel()
-		
+
 		err := bus.Shutdown(ctx)
 		if err != context.DeadlineExceeded {
 			t.Errorf("Expected context.DeadlineExceeded, got: %v", err)
 		}
 	})
-	
+
 	t.Run("respects context cancellation", func(t *testing.T) {
 		bus := New()
-		
+
 		Subscribe(bus, func(e TestEvent) {
 			time.Sleep(5 * time.Second)
 		}, Async())
-		
+
 		Publish(bus, TestEvent{ID: 1})
-		
+
 		ctx, cancel := context.WithCancel(context.Background())
 		go func() {
 			time.Sleep(50 * time.Millisecond)
 			cancel()
 		}()
-		
+
 		err := bus.Shutdown(ctx)
 		if err != context.Canceled {
 			t.Errorf("Expected context.Canceled, got: %v", err)
 		}
 	})
-	
+
 	t.Run("returns immediately when no async handlers", func(t *testing.T) {
 		bus := New()
-		
+
 		ctx := context.Background()
 		start := time.Now()
-		
+
 		err := bus.Shutdown(ctx)
 		duration := time.Since(start)
-		
+
 		if err != nil {
 			t.Fatalf("Shutdown failed: %v", err)
 		}
-		
+
 		if duration > 10*time.Millisecond {
 			t.Errorf("Shutdown took too long: %v", duration)
 		}
 	})
+}
+
+func TestShutdown_CallsStoreClose(t *testing.T) {
+	var closeCalled atomic.Bool
+
+	store := &mockStore{
+		closeFn: func() error {
+			closeCalled.Store(true)
+			return nil
+		},
+	}
+
+	bus := New(WithStore(store))
+	ctx := context.Background()
+
+	if err := bus.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown() error = %v", err)
+	}
+
+	if !closeCalled.Load() {
+		t.Error("expected store.Close() to be called")
+	}
+}
+
+func TestShutdown_StoreWithoutClose(t *testing.T) {
+	// Store without Close() method
+	store := &mockStoreNoClose{}
+	bus := New(WithStore(store))
+
+	ctx := context.Background()
+	if err := bus.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown() error = %v, want nil", err)
+	}
+}
+
+type mockStore struct {
+	closeFn func() error
+}
+
+func (m *mockStore) Save(ctx context.Context, event *StoredEvent) error { return nil }
+func (m *mockStore) Load(ctx context.Context, from, to int64) ([]*StoredEvent, error) {
+	return nil, nil
+}
+func (m *mockStore) GetPosition(ctx context.Context) (int64, error) { return 0, nil }
+func (m *mockStore) SaveSubscriptionPosition(ctx context.Context, sid string, pos int64) error {
+	return nil
+}
+func (m *mockStore) LoadSubscriptionPosition(ctx context.Context, sid string) (int64, error) {
+	return 0, nil
+}
+func (m *mockStore) Close() error {
+	if m.closeFn != nil {
+		return m.closeFn()
+	}
+	return nil
+}
+
+type mockStoreNoClose struct{}
+
+func (m *mockStoreNoClose) Save(ctx context.Context, event *StoredEvent) error { return nil }
+func (m *mockStoreNoClose) Load(ctx context.Context, from, to int64) ([]*StoredEvent, error) {
+	return nil, nil
+}
+func (m *mockStoreNoClose) GetPosition(ctx context.Context) (int64, error) { return 0, nil }
+func (m *mockStoreNoClose) SaveSubscriptionPosition(ctx context.Context, sid string, pos int64) error {
+	return nil
+}
+func (m *mockStoreNoClose) LoadSubscriptionPosition(ctx context.Context, sid string) (int64, error) {
+	return 0, nil
 }

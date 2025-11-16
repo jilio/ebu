@@ -186,7 +186,6 @@ func New(opts ...Option) *EventBus {
 		opt(bus)
 	}
 
-
 	return bus
 }
 
@@ -578,6 +577,7 @@ func WithObservability(obs Observability) Option {
 
 // Shutdown gracefully shuts down the event bus, waiting for async handlers to complete.
 // It respects the context timeout/cancellation.
+// If the store implements io.Closer, its Close() method will be called after handlers complete.
 func (bus *EventBus) Shutdown(ctx context.Context) error {
 	done := make(chan struct{})
 	go func() {
@@ -587,6 +587,12 @@ func (bus *EventBus) Shutdown(ctx context.Context) error {
 
 	select {
 	case <-done:
+		// Close store if it implements io.Closer
+		if bus.store != nil {
+			if closer, ok := bus.store.(interface{ Close() error }); ok {
+				return closer.Close()
+			}
+		}
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
