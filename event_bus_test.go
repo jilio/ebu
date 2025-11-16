@@ -2,6 +2,7 @@ package eventbus
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"runtime"
@@ -3414,6 +3415,34 @@ func TestShutdown_StoreWithoutClose(t *testing.T) {
 	ctx := context.Background()
 	if err := bus.Shutdown(ctx); err != nil {
 		t.Fatalf("Shutdown() error = %v, want nil", err)
+	}
+}
+
+func TestShutdown_StoreCloseError(t *testing.T) {
+	expectedErr := errors.New("close failed")
+	store := &mockStore{
+		closeFn: func() error {
+			return expectedErr
+		},
+	}
+
+	bus := New(WithStore(store))
+	ctx := context.Background()
+
+	err := bus.Shutdown(ctx)
+	if err == nil {
+		t.Fatal("Shutdown() error = nil, want error")
+	}
+
+	// Check that the error is wrapped properly
+	if !errors.Is(err, expectedErr) {
+		t.Errorf("Shutdown() error = %v, want wrapped error containing %v", err, expectedErr)
+	}
+
+	// Verify the error message includes context
+	errMsg := err.Error()
+	if !strings.Contains(errMsg, "failed to close store") {
+		t.Errorf("Shutdown() error message = %q, want it to contain 'failed to close store'", errMsg)
 	}
 }
 

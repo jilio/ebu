@@ -590,7 +590,9 @@ func (bus *EventBus) Shutdown(ctx context.Context) error {
 		// Close store if it implements io.Closer
 		if bus.store != nil {
 			if closer, ok := bus.store.(interface{ Close() error }); ok {
-				return closer.Close()
+				if err := closer.Close(); err != nil {
+					return fmt.Errorf("failed to close store: %w", err)
+				}
 			}
 		}
 		return nil
