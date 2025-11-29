@@ -3184,7 +3184,7 @@ func TestWithObservability(t *testing.T) {
 
 	// Create custom observability implementation
 	obs := &testObservability{
-		onPublishStart: func(ctx context.Context, eventType string) context.Context {
+		onPublishStart: func(ctx context.Context, eventType string, event any) context.Context {
 			mock.publishStartCalled = true
 			return ctx
 		},
@@ -3255,7 +3255,7 @@ func TestWithObservability(t *testing.T) {
 
 // testObservability is a test implementation of Observability
 type testObservability struct {
-	onPublishStart    func(ctx context.Context, eventType string) context.Context
+	onPublishStart    func(ctx context.Context, eventType string, event any) context.Context
 	onPublishComplete func(ctx context.Context, eventType string)
 	onHandlerStart    func(ctx context.Context, eventType string, async bool) context.Context
 	onHandlerComplete func(ctx context.Context, duration time.Duration, err error)
@@ -3263,9 +3263,9 @@ type testObservability struct {
 	onPersistComplete func(ctx context.Context, duration time.Duration, err error)
 }
 
-func (t *testObservability) OnPublishStart(ctx context.Context, eventType string) context.Context {
+func (t *testObservability) OnPublishStart(ctx context.Context, eventType string, event any) context.Context {
 	if t.onPublishStart != nil {
-		return t.onPublishStart(ctx, eventType)
+		return t.onPublishStart(ctx, eventType, event)
 	}
 	return ctx
 }

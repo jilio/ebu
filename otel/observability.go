@@ -25,6 +25,32 @@ const (
 	positionKey
 )
 
+// SpanAttributer allows events to provide custom span attributes.
+// Events implementing this interface can enrich observability spans
+// with domain-specific attributes.
+//
+// Example:
+//
+//	import (
+//		ebuotel "github.com/jilio/ebu/otel"
+//		"go.opentelemetry.io/otel/attribute"
+//	)
+//
+//	type QueryExecuted struct {
+//		OperationName string
+//		Fields        []string
+//	}
+//
+//	func (e QueryExecuted) SpanAttributes() []attribute.KeyValue {
+//		return []attribute.KeyValue{
+//			attribute.String("graphql.operation", e.OperationName),
+//			attribute.StringSlice("graphql.fields", e.Fields),
+//		}
+//	}
+type SpanAttributer interface {
+	SpanAttributes() []attribute.KeyValue
+}
+
 // Observability implements eventbus.Observability using OpenTelemetry
 type Observability struct {
 	tracer trace.Tracer
@@ -139,13 +165,18 @@ func New(opts ...Option) (*Observability, error) {
 }
 
 // OnPublishStart is called when an event starts publishing
-func (o *Observability) OnPublishStart(ctx context.Context, eventType string) context.Context {
+func (o *Observability) OnPublishStart(ctx context.Context, eventType string, event any) context.Context {
 	// Start a span for the publish operation
-	ctx, _ = o.tracer.Start(ctx, "eventbus.publish: "+eventType,
+	ctx, span := o.tracer.Start(ctx, "eventbus.publish: "+eventType,
 		trace.WithAttributes(
 			attribute.String("event.type", eventType),
 		),
 	)
+
+	// Add custom span attributes if event implements SpanAttributer
+	if sa, ok := event.(SpanAttributer); ok {
+		span.SetAttributes(sa.SpanAttributes()...)
+	}
 
 	// Increment publish counter
 	o.publishCounter.Add(ctx, 1,

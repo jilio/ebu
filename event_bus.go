@@ -144,7 +144,8 @@ func EventType(event any) string {
 type Observability interface {
 	// OnPublishStart is called when an event is about to be published.
 	// Returns a context that will be passed to handlers and subsequent hooks.
-	OnPublishStart(ctx context.Context, eventType string) context.Context
+	// The event parameter allows implementations to extract custom attributes.
+	OnPublishStart(ctx context.Context, eventType string, event any) context.Context
 
 	// OnPublishComplete is called after all synchronous handlers complete.
 	// Note: This is called before async handlers complete.
@@ -296,7 +297,7 @@ func PublishContext[T any](bus *EventBus, ctx context.Context, event T) {
 
 	// Observability: Track publish start
 	if bus.observability != nil {
-		ctx = bus.observability.OnPublishStart(ctx, eventTypeName)
+		ctx = bus.observability.OnPublishStart(ctx, eventTypeName, event)
 	}
 
 	// Call before publish hook
