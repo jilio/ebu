@@ -89,6 +89,20 @@ func TestNew(t *testing.T) {
 		}
 	})
 
+	t.Run("rejects path with query params", func(t *testing.T) {
+		_, err := New("/tmp/test.db?mode=ro")
+		if err == nil {
+			t.Fatal("expected error for path with '?' character")
+		}
+	})
+
+	t.Run("rejects path with fragment", func(t *testing.T) {
+		_, err := New("/tmp/test.db#fragment")
+		if err == nil {
+			t.Fatal("expected error for path with '#' character")
+		}
+	})
+
 	t.Run("creates in-memory store", func(t *testing.T) {
 		store, err := New(":memory:")
 		if err != nil {

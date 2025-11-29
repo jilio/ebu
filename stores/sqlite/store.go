@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	eventbus "github.com/jilio/ebu"
@@ -36,6 +37,11 @@ func New(path string, opts ...Option) (*SQLiteStore, error) {
 		return nil, errors.New("sqlite: path is required")
 	}
 
+	// Validate path to prevent URI parameter injection
+	if path != ":memory:" && (strings.Contains(path, "?") || strings.Contains(path, "#")) {
+		return nil, errors.New("sqlite: path cannot contain '?' or '#' characters")
+	}
+
 	cfg := defaultConfig()
 	cfg.path = path
 	for _, opt := range opts {
@@ -51,9 +57,10 @@ func New(path string, opts ...Option) (*SQLiteStore, error) {
 		dsn = fmt.Sprintf("file:%s?_busy_timeout=%d", cfg.path, cfg.busyTimeout.Milliseconds())
 	}
 
-	// sql.Open validates driver name but not database connectivity
-	// Since we import the sqlite driver, this cannot fail
-	db, _ := sql.Open("sqlite", dsn)
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: open database: %w", err)
+	}
 
 	// Apply pragmas for performance
 	// Errors here indicate filesystem issues (read-only, permissions)
