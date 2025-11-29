@@ -1088,3 +1088,77 @@ func TestPositionRaceWithRealisticStore(t *testing.T) {
 		t.Errorf("RACE CONDITION DETECTED: %d positions have duplicates: %v", len(duplicates), duplicates)
 	}
 }
+
+// contextCapturingStore captures the context passed to Save for testing
+type contextCapturingStore struct {
+	*MemoryStore
+	capturedCtx context.Context
+}
+
+func (s *contextCapturingStore) Save(ctx context.Context, event *StoredEvent) error {
+	s.capturedCtx = ctx
+	return s.MemoryStore.Save(ctx, event)
+}
+
+func TestPersistenceReceivesPublishContext(t *testing.T) {
+	store := &contextCapturingStore{MemoryStore: NewMemoryStore()}
+	bus := New(WithStore(store))
+
+	// Create context with a value to verify it's passed through
+	type ctxKey struct{}
+	ctx := context.WithValue(context.Background(), ctxKey{}, "trace-id-123")
+
+	// Publish an event with context
+	PublishContext(bus, ctx, TestEvent{ID: 1, Value: "test"})
+
+	// Verify the context was passed to the store
+	if store.capturedCtx == nil {
+		t.Fatal("store should have received a context")
+	}
+
+	if store.capturedCtx.Value(ctxKey{}) != "trace-id-123" {
+		t.Error("context value should be passed through to persistence")
+	}
+}
+
+func TestWithStoreContextHookChaining(t *testing.T) {
+	store := NewMemoryStore()
+
+	var customHookCalled bool
+	var customHookCtx context.Context
+
+	type ctxKey struct{}
+
+	// Create bus with custom context hook first, then add store
+	bus := New(
+		WithBeforePublishContext(func(ctx context.Context, eventType reflect.Type, event any) {
+			customHookCalled = true
+			customHookCtx = ctx
+		}),
+		WithStore(store),
+	)
+
+	// Create context with value
+	ctx := context.WithValue(context.Background(), ctxKey{}, "test-value")
+
+	// Publish an event
+	PublishContext(bus, ctx, TestEvent{ID: 1, Value: "test"})
+
+	// Custom hook should be called with context
+	if !customHookCalled {
+		t.Error("custom context hook should have been called")
+	}
+
+	if customHookCtx.Value(ctxKey{}) != "test-value" {
+		t.Error("custom hook should receive context with value")
+	}
+
+	// Event should also be persisted
+	events, err := store.Load(context.Background(), 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Errorf("expected 1 event, got %d", len(events))
+	}
+}

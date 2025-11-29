@@ -46,21 +46,21 @@ func WithStore(store EventStore) Option {
 			bus.storePosition = pos
 		}
 
-		// Chain the persistence hook with any existing hook
-		existingHook := bus.beforePublish
-		bus.beforePublish = func(eventType reflect.Type, event any) {
+		// Chain the persistence hook with any existing context-aware hook
+		existingHook := bus.beforePublishCtx
+		bus.beforePublishCtx = func(ctx context.Context, eventType reflect.Type, event any) {
 			// Call existing hook first if any
 			if existingHook != nil {
-				existingHook(eventType, event)
+				existingHook(ctx, eventType, event)
 			}
 			// Then persist the event
-			bus.persistEvent(eventType, event)
+			bus.persistEvent(ctx, eventType, event)
 		}
 	}
 }
 
 // persistEvent saves an event to storage (only if store is configured)
-func (bus *EventBus) persistEvent(eventType reflect.Type, event any) {
+func (bus *EventBus) persistEvent(ctx context.Context, eventType reflect.Type, event any) {
 	if bus.store == nil {
 		return // No persistence configured
 	}
@@ -88,8 +88,7 @@ func (bus *EventBus) persistEvent(eventType reflect.Type, event any) {
 		Timestamp: time.Now(),
 	}
 
-	// Create context with timeout if configured
-	ctx := context.Background()
+	// Apply timeout if configured
 	var cancel context.CancelFunc
 	if bus.persistenceTimeout > 0 {
 		ctx, cancel = context.WithTimeout(ctx, bus.persistenceTimeout)

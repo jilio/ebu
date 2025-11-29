@@ -3481,3 +3481,124 @@ func (m *mockStoreNoClose) SaveSubscriptionPosition(ctx context.Context, sid str
 func (m *mockStoreNoClose) LoadSubscriptionPosition(ctx context.Context, sid string) (int64, error) {
 	return 0, nil
 }
+
+func TestBeforePublishContextHook(t *testing.T) {
+	var hookCalled bool
+	var capturedCtx context.Context
+	var capturedEventType reflect.Type
+	var capturedEvent any
+
+	bus := New(
+		WithBeforePublishContext(func(ctx context.Context, eventType reflect.Type, event any) {
+			hookCalled = true
+			capturedCtx = ctx
+			capturedEventType = eventType
+			capturedEvent = event
+		}),
+	)
+
+	// Create context with value to verify it's passed through
+	type ctxKey struct{}
+	ctx := context.WithValue(context.Background(), ctxKey{}, "test-value")
+
+	// Publish an event with context
+	testEvent := UserEvent{UserID: "123", Action: "test"}
+	PublishContext(bus, ctx, testEvent)
+
+	// Verify hook was called
+	if !hookCalled {
+		t.Error("beforePublishCtx hook should have been called")
+	}
+
+	if capturedCtx.Value(ctxKey{}) != "test-value" {
+		t.Error("context value should be passed through to hook")
+	}
+
+	if capturedEventType != reflect.TypeOf(testEvent) {
+		t.Errorf("expected event type %v, got %v", reflect.TypeOf(testEvent), capturedEventType)
+	}
+
+	if capturedEvent != testEvent {
+		t.Errorf("expected event %v, got %v", testEvent, capturedEvent)
+	}
+}
+
+func TestAfterPublishContextHook(t *testing.T) {
+	var hookCalled bool
+	var handlerCalled bool
+	var capturedCtx context.Context
+
+	type ctxKey struct{}
+
+	bus := New(
+		WithAfterPublishContext(func(ctx context.Context, eventType reflect.Type, event any) {
+			hookCalled = true
+			capturedCtx = ctx
+			// Hook should be called after handler
+			if !handlerCalled {
+				t.Error("afterPublishCtx hook called before handler")
+			}
+		}),
+	)
+
+	// Subscribe a handler
+	if err := Subscribe(bus, func(e UserEvent) {
+		handlerCalled = true
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create context with value
+	ctx := context.WithValue(context.Background(), ctxKey{}, "test-value")
+
+	// Publish an event with context
+	PublishContext(bus, ctx, UserEvent{UserID: "123", Action: "test"})
+
+	// Verify hook was called
+	if !hookCalled {
+		t.Error("afterPublishCtx hook should have been called")
+	}
+
+	if capturedCtx.Value(ctxKey{}) != "test-value" {
+		t.Error("context value should be passed through to hook")
+	}
+}
+
+func TestContextHooksCalledWithLegacyHooks(t *testing.T) {
+	var legacyBeforeCalled bool
+	var ctxBeforeCalled bool
+	var legacyAfterCalled bool
+	var ctxAfterCalled bool
+
+	bus := New(
+		WithBeforePublish(func(eventType reflect.Type, event any) {
+			legacyBeforeCalled = true
+		}),
+		WithBeforePublishContext(func(ctx context.Context, eventType reflect.Type, event any) {
+			ctxBeforeCalled = true
+		}),
+		WithAfterPublish(func(eventType reflect.Type, event any) {
+			legacyAfterCalled = true
+		}),
+		WithAfterPublishContext(func(ctx context.Context, eventType reflect.Type, event any) {
+			ctxAfterCalled = true
+		}),
+	)
+
+	// Publish an event
+	Publish(bus, UserEvent{UserID: "123", Action: "test"})
+
+	// All hooks should be called
+	if !legacyBeforeCalled {
+		t.Error("legacy beforePublish hook should have been called")
+	}
+	if !ctxBeforeCalled {
+		t.Error("context-aware beforePublish hook should have been called")
+	}
+	if !legacyAfterCalled {
+		t.Error("legacy afterPublish hook should have been called")
+	}
+	if !ctxAfterCalled {
+		t.Error("context-aware afterPublish hook should have been called")
+	}
+}

@@ -42,6 +42,9 @@ type PersistenceErrorHandler func(event any, eventType reflect.Type, err error)
 // PublishHook is called when an event is published
 type PublishHook func(eventType reflect.Type, event any)
 
+// PublishHookContext is called when an event is published (with context)
+type PublishHookContext func(ctx context.Context, eventType reflect.Type, event any)
+
 const numShards = 32 // Power of 2 for efficient modulo
 
 // shard represents a single shard with its own mutex
@@ -52,11 +55,13 @@ type shard struct {
 
 // EventBus is a high-performance event bus with sharded locks
 type EventBus struct {
-	shards        [numShards]*shard
-	panicHandler  PanicHandler
-	beforePublish PublishHook
-	afterPublish  PublishHook
-	wg            sync.WaitGroup
+	shards           [numShards]*shard
+	panicHandler     PanicHandler
+	beforePublish    PublishHook
+	afterPublish     PublishHook
+	beforePublishCtx PublishHookContext
+	afterPublishCtx  PublishHookContext
+	wg               sync.WaitGroup
 
 	// Optional persistence fields (nil if not using persistence)
 	store                   EventStore
@@ -300,9 +305,12 @@ func PublishContext[T any](bus *EventBus, ctx context.Context, event T) {
 		ctx = bus.observability.OnPublishStart(ctx, eventTypeName, event)
 	}
 
-	// Call before publish hook
+	// Call before publish hooks
 	if bus.beforePublish != nil {
 		bus.beforePublish(eventType, event)
+	}
+	if bus.beforePublishCtx != nil {
+		bus.beforePublishCtx(ctx, eventType, event)
 	}
 
 	// Get handlers from appropriate shard
@@ -382,9 +390,12 @@ func PublishContext[T any](bus *EventBus, ctx context.Context, event T) {
 	// For async handlers, we don't wait inline to avoid blocking
 	// Users can call bus.Wait() if they need to wait for completion
 
-	// Call after publish hook
+	// Call after publish hooks
 	if bus.afterPublish != nil {
 		bus.afterPublish(eventType, event)
+	}
+	if bus.afterPublishCtx != nil {
+		bus.afterPublishCtx(ctx, eventType, event)
 	}
 
 	// Observability: Track publish complete (sync handlers done)
@@ -552,6 +563,20 @@ func WithBeforePublish(hook PublishHook) Option {
 func WithAfterPublish(hook PublishHook) Option {
 	return func(bus *EventBus) {
 		bus.afterPublish = hook
+	}
+}
+
+// WithBeforePublishContext sets a context-aware hook that's called before publishing events
+func WithBeforePublishContext(hook PublishHookContext) Option {
+	return func(bus *EventBus) {
+		bus.beforePublishCtx = hook
+	}
+}
+
+// WithAfterPublishContext sets a context-aware hook that's called after publishing events
+func WithAfterPublishContext(hook PublishHookContext) Option {
+	return func(bus *EventBus) {
+		bus.afterPublishCtx = hook
 	}
 }
 
