@@ -8,6 +8,7 @@ import (
 	"time"
 
 	eventbus "github.com/jilio/ebu"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -276,7 +277,7 @@ func TestPublishTracing(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	ctx = obs.OnPublishStart(ctx, "TestEvent")
+	ctx = obs.OnPublishStart(ctx, "TestEvent", struct{}{})
 	obs.OnPublishComplete(ctx, "TestEvent")
 
 	// Force flush
@@ -477,7 +478,7 @@ func TestMetrics(t *testing.T) {
 	ctx := context.Background()
 
 	// Simulate publish
-	ctx = obs.OnPublishStart(ctx, "TestEvent")
+	ctx = obs.OnPublishStart(ctx, "TestEvent", struct{}{})
 	obs.OnPublishComplete(ctx, "TestEvent")
 
 	// Simulate handler execution
@@ -779,3 +780,146 @@ func TestAttributePropagation(t *testing.T) {
 		}
 	})
 }
+
+// attributedEvent implements SpanAttributer for testing
+type attributedEvent struct {
+	UserID    string
+	Operation string
+}
+
+func (e attributedEvent) SpanAttributes() []attribute.KeyValue {
+	return []attribute.KeyValue{
+		attribute.String("user.id", e.UserID),
+		attribute.String("operation", e.Operation),
+	}
+}
+
+func TestSpanAttributer(t *testing.T) {
+	t.Run("with_attributes", func(t *testing.T) {
+		exporter := tracetest.NewInMemoryExporter()
+		tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+
+		obs, err := New(WithTracerProvider(tp))
+		if err != nil {
+			t.Fatalf("New() failed: %v", err)
+		}
+
+		ctx := context.Background()
+		event := attributedEvent{UserID: "123", Operation: "create"}
+		ctx = obs.OnPublishStart(ctx, "attributedEvent", event)
+		obs.OnPublishComplete(ctx, "attributedEvent")
+
+		if err := tp.ForceFlush(ctx); err != nil {
+			t.Fatalf("ForceFlush failed: %v", err)
+		}
+
+		spans := exporter.GetSpans()
+		if len(spans) != 1 {
+			t.Fatalf("expected 1 span, got %d", len(spans))
+		}
+
+		span := spans[0]
+
+		// Verify custom attributes are present
+		foundUserID := false
+		foundOperation := false
+		for _, attr := range span.Attributes {
+			if string(attr.Key) == "user.id" && attr.Value.AsString() == "123" {
+				foundUserID = true
+			}
+			if string(attr.Key) == "operation" && attr.Value.AsString() == "create" {
+				foundOperation = true
+			}
+		}
+
+		if !foundUserID {
+			t.Error("span missing user.id attribute")
+		}
+		if !foundOperation {
+			t.Error("span missing operation attribute")
+		}
+	})
+
+	t.Run("without_interface", func(t *testing.T) {
+		exporter := tracetest.NewInMemoryExporter()
+		tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+
+		obs, err := New(WithTracerProvider(tp))
+		if err != nil {
+			t.Fatalf("New() failed: %v", err)
+		}
+
+		ctx := context.Background()
+		// Plain event without SpanAttributer
+		event := struct{ Message string }{Message: "test"}
+		ctx = obs.OnPublishStart(ctx, "plainEvent", event)
+		obs.OnPublishComplete(ctx, "plainEvent")
+
+		if err := tp.ForceFlush(ctx); err != nil {
+			t.Fatalf("ForceFlush failed: %v", err)
+		}
+
+		spans := exporter.GetSpans()
+		if len(spans) != 1 {
+			t.Fatalf("expected 1 span, got %d", len(spans))
+		}
+
+		span := spans[0]
+
+		// Should only have the default event.type attribute
+		foundEventType := false
+		for _, attr := range span.Attributes {
+			if string(attr.Key) == "event.type" {
+				foundEventType = true
+			} else {
+				t.Errorf("unexpected attribute: %s", attr.Key)
+			}
+		}
+		if !foundEventType {
+			t.Error("span missing required event.type attribute")
+		}
+	})
+
+	t.Run("empty_attributes", func(t *testing.T) {
+		exporter := tracetest.NewInMemoryExporter()
+		tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+
+		obs, err := New(WithTracerProvider(tp))
+		if err != nil {
+			t.Fatalf("New() failed: %v", err)
+		}
+
+		ctx := context.Background()
+		ctx = obs.OnPublishStart(ctx, "emptyEvent", emptyAttributedEvent{})
+		obs.OnPublishComplete(ctx, "emptyEvent")
+
+		if err := tp.ForceFlush(ctx); err != nil {
+			t.Fatalf("ForceFlush failed: %v", err)
+		}
+
+		spans := exporter.GetSpans()
+		if len(spans) != 1 {
+			t.Fatalf("expected 1 span, got %d", len(spans))
+		}
+
+		span := spans[0]
+
+		// Should only have the default event.type attribute (empty SpanAttributes returns nothing extra)
+		for _, attr := range span.Attributes {
+			if string(attr.Key) != "event.type" {
+				t.Errorf("unexpected attribute from empty SpanAttributer: %s", attr.Key)
+			}
+		}
+	})
+}
+
+// emptyAttributedEvent implements SpanAttributer but returns empty slice
+type emptyAttributedEvent struct{}
+
+func (emptyAttributedEvent) SpanAttributes() []attribute.KeyValue {
+	return []attribute.KeyValue{}
+}
+
+// Verify SpanAttributer interface is exported properly
+var _ SpanAttributer = (*attributedEvent)(nil)
+var _ SpanAttributer = (*emptyAttributedEvent)(nil)
