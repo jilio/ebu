@@ -867,10 +867,16 @@ func TestSpanAttributer(t *testing.T) {
 		span := spans[0]
 
 		// Should only have the default event.type attribute
+		foundEventType := false
 		for _, attr := range span.Attributes {
-			if string(attr.Key) != "event.type" {
+			if string(attr.Key) == "event.type" {
+				foundEventType = true
+			} else {
 				t.Errorf("unexpected attribute: %s", attr.Key)
 			}
+		}
+		if !foundEventType {
+			t.Error("span missing required event.type attribute")
 		}
 	})
 
@@ -883,14 +889,8 @@ func TestSpanAttributer(t *testing.T) {
 			t.Fatalf("New() failed: %v", err)
 		}
 
-		// Event that implements SpanAttributer but returns empty slice
-		type emptyAttributer struct{}
-		emptyEvent := struct {
-			emptyAttributer
-		}{}
-
 		ctx := context.Background()
-		ctx = obs.OnPublishStart(ctx, "emptyEvent", emptyEvent)
+		ctx = obs.OnPublishStart(ctx, "emptyEvent", emptyAttributedEvent{})
 		obs.OnPublishComplete(ctx, "emptyEvent")
 
 		if err := tp.ForceFlush(ctx); err != nil {
@@ -902,9 +902,24 @@ func TestSpanAttributer(t *testing.T) {
 			t.Fatalf("expected 1 span, got %d", len(spans))
 		}
 
-		// Should complete without error
+		span := spans[0]
+
+		// Should only have the default event.type attribute (empty SpanAttributes returns nothing extra)
+		for _, attr := range span.Attributes {
+			if string(attr.Key) != "event.type" {
+				t.Errorf("unexpected attribute from empty SpanAttributer: %s", attr.Key)
+			}
+		}
 	})
+}
+
+// emptyAttributedEvent implements SpanAttributer but returns empty slice
+type emptyAttributedEvent struct{}
+
+func (emptyAttributedEvent) SpanAttributes() []attribute.KeyValue {
+	return []attribute.KeyValue{}
 }
 
 // Verify SpanAttributer interface is exported properly
 var _ SpanAttributer = (*attributedEvent)(nil)
+var _ SpanAttributer = (*emptyAttributedEvent)(nil)
