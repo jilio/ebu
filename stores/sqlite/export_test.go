@@ -20,3 +20,35 @@ func RunMigrateV1(ctx context.Context, db *sql.DB) error {
 func NewFromDB(db *sql.DB) (*SQLiteStore, error) {
 	return newFromDB(db, defaultConfig())
 }
+
+// SetDBOpener sets the database opener function (for testing)
+func SetDBOpener(opener func(driverName, dataSourceName string) (*sql.DB, error)) {
+	dbOpener = opener
+}
+
+// ResetDBOpener restores the default database opener
+func ResetDBOpener() {
+	dbOpener = sql.Open
+}
+
+// GetDB exposes the internal db for testing
+func (s *SQLiteStore) GetDB() *sql.DB {
+	return s.db
+}
+
+// RowScanner is the interface for scanning rows (exported for testing)
+type RowScanner = rowScanner
+
+// ScanEvents exposes scanEvents for testing
+func (s *SQLiteStore) ScanEvents(rows RowScanner) ([]any, error) {
+	events, err := s.scanEvents(rows)
+	if err != nil {
+		return nil, err
+	}
+	// Convert to []any to avoid importing eventbus in export_test
+	result := make([]any, len(events))
+	for i, e := range events {
+		result[i] = e
+	}
+	return result, nil
+}

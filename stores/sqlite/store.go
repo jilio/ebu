@@ -31,6 +31,9 @@ type SQLiteStore struct {
 // Ensure SQLiteStore implements eventbus.EventStore
 var _ eventbus.EventStore = (*SQLiteStore)(nil)
 
+// dbOpener is used to open database connections, injectable for testing
+var dbOpener = sql.Open
+
 // New creates a new SQLiteStore with the given path and options
 func New(path string, opts ...Option) (*SQLiteStore, error) {
 	if path == "" {
@@ -57,7 +60,7 @@ func New(path string, opts ...Option) (*SQLiteStore, error) {
 		dsn = fmt.Sprintf("file:%s?_busy_timeout=%d", cfg.path, cfg.busyTimeout.Milliseconds())
 	}
 
-	db, err := sql.Open("sqlite", dsn)
+	db, err := dbOpener("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: open database: %w", err)
 	}
@@ -173,12 +176,25 @@ func (s *SQLiteStore) Save(ctx context.Context, event *eventbus.StoredEvent) err
 	return nil
 }
 
+// rowScanner abstracts sql.Rows for testing
+type rowScanner interface {
+	Next() bool
+	Scan(dest ...any) error
+	Err() error
+	Close() error
+}
+
 // Load implements eventbus.EventStore
-func (s *SQLiteStore) Load(ctx context.Context, from, to int64) ([]*eventbus.StoredEvent, error) {
+func (s *SQLiteStore) Load(ctx context.Context, from, to int64) (events []*eventbus.StoredEvent, err error) {
 	start := time.Now()
 
+	defer func() {
+		if s.metricsHook != nil {
+			s.metricsHook.OnLoad(time.Since(start), len(events), err)
+		}
+	}()
+
 	var rows *sql.Rows
-	var err error
 
 	if to == -1 {
 		rows, err = s.loadFromStmt.QueryContext(ctx, from)
@@ -187,38 +203,36 @@ func (s *SQLiteStore) Load(ctx context.Context, from, to int64) ([]*eventbus.Sto
 	}
 
 	if err != nil {
-		if s.metricsHook != nil {
-			s.metricsHook.OnLoad(time.Since(start), 0, err)
-		}
 		return nil, fmt.Errorf("sqlite: load events: %w", err)
 	}
+
+	events, err = s.scanEvents(rows)
+	if err != nil {
+		return nil, err
+	}
+
+	if s.logger != nil {
+		s.logger.Debug("loaded events", "from", from, "to", to, "count", len(events))
+	}
+
+	return events, nil
+}
+
+// scanEvents scans rows into events - extracted for testability
+func (s *SQLiteStore) scanEvents(rows rowScanner) ([]*eventbus.StoredEvent, error) {
 	defer rows.Close()
 
 	var events []*eventbus.StoredEvent
 	for rows.Next() {
 		event := &eventbus.StoredEvent{}
 		if err := rows.Scan(&event.Position, &event.Type, &event.Data, &event.Timestamp); err != nil {
-			if s.metricsHook != nil {
-				s.metricsHook.OnLoad(time.Since(start), len(events), err)
-			}
 			return nil, fmt.Errorf("sqlite: scan event: %w", err)
 		}
 		events = append(events, event)
 	}
 
 	if err := rows.Err(); err != nil {
-		if s.metricsHook != nil {
-			s.metricsHook.OnLoad(time.Since(start), len(events), err)
-		}
 		return nil, fmt.Errorf("sqlite: iterate events: %w", err)
-	}
-
-	if s.metricsHook != nil {
-		s.metricsHook.OnLoad(time.Since(start), len(events), nil)
-	}
-
-	if s.logger != nil {
-		s.logger.Debug("loaded events", "from", from, "to", to, "count", len(events))
 	}
 
 	return events, nil

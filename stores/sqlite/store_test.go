@@ -4,8 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -142,6 +144,22 @@ func TestNew(t *testing.T) {
 		}
 		defer store.Close()
 	})
+
+	t.Run("handles db open error", func(t *testing.T) {
+		// Mock dbOpener to return an error
+		SetDBOpener(func(driverName, dataSourceName string) (*sql.DB, error) {
+			return nil, errors.New("mock open error")
+		})
+		defer ResetDBOpener()
+
+		_, err := New(":memory:")
+		if err == nil {
+			t.Fatal("expected error when db open fails")
+		}
+		if !strings.Contains(err.Error(), "open database") {
+			t.Errorf("expected 'open database' in error, got: %v", err)
+		}
+	})
 }
 
 func TestSave(t *testing.T) {
@@ -265,6 +283,130 @@ func TestLoad(t *testing.T) {
 			t.Errorf("expected 10 events, got %d", len(events))
 		}
 	})
+}
+
+// mockRows implements RowScanner for testing rows.Err() error path
+type mockRows struct {
+	index   int
+	data    [][]any
+	scanErr error
+	iterErr error
+	closed  bool
+}
+
+func (m *mockRows) Next() bool {
+	if m.index >= len(m.data) {
+		return false
+	}
+	m.index++
+	return true
+}
+
+func (m *mockRows) Scan(dest ...any) error {
+	if m.scanErr != nil {
+		return m.scanErr
+	}
+	row := m.data[m.index-1]
+	for i, d := range dest {
+		switch ptr := d.(type) {
+		case *int64:
+			*ptr = row[i].(int64)
+		case *string:
+			*ptr = row[i].(string)
+		case *[]byte:
+			*ptr = row[i].([]byte)
+		case *time.Time:
+			*ptr = row[i].(time.Time)
+		}
+	}
+	return nil
+}
+
+func (m *mockRows) Err() error {
+	return m.iterErr
+}
+
+func (m *mockRows) Close() error {
+	m.closed = true
+	return nil
+}
+
+func TestScanEventsRowsErr(t *testing.T) {
+	store, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	// Create mock rows that return an error from Err()
+	mock := &mockRows{
+		data:    [][]any{}, // No data, but Err() will return error
+		iterErr: errors.New("iteration error"),
+	}
+
+	_, err = store.ScanEvents(mock)
+	if err == nil {
+		t.Fatal("expected error from rows.Err()")
+	}
+	if !strings.Contains(err.Error(), "iterate events") {
+		t.Errorf("expected 'iterate events' in error, got: %v", err)
+	}
+	if !mock.closed {
+		t.Error("expected rows to be closed")
+	}
+}
+
+func TestScanEventsScanErr(t *testing.T) {
+	store, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	// Create mock rows that return an error from Scan()
+	mock := &mockRows{
+		data:    [][]any{{int64(1), "test", []byte(`{}`), time.Now()}},
+		scanErr: errors.New("scan error"),
+	}
+
+	_, err = store.ScanEvents(mock)
+	if err == nil {
+		t.Fatal("expected error from Scan()")
+	}
+	if !strings.Contains(err.Error(), "scan event") {
+		t.Errorf("expected 'scan event' in error, got: %v", err)
+	}
+}
+
+func TestLoadDBClosed(t *testing.T) {
+	// Create a store with events
+	store, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// Save some events
+	for i := 0; i < 10; i++ {
+		event := &eventbus.StoredEvent{
+			Type:      "TestEvent",
+			Data:      json.RawMessage(`{"id": 1}`),
+			Timestamp: time.Now(),
+		}
+		if err := store.Save(ctx, event); err != nil {
+			t.Fatalf("failed to save event: %v", err)
+		}
+	}
+
+	// Close the database connection to force error
+	store.GetDB().Close()
+
+	// Now try to load - this should error
+	_, err = store.Load(ctx, 1, -1)
+	if err == nil {
+		t.Fatal("expected error when database is closed")
+	}
 }
 
 func TestGetPosition(t *testing.T) {

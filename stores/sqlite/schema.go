@@ -59,11 +59,17 @@ func migrate(ctx context.Context, db *sql.DB) error {
 }
 
 // migrateV1 applies the initial schema
-func migrateV1(ctx context.Context, db *sql.DB) error {
+func migrateV1(ctx context.Context, db *sql.DB) (err error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
 	}
+
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+		}
+	}()
 
 	// Execute all schema creation in transaction
 	statements := []string{
@@ -74,10 +80,7 @@ func migrateV1(ctx context.Context, db *sql.DB) error {
 	}
 
 	for _, stmt := range statements {
-		if _, err := tx.ExecContext(ctx, stmt); err != nil {
-			if rbErr := tx.Rollback(); rbErr != nil {
-				return fmt.Errorf("exec schema: %w (rollback failed: %v)", err, rbErr)
-			}
+		if _, err = tx.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("exec schema: %w", err)
 		}
 	}
