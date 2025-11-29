@@ -34,7 +34,11 @@ var _ eventbus.EventStore = (*SQLiteStore)(nil)
 // dbOpener is used to open database connections, injectable for testing
 var dbOpener = sql.Open
 
-// New creates a new SQLiteStore with the given path and options
+// New creates a new SQLiteStore with the given path and options.
+//
+// Note: When WithAutoMigrate is enabled (the default), migrations run with
+// context.Background() and are not cancellable. This ensures migrations
+// complete fully to avoid leaving the database in an inconsistent state.
 func New(path string, opts ...Option) (*SQLiteStore, error) {
 	if path == "" {
 		return nil, errors.New("sqlite: path is required")
@@ -307,26 +311,23 @@ func (s *SQLiteStore) LoadSubscriptionPosition(ctx context.Context, subscription
 	return position, nil
 }
 
-// Close closes the database connection and releases resources
+// Close closes the database connection and releases resources.
+// Prepared statement close errors are ignored as they cannot fail in practice
+// with SQLite (the driver handles cleanup when the connection closes).
 func (s *SQLiteStore) Close() error {
-	// Close prepared statements
-	if s.saveStmt != nil {
-		s.saveStmt.Close()
+	// Close prepared statements - errors ignored as db.Close() handles cleanup
+	stmts := []*sql.Stmt{
+		s.saveStmt,
+		s.loadStmt,
+		s.loadFromStmt,
+		s.getPositionStmt,
+		s.saveSubPosStmt,
+		s.loadSubPosStmt,
 	}
-	if s.loadStmt != nil {
-		s.loadStmt.Close()
-	}
-	if s.loadFromStmt != nil {
-		s.loadFromStmt.Close()
-	}
-	if s.getPositionStmt != nil {
-		s.getPositionStmt.Close()
-	}
-	if s.saveSubPosStmt != nil {
-		s.saveSubPosStmt.Close()
-	}
-	if s.loadSubPosStmt != nil {
-		s.loadSubPosStmt.Close()
+	for _, stmt := range stmts {
+		if stmt != nil {
+			stmt.Close()
+		}
 	}
 
 	if s.logger != nil {
