@@ -199,6 +199,13 @@ func (s *SQLiteStore) Load(ctx context.Context, from, to int64) ([]*eventbus.Sto
 		events = append(events, event)
 	}
 
+	if err := rows.Err(); err != nil {
+		if s.metricsHook != nil {
+			s.metricsHook.OnLoad(time.Since(start), len(events), err)
+		}
+		return nil, fmt.Errorf("sqlite: iterate events: %w", err)
+	}
+
 	if s.metricsHook != nil {
 		s.metricsHook.OnLoad(time.Since(start), len(events), nil)
 	}

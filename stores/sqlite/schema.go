@@ -75,7 +75,9 @@ func migrateV1(ctx context.Context, db *sql.DB) error {
 
 	for _, stmt := range statements {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
-			tx.Rollback()
+			if rbErr := tx.Rollback(); rbErr != nil {
+				return fmt.Errorf("exec schema: %w (rollback failed: %v)", err, rbErr)
+			}
 			return fmt.Errorf("exec schema: %w", err)
 		}
 	}
