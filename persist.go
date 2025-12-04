@@ -30,6 +30,11 @@ type EventStore interface {
 
 // EventStoreStreamer is an optional interface for memory-efficient streaming.
 // When implemented, the Replay method will automatically use streaming.
+//
+// Implementation notes:
+//   - Database-backed stores should use cursor-based iteration to minimize memory
+//   - In-memory stores may need to take a snapshot to avoid holding locks during iteration,
+//     trading memory for deadlock safety (see MemoryStore.LoadStream for an example)
 type EventStoreStreamer interface {
 	// LoadStream returns an iterator yielding events in the given range.
 	// Use to=-1 for all events from position (same convention as Load).

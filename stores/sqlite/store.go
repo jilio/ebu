@@ -467,7 +467,7 @@ func (s *SQLiteStore) streamBatched(
 		for rows.Next() {
 			event := &eventbus.StoredEvent{}
 			if err := rows.Scan(&event.Position, &event.Type, &event.Data, &event.Timestamp); err != nil {
-				rows.Close()
+				rows.Close() // Best effort close, scan error takes precedence
 				*iterErr = fmt.Errorf("sqlite: scan event: %w", err)
 				yield(nil, *iterErr)
 				return
@@ -478,12 +478,16 @@ func (s *SQLiteStore) streamBatched(
 			*eventCount++
 
 			if !yield(event, nil) {
-				rows.Close()
+				rows.Close() // Best effort close on early termination
 				return
 			}
 		}
 
-		rows.Close()
+		if err := rows.Close(); err != nil {
+			*iterErr = fmt.Errorf("sqlite: close rows: %w", err)
+			yield(nil, *iterErr)
+			return
+		}
 
 		// If we got fewer rows than batch size, we're done
 		if batchCount < batchSize {
