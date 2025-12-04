@@ -461,31 +461,8 @@ func (s *SQLiteStore) streamBatched(
 			return
 		}
 
-		batchCount := 0
-		var lastPos int64
-
-		for rows.Next() {
-			event := &eventbus.StoredEvent{}
-			if err := rows.Scan(&event.Position, &event.Type, &event.Data, &event.Timestamp); err != nil {
-				rows.Close() // Best effort close, scan error takes precedence
-				*iterErr = fmt.Errorf("sqlite: scan event: %w", err)
-				yield(nil, *iterErr)
-				return
-			}
-
-			lastPos = event.Position
-			batchCount++
-			*eventCount++
-
-			if !yield(event, nil) {
-				rows.Close() // Best effort close on early termination
-				return
-			}
-		}
-
-		if err := rows.Close(); err != nil {
-			*iterErr = fmt.Errorf("sqlite: close rows: %w", err)
-			yield(nil, *iterErr)
+		batchCount, lastPos, cont := s.streamBatch(rows, eventCount, iterErr, yield)
+		if !cont {
 			return
 		}
 
@@ -501,4 +478,40 @@ func (s *SQLiteStore) streamBatched(
 	if s.logger != nil {
 		s.logger.Debug("streamed events (batched)", "from", from, "to", to, "count", *eventCount, "batchSize", batchSize)
 	}
+}
+
+// streamBatch processes a single batch of rows. Returns (batchCount, lastPos, shouldContinue).
+// shouldContinue is false if iteration should stop (error or early termination).
+func (s *SQLiteStore) streamBatch(
+	rows rowScanner,
+	eventCount *int,
+	iterErr *error,
+	yield func(*eventbus.StoredEvent, error) bool,
+) (batchCount int, lastPos int64, cont bool) {
+	for rows.Next() {
+		event := &eventbus.StoredEvent{}
+		if err := rows.Scan(&event.Position, &event.Type, &event.Data, &event.Timestamp); err != nil {
+			rows.Close() // Best effort close, scan error takes precedence
+			*iterErr = fmt.Errorf("sqlite: scan event: %w", err)
+			yield(nil, *iterErr)
+			return 0, 0, false
+		}
+
+		lastPos = event.Position
+		batchCount++
+		*eventCount++
+
+		if !yield(event, nil) {
+			rows.Close() // Best effort close on early termination
+			return batchCount, lastPos, false
+		}
+	}
+
+	if err := rows.Close(); err != nil {
+		*iterErr = fmt.Errorf("sqlite: close rows: %w", err)
+		yield(nil, *iterErr)
+		return batchCount, lastPos, false
+	}
+
+	return batchCount, lastPos, true
 }

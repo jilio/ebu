@@ -287,11 +287,12 @@ func TestLoad(t *testing.T) {
 
 // mockRows implements RowScanner for testing rows.Err() error path
 type mockRows struct {
-	index   int
-	data    [][]any
-	scanErr error
-	iterErr error
-	closed  bool
+	index    int
+	data     [][]any
+	scanErr  error
+	iterErr  error
+	closeErr error
+	closed   bool
 }
 
 func (m *mockRows) Next() bool {
@@ -328,7 +329,7 @@ func (m *mockRows) Err() error {
 
 func (m *mockRows) Close() error {
 	m.closed = true
-	return nil
+	return m.closeErr
 }
 
 func TestScanEventsRowsErr(t *testing.T) {
@@ -2233,5 +2234,64 @@ func TestStreamRowsEarlyTermination(t *testing.T) {
 	}
 	if !mock.closed {
 		t.Error("expected rows to be closed after early termination")
+	}
+}
+
+func TestStreamBatchCloseErr(t *testing.T) {
+	store, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	// Create mock rows that return an error from Close()
+	mock := &mockRows{
+		data: [][]any{
+			{int64(1), "test", []byte(`{}`), time.Now()},
+		},
+		closeErr: errors.New("close error"),
+	}
+
+	var eventCount int
+	var iterErr error
+	var gotError bool
+	var receivedCount int
+
+	batchCount, lastPos, cont := store.StreamBatch(mock, &eventCount, &iterErr, func(event *eventbus.StoredEvent, err error) bool {
+		if err != nil {
+			gotError = true
+			return false
+		}
+		receivedCount++
+		return true
+	})
+
+	// Should have processed the event before Close error
+	if receivedCount != 1 {
+		t.Errorf("expected 1 event received, got %d", receivedCount)
+	}
+
+	// Should have returned the close error
+	if !gotError {
+		t.Error("expected error from rows.Close()")
+	}
+	if iterErr == nil {
+		t.Error("expected iterErr to be set")
+	}
+	if !strings.Contains(iterErr.Error(), "close rows") {
+		t.Errorf("expected 'close rows' in error, got: %v", iterErr)
+	}
+
+	// cont should be false due to error
+	if cont {
+		t.Error("expected cont to be false due to close error")
+	}
+
+	// batchCount and lastPos should reflect what was processed
+	if batchCount != 1 {
+		t.Errorf("expected batchCount 1, got %d", batchCount)
+	}
+	if lastPos != 1 {
+		t.Errorf("expected lastPos 1, got %d", lastPos)
 	}
 }
