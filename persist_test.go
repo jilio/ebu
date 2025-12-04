@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"iter"
 	"reflect"
 	"strings"
 	"sync"
@@ -1160,5 +1161,372 @@ func TestWithStoreContextHookChaining(t *testing.T) {
 	}
 	if len(events) != 1 {
 		t.Errorf("expected 1 event, got %d", len(events))
+	}
+}
+
+// TestMemoryStoreLoadStream tests the LoadStream implementation
+func TestMemoryStoreLoadStream(t *testing.T) {
+	store := NewMemoryStore()
+	ctx := context.Background()
+
+	// Save test events
+	for i := 1; i <= 5; i++ {
+		event := &StoredEvent{
+			Position:  int64(i),
+			Type:      "TestEvent",
+			Data:      []byte(fmt.Sprintf(`{"id": %d}`, i)),
+			Timestamp: time.Now(),
+		}
+		store.Save(ctx, event)
+	}
+
+	t.Run("streams all events from position", func(t *testing.T) {
+		var received []*StoredEvent
+		for event, err := range store.LoadStream(ctx, 1, -1) {
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			received = append(received, event)
+		}
+
+		if len(received) != 5 {
+			t.Errorf("expected 5 events, got %d", len(received))
+		}
+	})
+
+	t.Run("streams events with upper bound", func(t *testing.T) {
+		var received []*StoredEvent
+		for event, err := range store.LoadStream(ctx, 2, 4) {
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			received = append(received, event)
+		}
+
+		if len(received) != 3 {
+			t.Errorf("expected 3 events, got %d", len(received))
+		}
+		if received[0].Position != 2 {
+			t.Errorf("expected first position 2, got %d", received[0].Position)
+		}
+		if received[2].Position != 4 {
+			t.Errorf("expected last position 4, got %d", received[2].Position)
+		}
+	})
+
+	t.Run("streams events from middle position", func(t *testing.T) {
+		var received []*StoredEvent
+		for event, err := range store.LoadStream(ctx, 3, -1) {
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			received = append(received, event)
+		}
+
+		if len(received) != 3 {
+			t.Errorf("expected 3 events, got %d", len(received))
+		}
+		if received[0].Position != 3 {
+			t.Errorf("expected first position 3, got %d", received[0].Position)
+		}
+	})
+
+	t.Run("handles early termination", func(t *testing.T) {
+		count := 0
+		for event, err := range store.LoadStream(ctx, 1, -1) {
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			count++
+			if event.Position == 2 {
+				break // Early termination
+			}
+		}
+
+		if count != 2 {
+			t.Errorf("expected 2 events before break, got %d", count)
+		}
+	})
+
+	t.Run("handles context cancellation", func(t *testing.T) {
+		cancelCtx, cancel := context.WithCancel(ctx)
+		cancel() // Cancel immediately
+
+		var gotError bool
+		for _, err := range store.LoadStream(cancelCtx, 1, -1) {
+			if err != nil {
+				gotError = true
+				if !errors.Is(err, context.Canceled) {
+					t.Errorf("expected context.Canceled, got: %v", err)
+				}
+				break
+			}
+		}
+
+		if !gotError {
+			t.Error("expected context cancellation error")
+		}
+	})
+
+	t.Run("returns empty for out of range", func(t *testing.T) {
+		count := 0
+		for _, err := range store.LoadStream(ctx, 100, -1) {
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			count++
+		}
+
+		if count != 0 {
+			t.Errorf("expected 0 events, got %d", count)
+		}
+	})
+}
+
+// TestEventStoreStreamerInterface verifies interface compliance
+func TestEventStoreStreamerInterface(t *testing.T) {
+	var store EventStore = NewMemoryStore()
+
+	// Type assertion to EventStoreStreamer
+	streamer, ok := store.(EventStoreStreamer)
+	if !ok {
+		t.Fatal("MemoryStore should implement EventStoreStreamer")
+	}
+
+	// Verify it works
+	ctx := context.Background()
+	for _, err := range streamer.LoadStream(ctx, 0, -1) {
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+}
+
+// TestReplayUsesStreaming tests that Replay auto-detects and uses LoadStream
+func TestReplayUsesStreaming(t *testing.T) {
+	store := NewMemoryStore()
+	bus := New(WithStore(store))
+
+	// Publish events
+	for i := 1; i <= 5; i++ {
+		Publish(bus, TestEvent{ID: i})
+	}
+
+	// Replay should use streaming internally (MemoryStore implements EventStoreStreamer)
+	var replayed []int
+	ctx := context.Background()
+	err := bus.Replay(ctx, 2, func(event *StoredEvent) error {
+		replayed = append(replayed, int(event.Position))
+		return nil
+	})
+
+	if err != nil {
+		t.Fatalf("Replay failed: %v", err)
+	}
+
+	// Should replay events 2, 3, 4, 5
+	if len(replayed) != 4 {
+		t.Errorf("Expected 4 replayed events, got %d", len(replayed))
+	}
+
+	for i, pos := range replayed {
+		expected := i + 2
+		if pos != expected {
+			t.Errorf("Expected position %d, got %d", expected, pos)
+		}
+	}
+}
+
+// streamingErrorStore is a store that implements EventStoreStreamer but returns errors
+type streamingErrorStore struct {
+	errorStore
+}
+
+func (s *streamingErrorStore) LoadStream(ctx context.Context, from, to int64) iter.Seq2[*StoredEvent, error] {
+	return func(yield func(*StoredEvent, error) bool) {
+		yield(nil, errors.New("stream error"))
+	}
+}
+
+// TestReplayWithStreamingError tests error handling when LoadStream returns an error
+func TestReplayWithStreamingError(t *testing.T) {
+	store := &streamingErrorStore{}
+	bus := New(WithStore(store))
+
+	ctx := context.Background()
+	err := bus.Replay(ctx, 1, func(event *StoredEvent) error {
+		return nil
+	})
+
+	if err == nil {
+		t.Error("Expected error from Replay when LoadStream fails")
+	}
+
+	if !strings.Contains(err.Error(), "stream events") {
+		t.Errorf("Expected 'stream events' in error, got: %v", err)
+	}
+}
+
+// nonStreamingStore is a store that does NOT implement EventStoreStreamer
+type nonStreamingStore struct {
+	errorStore
+}
+
+// TestReplayFallsBackToLoad tests that Replay falls back to Load for non-streaming stores
+func TestReplayFallsBackToLoad(t *testing.T) {
+	store := &nonStreamingStore{}
+	bus := New(WithStore(store))
+
+	ctx := context.Background()
+	err := bus.Replay(ctx, 1, func(event *StoredEvent) error {
+		return nil
+	})
+
+	// Should succeed with empty result since Load returns empty slice
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+}
+
+// TestReplayStreamingHandlerError tests handler error when using streaming
+func TestReplayStreamingHandlerError(t *testing.T) {
+	store := NewMemoryStore()
+	bus := New(WithStore(store))
+
+	// Publish events
+	for i := 1; i <= 3; i++ {
+		Publish(bus, TestEvent{ID: i})
+	}
+
+	ctx := context.Background()
+	handlerErr := errors.New("handler failed")
+	err := bus.Replay(ctx, 1, func(event *StoredEvent) error {
+		if event.Position == 2 {
+			return handlerErr
+		}
+		return nil
+	})
+
+	if err == nil {
+		t.Error("Expected error from Replay when handler fails")
+	}
+
+	if !strings.Contains(err.Error(), "handle event at position 2") {
+		t.Errorf("Expected 'handle event at position 2' in error, got: %v", err)
+	}
+}
+
+// nonStreamingStoreWithEvents returns events for testing fallback path
+type nonStreamingStoreWithEvents struct {
+	events []*StoredEvent
+}
+
+func (s *nonStreamingStoreWithEvents) Save(ctx context.Context, event *StoredEvent) error {
+	event.Position = int64(len(s.events)) + 1
+	s.events = append(s.events, event)
+	return nil
+}
+
+func (s *nonStreamingStoreWithEvents) Load(ctx context.Context, from, to int64) ([]*StoredEvent, error) {
+	var result []*StoredEvent
+	for _, e := range s.events {
+		if e.Position >= from && (to == -1 || e.Position <= to) {
+			result = append(result, e)
+		}
+	}
+	return result, nil
+}
+
+func (s *nonStreamingStoreWithEvents) GetPosition(ctx context.Context) (int64, error) {
+	if len(s.events) == 0 {
+		return 0, nil
+	}
+	return s.events[len(s.events)-1].Position, nil
+}
+
+func (s *nonStreamingStoreWithEvents) SaveSubscriptionPosition(ctx context.Context, subscriptionID string, position int64) error {
+	return nil
+}
+
+func (s *nonStreamingStoreWithEvents) LoadSubscriptionPosition(ctx context.Context, subscriptionID string) (int64, error) {
+	return 0, nil
+}
+
+// TestReplayNonStreamingHandlerError tests handler error for non-streaming stores
+func TestReplayNonStreamingHandlerError(t *testing.T) {
+	store := &nonStreamingStoreWithEvents{}
+	bus := New(WithStore(store))
+
+	// Save events directly to the store
+	ctx := context.Background()
+	for i := 1; i <= 3; i++ {
+		event := &StoredEvent{
+			Type:      "TestEvent",
+			Data:      []byte(fmt.Sprintf(`{"id": %d}`, i)),
+			Timestamp: time.Now(),
+		}
+		store.Save(ctx, event)
+	}
+	// Update bus store position
+	bus.storeMu.Lock()
+	bus.storePosition = 3
+	bus.storeMu.Unlock()
+
+	handlerErr := errors.New("handler failed")
+	err := bus.Replay(ctx, 1, func(event *StoredEvent) error {
+		if event.Position == 2 {
+			return handlerErr
+		}
+		return nil
+	})
+
+	if err == nil {
+		t.Error("Expected error from Replay when handler fails")
+	}
+
+	if !strings.Contains(err.Error(), "handle event at position 2") {
+		t.Errorf("Expected 'handle event at position 2' in error, got: %v", err)
+	}
+}
+
+// nonStreamingStoreWithLoadError returns error on Load
+type nonStreamingStoreWithLoadError struct{}
+
+func (s *nonStreamingStoreWithLoadError) Save(ctx context.Context, event *StoredEvent) error {
+	return nil
+}
+
+func (s *nonStreamingStoreWithLoadError) Load(ctx context.Context, from, to int64) ([]*StoredEvent, error) {
+	return nil, errors.New("load failed")
+}
+
+func (s *nonStreamingStoreWithLoadError) GetPosition(ctx context.Context) (int64, error) {
+	return 5, nil // Return non-zero so Replay tries to load
+}
+
+func (s *nonStreamingStoreWithLoadError) SaveSubscriptionPosition(ctx context.Context, subscriptionID string, position int64) error {
+	return nil
+}
+
+func (s *nonStreamingStoreWithLoadError) LoadSubscriptionPosition(ctx context.Context, subscriptionID string) (int64, error) {
+	return 0, nil
+}
+
+// TestReplayNonStreamingLoadError tests Load error for non-streaming stores
+func TestReplayNonStreamingLoadError(t *testing.T) {
+	store := &nonStreamingStoreWithLoadError{}
+	bus := New(WithStore(store))
+
+	ctx := context.Background()
+	err := bus.Replay(ctx, 1, func(event *StoredEvent) error {
+		return nil
+	})
+
+	if err == nil {
+		t.Error("Expected error from Replay when Load fails")
+	}
+
+	if !strings.Contains(err.Error(), "load events") {
+		t.Errorf("Expected 'load events' in error, got: %v", err)
 	}
 }

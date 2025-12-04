@@ -3,6 +3,8 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+
+	eventbus "github.com/jilio/ebu"
 )
 
 // RunMigrate runs migration on a database (exported for testing)
@@ -51,4 +53,28 @@ func (s *SQLiteStore) ScanEvents(rows RowScanner) ([]any, error) {
 		result[i] = e
 	}
 	return result, nil
+}
+
+// StreamRowsYieldFunc is the yield function type for StreamRows
+type StreamRowsYieldFunc = func(*eventbus.StoredEvent, error) bool
+
+// StreamRows exposes streamRows for testing error paths
+func (s *SQLiteStore) StreamRows(
+	ctx context.Context,
+	rows RowScanner,
+	eventCount *int,
+	iterErr *error,
+	yield StreamRowsYieldFunc,
+) {
+	s.streamRows(ctx, rows, eventCount, iterErr, yield)
+}
+
+// StreamBatch exposes streamBatch for testing error paths (e.g., rows.Close() error)
+func (s *SQLiteStore) StreamBatch(
+	rows RowScanner,
+	eventCount *int,
+	iterErr *error,
+	yield StreamRowsYieldFunc,
+) (batchCount int, lastPos int64, cont bool) {
+	return s.streamBatch(rows, eventCount, iterErr, yield)
 }

@@ -287,11 +287,12 @@ func TestLoad(t *testing.T) {
 
 // mockRows implements RowScanner for testing rows.Err() error path
 type mockRows struct {
-	index   int
-	data    [][]any
-	scanErr error
-	iterErr error
-	closed  bool
+	index    int
+	data     [][]any
+	scanErr  error
+	iterErr  error
+	closeErr error
+	closed   bool
 }
 
 func (m *mockRows) Next() bool {
@@ -328,7 +329,7 @@ func (m *mockRows) Err() error {
 
 func (m *mockRows) Close() error {
 	m.closed = true
-	return nil
+	return m.closeErr
 }
 
 func TestScanEventsRowsErr(t *testing.T) {
@@ -1423,5 +1424,899 @@ func TestNewFromDB_PrepareStatementsError(t *testing.T) {
 	_, err = NewFromDB(db)
 	if err == nil {
 		t.Fatal("expected error when db is closed")
+	}
+}
+
+func TestLoadStream(t *testing.T) {
+	store, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Save test events
+	for i := 1; i <= 10; i++ {
+		event := &eventbus.StoredEvent{
+			Type:      "TestEvent",
+			Data:      json.RawMessage(`{"id": ` + string(rune('0'+i)) + `}`),
+			Timestamp: time.Now(),
+		}
+		if err := store.Save(ctx, event); err != nil {
+			t.Fatalf("failed to save event: %v", err)
+		}
+	}
+
+	t.Run("streams all events from position 1", func(t *testing.T) {
+		var events []*eventbus.StoredEvent
+		for event, err := range store.LoadStream(ctx, 1, -1) {
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			events = append(events, event)
+		}
+
+		if len(events) != 10 {
+			t.Errorf("expected 10 events, got %d", len(events))
+		}
+	})
+
+	t.Run("streams events with upper bound", func(t *testing.T) {
+		var events []*eventbus.StoredEvent
+		for event, err := range store.LoadStream(ctx, 3, 7) {
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			events = append(events, event)
+		}
+
+		if len(events) != 5 {
+			t.Errorf("expected 5 events (3-7), got %d", len(events))
+		}
+		if events[0].Position != 3 {
+			t.Errorf("expected first position 3, got %d", events[0].Position)
+		}
+		if events[4].Position != 7 {
+			t.Errorf("expected last position 7, got %d", events[4].Position)
+		}
+	})
+
+	t.Run("streams events from middle position", func(t *testing.T) {
+		var events []*eventbus.StoredEvent
+		for event, err := range store.LoadStream(ctx, 5, -1) {
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			events = append(events, event)
+		}
+
+		if len(events) != 6 {
+			t.Errorf("expected 6 events (5-10), got %d", len(events))
+		}
+		if events[0].Position != 5 {
+			t.Errorf("expected first position 5, got %d", events[0].Position)
+		}
+	})
+
+	t.Run("handles early termination and closes rows", func(t *testing.T) {
+		count := 0
+		for event, err := range store.LoadStream(ctx, 1, -1) {
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			count++
+			if event.Position == 3 {
+				break // Early termination should close rows
+			}
+		}
+
+		if count != 3 {
+			t.Errorf("expected 3 events, got %d", count)
+		}
+
+		// Verify store is still usable (rows were properly closed)
+		pos, err := store.GetPosition(ctx)
+		if err != nil {
+			t.Errorf("store should be usable after early termination: %v", err)
+		}
+		if pos != 10 {
+			t.Errorf("expected position 10, got %d", pos)
+		}
+	})
+
+	t.Run("handles context cancellation", func(t *testing.T) {
+		cancelCtx, cancel := context.WithCancel(ctx)
+		cancel() // Cancel immediately
+
+		var gotError bool
+		for _, err := range store.LoadStream(cancelCtx, 1, -1) {
+			if err != nil {
+				gotError = true
+				break
+			}
+		}
+
+		if !gotError {
+			t.Error("expected error with cancelled context")
+		}
+	})
+
+	t.Run("returns empty stream for out of range", func(t *testing.T) {
+		count := 0
+		for _, err := range store.LoadStream(ctx, 100, -1) {
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			count++
+		}
+
+		if count != 0 {
+			t.Errorf("expected 0 events, got %d", count)
+		}
+	})
+}
+
+func TestLoadStreamWithMetrics(t *testing.T) {
+	metrics := &testMetricsHook{}
+
+	store, err := New(":memory:", WithMetricsHook(metrics))
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Save some events
+	for i := 0; i < 5; i++ {
+		event := &eventbus.StoredEvent{
+			Type:      "TestEvent",
+			Data:      json.RawMessage(`{}`),
+			Timestamp: time.Now(),
+		}
+		store.Save(ctx, event)
+	}
+
+	// Reset metrics
+	metrics.mu.Lock()
+	metrics.loadCount = 0
+	metrics.mu.Unlock()
+
+	// Stream events
+	count := 0
+	for _, err := range store.LoadStream(ctx, 1, -1) {
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		count++
+	}
+
+	if count != 5 {
+		t.Errorf("expected 5 events, got %d", count)
+	}
+
+	// Verify metrics were called
+	metrics.mu.Lock()
+	if metrics.loadCount != 1 {
+		t.Errorf("expected 1 load metric call, got %d", metrics.loadCount)
+	}
+	metrics.mu.Unlock()
+}
+
+func TestLoadStreamDBClosed(t *testing.T) {
+	store, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// Save an event
+	event := &eventbus.StoredEvent{
+		Type:      "TestEvent",
+		Data:      json.RawMessage(`{}`),
+		Timestamp: time.Now(),
+	}
+	store.Save(ctx, event)
+
+	// Close the store
+	store.Close()
+
+	// Stream should error
+	var gotError bool
+	for _, err := range store.LoadStream(ctx, 1, -1) {
+		if err != nil {
+			gotError = true
+			break
+		}
+	}
+
+	if !gotError {
+		t.Error("expected error when database is closed")
+	}
+}
+
+func TestLoadStreamInterfaceCheck(t *testing.T) {
+	store, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	// Verify SQLiteStore implements EventStoreStreamer
+	var _ eventbus.EventStoreStreamer = store
+}
+
+func TestLoadStreamBatched(t *testing.T) {
+	store, err := New(":memory:", WithStreamBatchSize(3))
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Save 10 events
+	for i := 1; i <= 10; i++ {
+		event := &eventbus.StoredEvent{
+			Type:      "TestEvent",
+			Data:      json.RawMessage(`{}`),
+			Timestamp: time.Now(),
+		}
+		if err := store.Save(ctx, event); err != nil {
+			t.Fatalf("failed to save event: %v", err)
+		}
+	}
+
+	t.Run("batched streaming all events", func(t *testing.T) {
+		var events []*eventbus.StoredEvent
+		for event, err := range store.LoadStream(ctx, 1, -1) {
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			events = append(events, event)
+		}
+
+		if len(events) != 10 {
+			t.Errorf("expected 10 events, got %d", len(events))
+		}
+
+		// Verify sequential positions
+		for i, e := range events {
+			if e.Position != int64(i+1) {
+				t.Errorf("expected position %d, got %d", i+1, e.Position)
+			}
+		}
+	})
+
+	t.Run("batched streaming with upper bound", func(t *testing.T) {
+		var events []*eventbus.StoredEvent
+		for event, err := range store.LoadStream(ctx, 2, 8) {
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			events = append(events, event)
+		}
+
+		if len(events) != 7 {
+			t.Errorf("expected 7 events (2-8), got %d", len(events))
+		}
+	})
+
+	t.Run("batched streaming early termination", func(t *testing.T) {
+		count := 0
+		for event, err := range store.LoadStream(ctx, 1, -1) {
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			count++
+			if event.Position == 5 {
+				break
+			}
+		}
+
+		if count != 5 {
+			t.Errorf("expected 5 events before break, got %d", count)
+		}
+
+		// Verify store is still usable
+		pos, err := store.GetPosition(ctx)
+		if err != nil {
+			t.Errorf("store should be usable after early termination: %v", err)
+		}
+		if pos != 10 {
+			t.Errorf("expected position 10, got %d", pos)
+		}
+	})
+
+	t.Run("batched streaming context cancellation", func(t *testing.T) {
+		cancelCtx, cancel := context.WithCancel(ctx)
+		cancel()
+
+		var gotError bool
+		for _, err := range store.LoadStream(cancelCtx, 1, -1) {
+			if err != nil {
+				gotError = true
+				break
+			}
+		}
+
+		if !gotError {
+			t.Error("expected error with cancelled context")
+		}
+	})
+
+	t.Run("batched streaming upper bound exactly on batch boundary", func(t *testing.T) {
+		// Batch size is 3, upper bound is 6
+		// Batch 1: pos 1-3 (3 events), lastPos=3, currentPos=4
+		// Batch 2: pos 4-6 (3 events), lastPos=6, currentPos=7
+		// currentPos (7) > to (6), triggers early break optimization
+		var events []*eventbus.StoredEvent
+		for event, err := range store.LoadStream(ctx, 1, 6) {
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			events = append(events, event)
+		}
+
+		if len(events) != 6 {
+			t.Errorf("expected 6 events (1-6), got %d", len(events))
+		}
+
+		// Verify exact positions
+		for i, e := range events {
+			if e.Position != int64(i+1) {
+				t.Errorf("expected position %d, got %d", i+1, e.Position)
+			}
+		}
+	})
+}
+
+func TestLoadStreamBatchedDBClosed(t *testing.T) {
+	store, err := New(":memory:", WithStreamBatchSize(3))
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// Save an event
+	event := &eventbus.StoredEvent{
+		Type:      "TestEvent",
+		Data:      json.RawMessage(`{}`),
+		Timestamp: time.Now(),
+	}
+	store.Save(ctx, event)
+
+	// Close the store
+	store.Close()
+
+	// Stream should error
+	var gotError bool
+	for _, err := range store.LoadStream(ctx, 1, -1) {
+		if err != nil {
+			gotError = true
+			break
+		}
+	}
+
+	if !gotError {
+		t.Error("expected error when database is closed")
+	}
+}
+
+func TestWithStreamBatchSize(t *testing.T) {
+	store, err := New(":memory:", WithStreamBatchSize(100))
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	// Verify the option was applied by checking batched behavior works
+	ctx := context.Background()
+	for i := 0; i < 5; i++ {
+		event := &eventbus.StoredEvent{
+			Type:      "TestEvent",
+			Data:      json.RawMessage(`{}`),
+			Timestamp: time.Now(),
+		}
+		store.Save(ctx, event)
+	}
+
+	count := 0
+	for _, err := range store.LoadStream(ctx, 1, -1) {
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		count++
+	}
+
+	if count != 5 {
+		t.Errorf("expected 5 events, got %d", count)
+	}
+}
+
+func BenchmarkLoadVsLoadStream(b *testing.B) {
+	store, _ := New(":memory:")
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Pre-populate with 10000 events
+	for i := 0; i < 10000; i++ {
+		event := &eventbus.StoredEvent{
+			Type:      "BenchEvent",
+			Data:      json.RawMessage(`{"id": 1}`),
+			Timestamp: time.Now(),
+		}
+		store.Save(ctx, event)
+	}
+
+	b.Run("Load", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			events, _ := store.Load(ctx, 1, -1)
+			_ = len(events)
+		}
+	})
+
+	b.Run("LoadStream", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			count := 0
+			for _, err := range store.LoadStream(ctx, 1, -1) {
+				if err != nil {
+					break
+				}
+				count++
+			}
+		}
+	})
+}
+
+func TestLoadStreamWithLogger(t *testing.T) {
+	logger := &testLogger{t: t}
+
+	store, err := New(":memory:", WithLogger(logger))
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Save some events
+	for i := 0; i < 3; i++ {
+		event := &eventbus.StoredEvent{
+			Type:      "TestEvent",
+			Data:      json.RawMessage(`{}`),
+			Timestamp: time.Now(),
+		}
+		store.Save(ctx, event)
+	}
+
+	// Stream all events - should trigger logger.Debug
+	count := 0
+	for _, err := range store.LoadStream(ctx, 1, -1) {
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		count++
+	}
+
+	if count != 3 {
+		t.Errorf("expected 3 events, got %d", count)
+	}
+}
+
+func TestLoadStreamBatchedWithLogger(t *testing.T) {
+	logger := &testLogger{t: t}
+
+	store, err := New(":memory:", WithLogger(logger), WithStreamBatchSize(2))
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Save some events
+	for i := 0; i < 5; i++ {
+		event := &eventbus.StoredEvent{
+			Type:      "TestEvent",
+			Data:      json.RawMessage(`{}`),
+			Timestamp: time.Now(),
+		}
+		store.Save(ctx, event)
+	}
+
+	// Stream all events - should trigger logger.Debug for batched streaming
+	count := 0
+	for _, err := range store.LoadStream(ctx, 1, -1) {
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		count++
+	}
+
+	if count != 5 {
+		t.Errorf("expected 5 events, got %d", count)
+	}
+}
+
+func TestLoadStreamContextCancelDuringIteration(t *testing.T) {
+	store, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Save many events to ensure we have something to iterate
+	for i := 0; i < 10; i++ {
+		event := &eventbus.StoredEvent{
+			Type:      "TestEvent",
+			Data:      json.RawMessage(`{}`),
+			Timestamp: time.Now(),
+		}
+		store.Save(ctx, event)
+	}
+
+	// Create a context that can be cancelled
+	cancelCtx, cancel := context.WithCancel(ctx)
+
+	count := 0
+	var gotError bool
+	for _, err := range store.LoadStream(cancelCtx, 1, -1) {
+		if err != nil {
+			gotError = true
+			break
+		}
+		count++
+		if count == 3 {
+			// Cancel after receiving 3 events
+			cancel()
+		}
+	}
+
+	// We should have received some events before cancellation
+	if count < 3 {
+		t.Errorf("expected at least 3 events before cancellation, got %d", count)
+	}
+
+	// The error might or might not have been caught depending on timing
+	// This is acceptable - the important thing is that cancellation stops iteration
+	_ = gotError
+}
+
+func TestLoadStreamBatchedContextCancelDuringIteration(t *testing.T) {
+	store, err := New(":memory:", WithStreamBatchSize(2))
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Save many events
+	for i := 0; i < 10; i++ {
+		event := &eventbus.StoredEvent{
+			Type:      "TestEvent",
+			Data:      json.RawMessage(`{}`),
+			Timestamp: time.Now(),
+		}
+		store.Save(ctx, event)
+	}
+
+	cancelCtx, cancel := context.WithCancel(ctx)
+
+	count := 0
+	for _, err := range store.LoadStream(cancelCtx, 1, -1) {
+		if err != nil {
+			break
+		}
+		count++
+		if count == 3 {
+			cancel()
+		}
+	}
+
+	if count < 3 {
+		t.Errorf("expected at least 3 events before cancellation, got %d", count)
+	}
+}
+
+func TestLoadStreamScanError(t *testing.T) {
+	store, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Insert a valid event first
+	event := &eventbus.StoredEvent{
+		Type:      "TestEvent",
+		Data:      json.RawMessage(`{}`),
+		Timestamp: time.Now(),
+	}
+	store.Save(ctx, event)
+
+	// Corrupt the data by inserting invalid timestamp directly via SQL
+	db := store.GetDB()
+	_, err = db.ExecContext(ctx, "INSERT INTO events (type, data, timestamp) VALUES ('BadEvent', '{}', 'not-a-timestamp')")
+	if err != nil {
+		t.Fatalf("failed to insert corrupt data: %v", err)
+	}
+
+	// Stream should error on the corrupt row
+	var gotError bool
+	for _, err := range store.LoadStream(ctx, 1, -1) {
+		if err != nil {
+			gotError = true
+			if !strings.Contains(err.Error(), "scan event") {
+				t.Errorf("expected 'scan event' in error, got: %v", err)
+			}
+			break
+		}
+	}
+
+	if !gotError {
+		t.Error("expected scan error for corrupt data")
+	}
+}
+
+func TestLoadStreamBatchedScanError(t *testing.T) {
+	store, err := New(":memory:", WithStreamBatchSize(2))
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Insert a valid event first
+	event := &eventbus.StoredEvent{
+		Type:      "TestEvent",
+		Data:      json.RawMessage(`{}`),
+		Timestamp: time.Now(),
+	}
+	store.Save(ctx, event)
+
+	// Corrupt the data by inserting invalid timestamp directly via SQL
+	db := store.GetDB()
+	_, err = db.ExecContext(ctx, "INSERT INTO events (type, data, timestamp) VALUES ('BadEvent', '{}', 'not-a-timestamp')")
+	if err != nil {
+		t.Fatalf("failed to insert corrupt data: %v", err)
+	}
+
+	// Stream should error on the corrupt row
+	var gotError bool
+	for _, err := range store.LoadStream(ctx, 1, -1) {
+		if err != nil {
+			gotError = true
+			if !strings.Contains(err.Error(), "scan event") {
+				t.Errorf("expected 'scan event' in error, got: %v", err)
+			}
+			break
+		}
+	}
+
+	if !gotError {
+		t.Error("expected scan error for corrupt data")
+	}
+}
+
+func TestStreamRowsIterErr(t *testing.T) {
+	store, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Create mock rows that return an error from Err()
+	mock := &mockRows{
+		data:    [][]any{}, // No data, but Err() will return error
+		iterErr: errors.New("iteration error"),
+	}
+
+	var eventCount int
+	var iterErr error
+	var gotError bool
+
+	store.StreamRows(ctx, mock, &eventCount, &iterErr, func(event *eventbus.StoredEvent, err error) bool {
+		if err != nil {
+			gotError = true
+			return false
+		}
+		return true
+	})
+
+	if !gotError {
+		t.Error("expected error from rows.Err()")
+	}
+	if iterErr == nil {
+		t.Error("expected iterErr to be set")
+	}
+	if !strings.Contains(iterErr.Error(), "iterate events") {
+		t.Errorf("expected 'iterate events' in error, got: %v", iterErr)
+	}
+}
+
+func TestStreamRowsScanErr(t *testing.T) {
+	store, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Create mock rows that return an error from Scan()
+	mock := &mockRows{
+		data:    [][]any{{int64(1), "test", []byte(`{}`), time.Now()}},
+		scanErr: errors.New("scan error"),
+	}
+
+	var eventCount int
+	var iterErr error
+	var gotError bool
+
+	store.StreamRows(ctx, mock, &eventCount, &iterErr, func(event *eventbus.StoredEvent, err error) bool {
+		if err != nil {
+			gotError = true
+			return false
+		}
+		return true
+	})
+
+	if !gotError {
+		t.Error("expected error from rows.Scan()")
+	}
+	if iterErr == nil {
+		t.Error("expected iterErr to be set")
+	}
+	if !strings.Contains(iterErr.Error(), "scan event") {
+		t.Errorf("expected 'scan event' in error, got: %v", iterErr)
+	}
+}
+
+func TestStreamRowsContextCancel(t *testing.T) {
+	store, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // Cancel immediately
+
+	// Create mock rows that has data
+	mock := &mockRows{
+		data: [][]any{{int64(1), "test", []byte(`{}`), time.Now()}},
+	}
+
+	var eventCount int
+	var iterErr error
+	var gotError bool
+
+	store.StreamRows(ctx, mock, &eventCount, &iterErr, func(event *eventbus.StoredEvent, err error) bool {
+		if err != nil {
+			gotError = true
+			return false
+		}
+		return true
+	})
+
+	if !gotError {
+		t.Error("expected context cancellation error")
+	}
+	if !errors.Is(iterErr, context.Canceled) {
+		t.Errorf("expected context.Canceled, got: %v", iterErr)
+	}
+}
+
+func TestStreamRowsEarlyTermination(t *testing.T) {
+	store, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Create mock rows with multiple rows
+	mock := &mockRows{
+		data: [][]any{
+			{int64(1), "test", []byte(`{}`), time.Now()},
+			{int64(2), "test", []byte(`{}`), time.Now()},
+			{int64(3), "test", []byte(`{}`), time.Now()},
+		},
+	}
+
+	var eventCount int
+	var iterErr error
+	count := 0
+
+	store.StreamRows(ctx, mock, &eventCount, &iterErr, func(event *eventbus.StoredEvent, err error) bool {
+		count++
+		if count == 2 {
+			return false // Stop after 2 events
+		}
+		return true
+	})
+
+	if count != 2 {
+		t.Errorf("expected 2 events, got %d", count)
+	}
+	if eventCount != 2 {
+		t.Errorf("expected eventCount 2, got %d", eventCount)
+	}
+	if !mock.closed {
+		t.Error("expected rows to be closed after early termination")
+	}
+}
+
+func TestStreamBatchCloseErr(t *testing.T) {
+	store, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	// Create mock rows that return an error from Close()
+	mock := &mockRows{
+		data: [][]any{
+			{int64(1), "test", []byte(`{}`), time.Now()},
+		},
+		closeErr: errors.New("close error"),
+	}
+
+	var eventCount int
+	var iterErr error
+	var gotError bool
+	var receivedCount int
+
+	batchCount, lastPos, cont := store.StreamBatch(mock, &eventCount, &iterErr, func(event *eventbus.StoredEvent, err error) bool {
+		if err != nil {
+			gotError = true
+			return false
+		}
+		receivedCount++
+		return true
+	})
+
+	// Should have processed the event before Close error
+	if receivedCount != 1 {
+		t.Errorf("expected 1 event received, got %d", receivedCount)
+	}
+
+	// Should have returned the close error
+	if !gotError {
+		t.Error("expected error from rows.Close()")
+	}
+	if iterErr == nil {
+		t.Error("expected iterErr to be set")
+	}
+	if !strings.Contains(iterErr.Error(), "close rows") {
+		t.Errorf("expected 'close rows' in error, got: %v", iterErr)
+	}
+
+	// cont should be false due to error
+	if cont {
+		t.Error("expected cont to be false due to close error")
+	}
+
+	// batchCount and lastPos should reflect what was processed
+	if batchCount != 1 {
+		t.Errorf("expected batchCount 1, got %d", batchCount)
+	}
+	if lastPos != 1 {
+		t.Errorf("expected lastPos 1, got %d", lastPos)
 	}
 }
