@@ -431,7 +431,8 @@
           "expr": "histogram_quantile(0.95, sum(rate(ebu_eventbus_handler_duration_milliseconds_bucket{event_type=~\"$event_type\"}[5m])) by (le, event_type))",
           "interval": "",
           "legendFormat": "{{event_type}}",
-          "refId": "A"
+          "refId": "A",
+          "exemplar": true
         }
       ],
       "title": "p95 Handler Duration by Event Type",
@@ -505,7 +506,8 @@
           "expr": "histogram_quantile(0.95, sum(rate(ebu_eventbus_handler_duration_milliseconds_bucket{event_type=~\"$event_type\", async=\"true\"}[5m])) by (le, event_type))",
           "interval": "",
           "legendFormat": "{{event_type}} (async)",
-          "refId": "A"
+          "refId": "A",
+          "exemplar": true
         }
       ],
       "title": "p95 Async Handler Duration by Event Type",
@@ -579,7 +581,8 @@
           "expr": "histogram_quantile(0.95, sum(rate(ebu_eventbus_persist_duration_milliseconds_bucket{event_type=~\"$event_type\"}[5m])) by (le, event_type))",
           "interval": "",
           "legendFormat": "{{event_type}}",
-          "refId": "A"
+          "refId": "A",
+          "exemplar": true
         }
       ],
       "title": "p95 Persist Duration by Event Type",
