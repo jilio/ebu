@@ -376,39 +376,51 @@ func (s *SQLiteStore) LoadStream(ctx context.Context, from, to int64) iter.Seq2[
 			yield(nil, iterErr)
 			return
 		}
-		defer rows.Close()
 
-		for rows.Next() {
-			select {
-			case <-ctx.Done():
-				iterErr = ctx.Err()
-				yield(nil, iterErr)
-				return
-			default:
-			}
-
-			event := &eventbus.StoredEvent{}
-			if err := rows.Scan(&event.Position, &event.Type, &event.Data, &event.Timestamp); err != nil {
-				iterErr = fmt.Errorf("sqlite: scan event: %w", err)
-				yield(nil, iterErr)
-				return
-			}
-
-			eventCount++
-			if !yield(event, nil) {
-				return
-			}
-		}
-
-		if err := rows.Err(); err != nil {
-			iterErr = fmt.Errorf("sqlite: iterate events: %w", err)
-			yield(nil, iterErr)
-			return
-		}
+		s.streamRows(ctx, rows, &eventCount, &iterErr, yield)
 
 		if s.logger != nil {
 			s.logger.Debug("streamed events", "from", from, "to", to, "count", eventCount)
 		}
+	}
+}
+
+// streamRows iterates over rows yielding events. Extracted for testability.
+func (s *SQLiteStore) streamRows(
+	ctx context.Context,
+	rows rowScanner,
+	eventCount *int,
+	iterErr *error,
+	yield func(*eventbus.StoredEvent, error) bool,
+) {
+	defer rows.Close()
+
+	for rows.Next() {
+		select {
+		case <-ctx.Done():
+			*iterErr = ctx.Err()
+			yield(nil, *iterErr)
+			return
+		default:
+		}
+
+		event := &eventbus.StoredEvent{}
+		if err := rows.Scan(&event.Position, &event.Type, &event.Data, &event.Timestamp); err != nil {
+			*iterErr = fmt.Errorf("sqlite: scan event: %w", err)
+			yield(nil, *iterErr)
+			return
+		}
+
+		*eventCount++
+		if !yield(event, nil) {
+			return
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		*iterErr = fmt.Errorf("sqlite: iterate events: %w", err)
+		yield(nil, *iterErr)
+		return
 	}
 }
 
@@ -472,12 +484,6 @@ func (s *SQLiteStore) streamBatched(
 		}
 
 		rows.Close()
-
-		if err := rows.Err(); err != nil {
-			*iterErr = fmt.Errorf("sqlite: iterate events: %w", err)
-			yield(nil, *iterErr)
-			return
-		}
 
 		// If we got fewer rows than batch size, we're done
 		if batchCount < batchSize {

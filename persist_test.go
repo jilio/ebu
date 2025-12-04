@@ -1387,3 +1387,146 @@ func TestReplayFallsBackToLoad(t *testing.T) {
 		t.Errorf("Unexpected error: %v", err)
 	}
 }
+
+// TestReplayStreamingHandlerError tests handler error when using streaming
+func TestReplayStreamingHandlerError(t *testing.T) {
+	store := NewMemoryStore()
+	bus := New(WithStore(store))
+
+	// Publish events
+	for i := 1; i <= 3; i++ {
+		Publish(bus, TestEvent{ID: i})
+	}
+
+	ctx := context.Background()
+	handlerErr := errors.New("handler failed")
+	err := bus.Replay(ctx, 1, func(event *StoredEvent) error {
+		if event.Position == 2 {
+			return handlerErr
+		}
+		return nil
+	})
+
+	if err == nil {
+		t.Error("Expected error from Replay when handler fails")
+	}
+
+	if !strings.Contains(err.Error(), "handle event at position 2") {
+		t.Errorf("Expected 'handle event at position 2' in error, got: %v", err)
+	}
+}
+
+// nonStreamingStoreWithEvents returns events for testing fallback path
+type nonStreamingStoreWithEvents struct {
+	events []*StoredEvent
+}
+
+func (s *nonStreamingStoreWithEvents) Save(ctx context.Context, event *StoredEvent) error {
+	event.Position = int64(len(s.events)) + 1
+	s.events = append(s.events, event)
+	return nil
+}
+
+func (s *nonStreamingStoreWithEvents) Load(ctx context.Context, from, to int64) ([]*StoredEvent, error) {
+	var result []*StoredEvent
+	for _, e := range s.events {
+		if e.Position >= from && (to == -1 || e.Position <= to) {
+			result = append(result, e)
+		}
+	}
+	return result, nil
+}
+
+func (s *nonStreamingStoreWithEvents) GetPosition(ctx context.Context) (int64, error) {
+	if len(s.events) == 0 {
+		return 0, nil
+	}
+	return s.events[len(s.events)-1].Position, nil
+}
+
+func (s *nonStreamingStoreWithEvents) SaveSubscriptionPosition(ctx context.Context, subscriptionID string, position int64) error {
+	return nil
+}
+
+func (s *nonStreamingStoreWithEvents) LoadSubscriptionPosition(ctx context.Context, subscriptionID string) (int64, error) {
+	return 0, nil
+}
+
+// TestReplayNonStreamingHandlerError tests handler error for non-streaming stores
+func TestReplayNonStreamingHandlerError(t *testing.T) {
+	store := &nonStreamingStoreWithEvents{}
+	bus := New(WithStore(store))
+
+	// Save events directly to the store
+	ctx := context.Background()
+	for i := 1; i <= 3; i++ {
+		event := &StoredEvent{
+			Type:      "TestEvent",
+			Data:      []byte(fmt.Sprintf(`{"id": %d}`, i)),
+			Timestamp: time.Now(),
+		}
+		store.Save(ctx, event)
+	}
+	// Update bus store position
+	bus.storeMu.Lock()
+	bus.storePosition = 3
+	bus.storeMu.Unlock()
+
+	handlerErr := errors.New("handler failed")
+	err := bus.Replay(ctx, 1, func(event *StoredEvent) error {
+		if event.Position == 2 {
+			return handlerErr
+		}
+		return nil
+	})
+
+	if err == nil {
+		t.Error("Expected error from Replay when handler fails")
+	}
+
+	if !strings.Contains(err.Error(), "handle event at position 2") {
+		t.Errorf("Expected 'handle event at position 2' in error, got: %v", err)
+	}
+}
+
+// nonStreamingStoreWithLoadError returns error on Load
+type nonStreamingStoreWithLoadError struct{}
+
+func (s *nonStreamingStoreWithLoadError) Save(ctx context.Context, event *StoredEvent) error {
+	return nil
+}
+
+func (s *nonStreamingStoreWithLoadError) Load(ctx context.Context, from, to int64) ([]*StoredEvent, error) {
+	return nil, errors.New("load failed")
+}
+
+func (s *nonStreamingStoreWithLoadError) GetPosition(ctx context.Context) (int64, error) {
+	return 5, nil // Return non-zero so Replay tries to load
+}
+
+func (s *nonStreamingStoreWithLoadError) SaveSubscriptionPosition(ctx context.Context, subscriptionID string, position int64) error {
+	return nil
+}
+
+func (s *nonStreamingStoreWithLoadError) LoadSubscriptionPosition(ctx context.Context, subscriptionID string) (int64, error) {
+	return 0, nil
+}
+
+// TestReplayNonStreamingLoadError tests Load error for non-streaming stores
+func TestReplayNonStreamingLoadError(t *testing.T) {
+	store := &nonStreamingStoreWithLoadError{}
+	bus := New(WithStore(store))
+
+	ctx := context.Background()
+	err := bus.Replay(ctx, 1, func(event *StoredEvent) error {
+		return nil
+	})
+
+	if err == nil {
+		t.Error("Expected error from Replay when Load fails")
+	}
+
+	if !strings.Contains(err.Error(), "load events") {
+		t.Errorf("Expected 'load events' in error, got: %v", err)
+	}
+}
