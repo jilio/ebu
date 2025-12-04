@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"iter"
 	"strings"
 	"time"
 
@@ -28,8 +29,9 @@ type SQLiteStore struct {
 	loadSubPosStmt  *sql.Stmt
 }
 
-// Ensure SQLiteStore implements eventbus.EventStore
+// Ensure SQLiteStore implements eventbus.EventStore and eventbus.EventStoreStreamer
 var _ eventbus.EventStore = (*SQLiteStore)(nil)
+var _ eventbus.EventStoreStreamer = (*SQLiteStore)(nil)
 
 // dbOpener is used to open database connections, injectable for testing
 var dbOpener = sql.Open
@@ -335,4 +337,158 @@ func (s *SQLiteStore) Close() error {
 	}
 
 	return s.db.Close()
+}
+
+// LoadStream implements eventbus.EventStoreStreamer for memory-efficient event streaming.
+// It uses cursor-based iteration, keeping only one row in memory at a time.
+// The database rows are properly closed when:
+// - The iteration completes naturally
+// - The consumer breaks out of the range loop
+// - The context is cancelled
+func (s *SQLiteStore) LoadStream(ctx context.Context, from, to int64) iter.Seq2[*eventbus.StoredEvent, error] {
+	return func(yield func(*eventbus.StoredEvent, error) bool) {
+		start := time.Now()
+		var eventCount int
+		var iterErr error
+
+		defer func() {
+			if s.metricsHook != nil {
+				s.metricsHook.OnLoad(time.Since(start), eventCount, iterErr)
+			}
+		}()
+
+		// If batching is enabled, use cursor-based pagination
+		if s.cfg.streamBatchSize > 0 {
+			s.streamBatched(ctx, from, to, &eventCount, &iterErr, yield)
+			return
+		}
+
+		// Use appropriate prepared statement based on to value
+		var rows *sql.Rows
+		var err error
+		if to == -1 {
+			rows, err = s.loadFromStmt.QueryContext(ctx, from)
+		} else {
+			rows, err = s.loadStmt.QueryContext(ctx, from, to)
+		}
+		if err != nil {
+			iterErr = fmt.Errorf("sqlite: load stream: %w", err)
+			yield(nil, iterErr)
+			return
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			select {
+			case <-ctx.Done():
+				iterErr = ctx.Err()
+				yield(nil, iterErr)
+				return
+			default:
+			}
+
+			event := &eventbus.StoredEvent{}
+			if err := rows.Scan(&event.Position, &event.Type, &event.Data, &event.Timestamp); err != nil {
+				iterErr = fmt.Errorf("sqlite: scan event: %w", err)
+				yield(nil, iterErr)
+				return
+			}
+
+			eventCount++
+			if !yield(event, nil) {
+				return
+			}
+		}
+
+		if err := rows.Err(); err != nil {
+			iterErr = fmt.Errorf("sqlite: iterate events: %w", err)
+			yield(nil, iterErr)
+			return
+		}
+
+		if s.logger != nil {
+			s.logger.Debug("streamed events", "from", from, "to", to, "count", eventCount)
+		}
+	}
+}
+
+// streamBatched fetches events in batches using cursor-based pagination
+func (s *SQLiteStore) streamBatched(
+	ctx context.Context,
+	from, to int64,
+	eventCount *int,
+	iterErr *error,
+	yield func(*eventbus.StoredEvent, error) bool,
+) {
+	batchSize := s.cfg.streamBatchSize
+	currentPos := from
+
+	for {
+		select {
+		case <-ctx.Done():
+			*iterErr = ctx.Err()
+			yield(nil, *iterErr)
+			return
+		default:
+		}
+
+		// Build query based on whether we have an upper bound
+		var query string
+		var rows *sql.Rows
+		var err error
+		if to == -1 {
+			query = "SELECT position, type, data, timestamp FROM events WHERE position >= ? ORDER BY position LIMIT ?"
+			rows, err = s.db.QueryContext(ctx, query, currentPos, batchSize)
+		} else {
+			query = "SELECT position, type, data, timestamp FROM events WHERE position >= ? AND position <= ? ORDER BY position LIMIT ?"
+			rows, err = s.db.QueryContext(ctx, query, currentPos, to, batchSize)
+		}
+		if err != nil {
+			*iterErr = fmt.Errorf("sqlite: load stream batch: %w", err)
+			yield(nil, *iterErr)
+			return
+		}
+
+		batchCount := 0
+		var lastPos int64
+
+		for rows.Next() {
+			event := &eventbus.StoredEvent{}
+			if err := rows.Scan(&event.Position, &event.Type, &event.Data, &event.Timestamp); err != nil {
+				rows.Close()
+				*iterErr = fmt.Errorf("sqlite: scan event: %w", err)
+				yield(nil, *iterErr)
+				return
+			}
+
+			lastPos = event.Position
+			batchCount++
+			*eventCount++
+
+			if !yield(event, nil) {
+				rows.Close()
+				return
+			}
+		}
+
+		rows.Close()
+
+		if err := rows.Err(); err != nil {
+			*iterErr = fmt.Errorf("sqlite: iterate events: %w", err)
+			yield(nil, *iterErr)
+			return
+		}
+
+		// If we got fewer rows than batch size, we're done
+		if batchCount < batchSize {
+			break
+		}
+
+		// Move to next batch (position after last seen)
+		currentPos = lastPos + 1
+	}
+
+	if s.logger != nil {
+		s.logger.Debug("streamed events (batched)", "from", from, "to", to, "count", *eventCount, "batchSize", batchSize)
+	}
 }

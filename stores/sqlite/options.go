@@ -25,11 +25,12 @@ type Option func(*config)
 
 // config holds all configuration options
 type config struct {
-	path        string
-	busyTimeout time.Duration
-	autoMigrate bool
-	logger      Logger
-	metricsHook MetricsHook
+	path            string
+	busyTimeout     time.Duration
+	autoMigrate     bool
+	logger          Logger
+	metricsHook     MetricsHook
+	streamBatchSize int
 }
 
 // defaultConfig returns the default configuration
@@ -67,5 +68,14 @@ func WithLogger(logger Logger) Option {
 func WithMetricsHook(hook MetricsHook) Option {
 	return func(c *config) {
 		c.metricsHook = hook
+	}
+}
+
+// WithStreamBatchSize sets the batch size for LoadStream operations.
+// When > 0, events are fetched in batches of this size using LIMIT.
+// Default is 0 (no batching, fetch all matching rows at once).
+func WithStreamBatchSize(size int) Option {
+	return func(c *config) {
+		c.streamBatchSize = size
 	}
 }

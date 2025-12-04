@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"iter"
 	"reflect"
 	"sync"
 	"time"
@@ -25,6 +26,16 @@ type EventStore interface {
 
 	// Load subscription position
 	LoadSubscriptionPosition(ctx context.Context, subscriptionID string) (int64, error)
+}
+
+// EventStoreStreamer is an optional interface for memory-efficient streaming.
+// When implemented, the Replay method will automatically use streaming.
+type EventStoreStreamer interface {
+	// LoadStream returns an iterator yielding events in the given range.
+	// Use to=-1 for all events from position (same convention as Load).
+	// The iterator checks ctx.Done() before each yield and returns ctx.Err() when cancelled.
+	// A yielded error terminates iteration.
+	LoadStream(ctx context.Context, from, to int64) iter.Seq2[*StoredEvent, error]
 }
 
 // StoredEvent represents an event in storage
@@ -134,6 +145,20 @@ func (bus *EventBus) Replay(ctx context.Context, from int64, handler func(*Store
 	to := bus.storePosition
 	bus.storeMu.RUnlock()
 
+	// Use streaming if available for memory efficiency
+	if streamer, ok := bus.store.(EventStoreStreamer); ok {
+		for event, err := range streamer.LoadStream(ctx, from, to) {
+			if err != nil {
+				return fmt.Errorf("stream events: %w", err)
+			}
+			if err := handler(event); err != nil {
+				return fmt.Errorf("handle event at position %d: %w", event.Position, err)
+			}
+		}
+		return nil
+	}
+
+	// Fallback to Load for stores that don't support streaming
 	events, err := bus.store.Load(ctx, from, to)
 	if err != nil {
 		return fmt.Errorf("load events: %w", err)
@@ -255,6 +280,9 @@ type MemoryStore struct {
 	mu            sync.RWMutex
 }
 
+// Ensure MemoryStore implements EventStoreStreamer
+var _ EventStoreStreamer = (*MemoryStore)(nil)
+
 // NewMemoryStore creates a new in-memory event store
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
@@ -321,4 +349,33 @@ func (m *MemoryStore) LoadSubscriptionPosition(ctx context.Context, subscription
 	}
 
 	return pos, nil
+}
+
+// LoadStream implements EventStoreStreamer for memory-efficient event iteration.
+// Note: This takes a snapshot of the events slice to avoid holding the lock during
+// iteration, which could cause deadlocks if handlers call other store methods.
+func (m *MemoryStore) LoadStream(ctx context.Context, from, to int64) iter.Seq2[*StoredEvent, error] {
+	return func(yield func(*StoredEvent, error) bool) {
+		// Take a snapshot of events to avoid holding lock during iteration
+		m.mu.RLock()
+		events := make([]*StoredEvent, len(m.events))
+		copy(events, m.events)
+		m.mu.RUnlock()
+
+		for _, event := range events {
+			// Check context cancellation
+			select {
+			case <-ctx.Done():
+				yield(nil, ctx.Err())
+				return
+			default:
+			}
+
+			if event.Position >= from && (to == -1 || event.Position <= to) {
+				if !yield(event, nil) {
+					return // Consumer stopped iteration
+				}
+			}
+		}
+	}
 }
