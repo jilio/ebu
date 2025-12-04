@@ -357,14 +357,18 @@ func (m *MemoryStore) LoadSubscriptionPosition(ctx context.Context, subscription
 }
 
 // LoadStream implements EventStoreStreamer for memory-efficient event iteration.
-// Note: This takes a snapshot of the events slice to avoid holding the lock during
-// iteration, which could cause deadlocks if handlers call other store methods.
+// Note: This takes a filtered snapshot of matching events to avoid holding the lock
+// during iteration, which could cause deadlocks if handlers call other store methods.
 func (m *MemoryStore) LoadStream(ctx context.Context, from, to int64) iter.Seq2[*StoredEvent, error] {
 	return func(yield func(*StoredEvent, error) bool) {
-		// Take a snapshot of events to avoid holding lock during iteration
+		// Take a filtered snapshot to avoid holding lock during iteration
 		m.mu.RLock()
-		events := make([]*StoredEvent, len(m.events))
-		copy(events, m.events)
+		var events []*StoredEvent
+		for _, event := range m.events {
+			if event.Position >= from && (to == -1 || event.Position <= to) {
+				events = append(events, event)
+			}
+		}
 		m.mu.RUnlock()
 
 		for _, event := range events {
@@ -376,10 +380,8 @@ func (m *MemoryStore) LoadStream(ctx context.Context, from, to int64) iter.Seq2[
 			default:
 			}
 
-			if event.Position >= from && (to == -1 || event.Position <= to) {
-				if !yield(event, nil) {
-					return // Consumer stopped iteration
-				}
+			if !yield(event, nil) {
+				return // Consumer stopped iteration
 			}
 		}
 	}

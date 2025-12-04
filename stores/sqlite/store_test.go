@@ -1746,6 +1746,31 @@ func TestLoadStreamBatched(t *testing.T) {
 			t.Error("expected error with cancelled context")
 		}
 	})
+
+	t.Run("batched streaming upper bound exactly on batch boundary", func(t *testing.T) {
+		// Batch size is 3, upper bound is 6
+		// Batch 1: pos 1-3 (3 events), lastPos=3, currentPos=4
+		// Batch 2: pos 4-6 (3 events), lastPos=6, currentPos=7
+		// currentPos (7) > to (6), triggers early break optimization
+		var events []*eventbus.StoredEvent
+		for event, err := range store.LoadStream(ctx, 1, 6) {
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			events = append(events, event)
+		}
+
+		if len(events) != 6 {
+			t.Errorf("expected 6 events (1-6), got %d", len(events))
+		}
+
+		// Verify exact positions
+		for i, e := range events {
+			if e.Position != int64(i+1) {
+				t.Errorf("expected position %d, got %d", i+1, e.Position)
+			}
+		}
+	})
 }
 
 func TestLoadStreamBatchedDBClosed(t *testing.T) {

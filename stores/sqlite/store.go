@@ -473,6 +473,11 @@ func (s *SQLiteStore) streamBatched(
 
 		// Move to next batch (position after last seen)
 		currentPos = lastPos + 1
+
+		// If we've reached the upper bound, no need for another query
+		if to != -1 && currentPos > to {
+			break
+		}
 	}
 
 	if s.logger != nil {
