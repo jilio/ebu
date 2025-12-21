@@ -193,6 +193,11 @@ func (bus *EventBus) Replay(ctx context.Context, from Offset, handler func(*Stor
 	}
 
 	// Fallback to Read for stores that don't support streaming
+	batchSize := bus.replayBatchSize
+	if batchSize <= 0 {
+		batchSize = 100 // Default batch size
+	}
+
 	offset := from
 	for {
 		// Check context cancellation before each batch
@@ -202,7 +207,7 @@ func (bus *EventBus) Replay(ctx context.Context, from Offset, handler func(*Stor
 		default:
 		}
 
-		events, nextOffset, err := bus.store.Read(ctx, offset, 100) // Read in batches of 100
+		events, nextOffset, err := bus.store.Read(ctx, offset, batchSize)
 		if err != nil {
 			return fmt.Errorf("read events: %w", err)
 		}
@@ -219,7 +224,7 @@ func (bus *EventBus) Replay(ctx context.Context, from Offset, handler func(*Stor
 
 		// Protect against infinite loop if offset doesn't advance
 		if nextOffset == offset {
-			break
+			return fmt.Errorf("store returned non-advancing offset %s: possible bug in EventStore.Read implementation", offset)
 		}
 		offset = nextOffset
 	}
@@ -262,7 +267,9 @@ func (bus *EventBus) GetStore() EventStore {
 // SubscribeWithReplay subscribes and replays missed events.
 // Requires both an EventStore (for replay) and a SubscriptionStore (for tracking).
 // If the store implements SubscriptionStore, it will be used automatically.
+// The context is used for the replay phase and for saving offsets.
 func SubscribeWithReplay[T any](
+	ctx context.Context,
 	bus *EventBus,
 	subscriptionID string,
 	handler Handler[T],
@@ -281,8 +288,6 @@ func SubscribeWithReplay[T any](
 			return fmt.Errorf("SubscribeWithReplay requires a SubscriptionStore (use WithSubscriptionStore option or use a store that implements SubscriptionStore)")
 		}
 	}
-
-	ctx := context.Background()
 
 	// Load last offset for this subscription
 	lastOffset, _ := subStore.LoadOffset(ctx, subscriptionID)

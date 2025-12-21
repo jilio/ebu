@@ -104,7 +104,8 @@ func TestNonPersistentReplay(t *testing.T) {
 func TestSubscribeWithReplayNoPersistence(t *testing.T) {
 	bus := New() // No persistence
 
-	err := SubscribeWithReplay(bus, "test-sub", func(e TestEvent) {})
+	ctx := context.Background()
+	err := SubscribeWithReplay(ctx, bus, "test-sub", func(e TestEvent) {})
 
 	if err == nil {
 		t.Error("Expected error when calling SubscribeWithReplay on non-persistent bus")
@@ -247,8 +248,9 @@ func TestSubscribeWithReplay(t *testing.T) {
 	}
 
 	// Subscribe with replay
+	ctx := context.Background()
 	var received []int
-	err := SubscribeWithReplay(bus, "test-sub", func(e TestEvent) {
+	err := SubscribeWithReplay(ctx, bus, "test-sub", func(e TestEvent) {
 		received = append(received, e.ID)
 	})
 
@@ -274,7 +276,6 @@ func TestSubscribeWithReplay(t *testing.T) {
 	}
 
 	// Check subscription offset was saved
-	ctx := context.Background()
 	offset, err := store.LoadOffset(ctx, "test-sub")
 	if err != nil {
 		t.Fatalf("LoadOffset failed: %v", err)
@@ -289,6 +290,7 @@ func TestSubscribeWithReplay(t *testing.T) {
 func TestSubscribeWithReplayResume(t *testing.T) {
 	store := NewMemoryStore()
 	bus := New(WithStore(store))
+	ctx := context.Background()
 
 	// Publish initial events
 	for i := 1; i <= 3; i++ {
@@ -297,7 +299,7 @@ func TestSubscribeWithReplayResume(t *testing.T) {
 
 	// First subscription
 	var received1 []int
-	SubscribeWithReplay(bus, "resumable", func(e TestEvent) {
+	SubscribeWithReplay(ctx, bus, "resumable", func(e TestEvent) {
 		received1 = append(received1, e.ID)
 	})
 
@@ -318,7 +320,7 @@ func TestSubscribeWithReplayResume(t *testing.T) {
 
 	// Resume subscription - should only get new events
 	var received2 []int
-	SubscribeWithReplay(bus2, "resumable", func(e TestEvent) {
+	SubscribeWithReplay(ctx, bus2, "resumable", func(e TestEvent) {
 		received2 = append(received2, e.ID)
 	})
 
@@ -369,8 +371,9 @@ func TestSubscribeWithReplayUnmarshalError(t *testing.T) {
 	bus.storeMu.Unlock()
 
 	// Subscribe with replay - should fail due to unmarshal error
+	ctx := context.Background()
 	var received []TestEvent
-	err := SubscribeWithReplay(bus, "unmarshal-test", func(e TestEvent) {
+	err := SubscribeWithReplay(ctx, bus, "unmarshal-test", func(e TestEvent) {
 		received = append(received, e)
 	})
 
@@ -400,8 +403,9 @@ func TestSubscribeWithReplayDifferentEventTypes(t *testing.T) {
 	Publish(bus, TestEvent{ID: 3})
 
 	// Subscribe to TestEvent only
+	ctx := context.Background()
 	var received []int
-	err := SubscribeWithReplay(bus, "test-only", func(e TestEvent) {
+	err := SubscribeWithReplay(ctx, bus, "test-only", func(e TestEvent) {
 		received = append(received, e.ID)
 	})
 
@@ -1335,19 +1339,22 @@ func TestReplayNonStreamingInfiniteLoopProtection(t *testing.T) {
 	}
 	store.Append(ctx, event)
 
-	// Replay should detect the stuck offset and terminate
+	// Replay should detect the stuck offset and return an error
 	var replayed int
 	err := bus.Replay(ctx, OffsetOldest, func(event *StoredEvent) error {
 		replayed++
 		return nil
 	})
 
-	// Should not error, just terminate gracefully
-	if err != nil {
-		t.Errorf("Unexpected error: %v", err)
+	// Should error to indicate a buggy EventStore implementation
+	if err == nil {
+		t.Error("Expected error for stuck offset, got nil")
+	}
+	if !strings.Contains(err.Error(), "non-advancing offset") {
+		t.Errorf("Expected 'non-advancing offset' error, got: %v", err)
 	}
 
-	// Should have processed events exactly once (infinite loop protection kicks in)
+	// Should have processed events exactly once before detecting the stuck offset
 	if replayed != 1 {
 		t.Errorf("Expected 1 replayed event, got %d", replayed)
 	}
@@ -1379,8 +1386,9 @@ func TestWithSubscriptionStore(t *testing.T) {
 	}
 
 	// Subscribe with replay
+	ctx := context.Background()
 	var received []int
-	err := SubscribeWithReplay(bus, "test-sub", func(e TestEvent) {
+	err := SubscribeWithReplay(ctx, bus, "test-sub", func(e TestEvent) {
 		received = append(received, e.ID)
 	})
 
@@ -1393,7 +1401,6 @@ func TestWithSubscriptionStore(t *testing.T) {
 	}
 
 	// Verify offset was saved in the subscription store (not event store)
-	ctx := context.Background()
 	offset, _ := subStore.LoadOffset(ctx, "test-sub")
 	if offset != Offset("00000000000000000003") {
 		t.Errorf("Expected offset '00000000000000000003' in subscription store, got %s", offset)
@@ -1417,7 +1424,8 @@ func TestSubscribeWithReplayNoSubscriptionStore(t *testing.T) {
 	store := &eventStoreOnly{}
 	bus := New(WithStore(store))
 
-	err := SubscribeWithReplay(bus, "test-sub", func(e TestEvent) {})
+	ctx := context.Background()
+	err := SubscribeWithReplay(ctx, bus, "test-sub", func(e TestEvent) {})
 
 	if err == nil {
 		t.Error("Expected error when no SubscriptionStore is available")
@@ -1471,5 +1479,41 @@ func TestReplayNonStreamingPagination(t *testing.T) {
 		if replayed[149] != "00000000000000000150" {
 			t.Errorf("Expected last offset '00000000000000000150', got %s", replayed[149])
 		}
+	}
+}
+
+// TestWithReplayBatchSize tests the configurable replay batch size option
+func TestWithReplayBatchSize(t *testing.T) {
+	// Create a non-streaming store to test batch reading
+	store := &nonStreamingStoreWithEvents{
+		events: make([]*StoredEvent, 0),
+	}
+	bus := New(WithStore(store), WithReplayBatchSize(10))
+
+	// Append 25 events directly to the store
+	ctx := context.Background()
+	for i := 1; i <= 25; i++ {
+		event := &Event{
+			Type:      "TestEvent",
+			Data:      []byte(fmt.Sprintf(`{"id": %d}`, i)),
+			Timestamp: time.Now(),
+		}
+		store.Append(ctx, event)
+	}
+
+	// Replay all events - this will require 3 Read calls (10 + 10 + 5) with batch size 10
+	var replayed int
+	err := bus.Replay(ctx, OffsetOldest, func(event *StoredEvent) error {
+		replayed++
+		return nil
+	})
+
+	if err != nil {
+		t.Fatalf("Replay failed: %v", err)
+	}
+
+	// Should replay all 25 events
+	if replayed != 25 {
+		t.Errorf("Expected 25 replayed events, got %d", replayed)
 	}
 }

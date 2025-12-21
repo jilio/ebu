@@ -294,7 +294,7 @@ func TestUpcastWithSubscribeWithReplay(t *testing.T) {
 
 	// Subscribe expecting V2 events
 	var receivedEvents []UserCreatedV2
-	err = SubscribeWithReplay(bus, "test-subscription", func(event UserCreatedV2) {
+	err = SubscribeWithReplay(ctx, bus, "test-subscription", func(event UserCreatedV2) {
 		receivedEvents = append(receivedEvents, event)
 	})
 	if err != nil {
