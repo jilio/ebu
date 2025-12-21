@@ -1152,7 +1152,8 @@ type nonStreamingStoreWithEvents struct {
 
 func (s *nonStreamingStoreWithEvents) Append(ctx context.Context, event *Event) (Offset, error) {
 	s.nextOffset++
-	offset := Offset(fmt.Sprintf("%d", s.nextOffset))
+	// Use zero-padded offsets for correct lexicographic ordering
+	offset := Offset(fmt.Sprintf("%010d", s.nextOffset))
 	stored := &StoredEvent{
 		Offset:    offset,
 		Type:      event.Type,
@@ -1188,7 +1189,9 @@ func (s *nonStreamingStoreWithEvents) LoadOffset(ctx context.Context, subscripti
 
 // TestReplayNonStreamingHandlerError tests handler error for non-streaming stores
 func TestReplayNonStreamingHandlerError(t *testing.T) {
-	store := &nonStreamingStoreWithEvents{}
+	store := &nonStreamingStoreWithEvents{
+		events: make([]*StoredEvent, 0),
+	}
 	bus := New(WithStore(store))
 
 	// Append events directly to the store
@@ -1204,7 +1207,8 @@ func TestReplayNonStreamingHandlerError(t *testing.T) {
 
 	handlerErr := errors.New("handler failed")
 	err := bus.Replay(ctx, OffsetOldest, func(event *StoredEvent) error {
-		if event.Offset == Offset("2") {
+		// Offset format is zero-padded: "0000000002"
+		if event.Offset == Offset("0000000002") {
 			return handlerErr
 		}
 		return nil
@@ -1214,8 +1218,8 @@ func TestReplayNonStreamingHandlerError(t *testing.T) {
 		t.Error("Expected error from Replay when handler fails")
 	}
 
-	if !strings.Contains(err.Error(), "handle event at offset 2") {
-		t.Errorf("Expected 'handle event at offset 2' in error, got: %v", err)
+	if !strings.Contains(err.Error(), "handle event at offset 0000000002") {
+		t.Errorf("Expected 'handle event at offset 0000000002' in error, got: %v", err)
 	}
 }
 
@@ -1329,5 +1333,51 @@ func TestSubscribeWithReplayNoSubscriptionStore(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "SubscriptionStore") {
 		t.Errorf("Expected error about SubscriptionStore, got: %v", err)
+	}
+}
+
+// TestReplayNonStreamingPagination tests the pagination path in Replay for non-streaming stores
+// This ensures the offset = nextOffset line is covered when reading more than 100 events
+func TestReplayNonStreamingPagination(t *testing.T) {
+	store := &nonStreamingStoreWithEvents{
+		events: make([]*StoredEvent, 0),
+	}
+	bus := New(WithStore(store))
+
+	// Append more than 100 events to trigger pagination (batch size is 100)
+	ctx := context.Background()
+	for i := 1; i <= 150; i++ {
+		event := &Event{
+			Type:      "TestEvent",
+			Data:      []byte(fmt.Sprintf(`{"id": %d}`, i)),
+			Timestamp: time.Now(),
+		}
+		store.Append(ctx, event)
+	}
+
+	// Replay all events - this will require at least 2 Read calls (100 + 50)
+	var replayed []string
+	err := bus.Replay(ctx, OffsetOldest, func(event *StoredEvent) error {
+		replayed = append(replayed, string(event.Offset))
+		return nil
+	})
+
+	if err != nil {
+		t.Fatalf("Replay failed: %v", err)
+	}
+
+	// Should replay all 150 events
+	if len(replayed) != 150 {
+		t.Errorf("Expected 150 replayed events, got %d", len(replayed))
+	}
+
+	// Verify offsets are in order (using zero-padded format)
+	if len(replayed) >= 150 {
+		if replayed[0] != "0000000001" {
+			t.Errorf("Expected first offset '0000000001', got %s", replayed[0])
+		}
+		if replayed[149] != "0000000150" {
+			t.Errorf("Expected last offset '0000000150', got %s", replayed[149])
+		}
 	}
 }
