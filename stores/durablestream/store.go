@@ -4,20 +4,26 @@
 // Durable-streams is an HTTP-based protocol for real-time sync to client
 // applications. It uses opaque string offsets and supports both catch-up
 // reads and live tailing via SSE.
+//
+// This implementation wraps the conformance-tested ahimsalabs/durable-streams-go
+// client library for full protocol compatibility.
 package durablestream
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"time"
 
+	"github.com/ahimsalabs/durable-streams-go/durablestream"
 	eventbus "github.com/jilio/ebu"
 )
 
 // Store implements eventbus.EventStore for durable-streams servers.
 type Store struct {
-	client *Client
+	client *durablestream.Client
+	path   string
 	cfg    *config
 }
 
@@ -26,21 +32,25 @@ var _ eventbus.EventStore = (*Store)(nil)
 
 // New creates a new Store connected to a durable-streams server.
 //
-// The streamURL should be the full URL to the stream endpoint,
-// e.g., "https://server.example.com/v1/stream/my-events".
+// The baseURL should be the base URL of the durable-streams server
+// (e.g., "http://localhost:4437/v1/stream").
+// The streamPath is the name of the stream (e.g., "my-events").
 //
 // By default, the store will attempt to create the stream if it doesn't exist.
 // Note: Stream creation uses context.Background() to ensure it completes fully.
 // Use NewWithContext if you need cancellable initialization.
-func New(streamURL string, opts ...Option) (*Store, error) {
-	return NewWithContext(context.Background(), streamURL, opts...)
+func New(baseURL string, streamPath string, opts ...Option) (*Store, error) {
+	return NewWithContext(context.Background(), baseURL, streamPath, opts...)
 }
 
 // NewWithContext creates a new Store with a context for initialization.
 // The context is used for the initial stream creation request.
-func NewWithContext(ctx context.Context, streamURL string, opts ...Option) (*Store, error) {
-	if streamURL == "" {
-		return nil, fmt.Errorf("durablestream: streamURL is required")
+func NewWithContext(ctx context.Context, baseURL string, streamPath string, opts ...Option) (*Store, error) {
+	if baseURL == "" {
+		return nil, fmt.Errorf("durablestream: baseURL is required")
+	}
+	if streamPath == "" {
+		return nil, fmt.Errorf("durablestream: streamPath is required")
 	}
 
 	cfg := defaultConfig()
@@ -48,36 +58,59 @@ func NewWithContext(ctx context.Context, streamURL string, opts ...Option) (*Sto
 		opt(cfg)
 	}
 
-	client := newClient(streamURL, cfg)
+	clientCfg := &durablestream.ClientConfig{
+		HTTPClient: cfg.httpClient,
+		Timeout:    cfg.timeout,
+	}
+
+	client := durablestream.NewClient(baseURL, clientCfg)
 
 	// Try to create the stream (idempotent)
-	if err := client.Create(ctx); err != nil {
+	_, err := client.Create(ctx, streamPath, &durablestream.CreateOptions{
+		ContentType: cfg.contentType,
+	})
+	if err != nil {
 		return nil, fmt.Errorf("durablestream: create stream: %w", err)
 	}
 
 	return &Store{
 		client: client,
+		path:   streamPath,
 		cfg:    cfg,
 	}, nil
 }
 
-// Append stores an event and returns its assigned offset.
-func (s *Store) Append(ctx context.Context, event *eventbus.Event) (eventbus.Offset, error) {
-	// For JSON mode, wrap the event in an array for batch semantics
-	data, err := json.Marshal([]*eventbus.Event{event})
-	if err != nil {
-		return "", fmt.Errorf("durablestream: marshal event: %w", err)
-	}
-
-	offset, err := s.client.Append(ctx, data)
-	if err != nil {
-		return "", fmt.Errorf("durablestream: append: %w", err)
-	}
-
-	return eventbus.Offset(offset), nil
+// storedEventForWrite represents the event format for writing to the stream.
+type storedEventForWrite struct {
+	Type      string          `json:"type"`
+	Data      json.RawMessage `json:"data"`
+	Timestamp string          `json:"timestamp,omitempty"`
 }
 
-// storedEventWithOffset is used to parse events that include their own offset
+// Append stores an event and returns its assigned offset.
+func (s *Store) Append(ctx context.Context, event *eventbus.Event) (eventbus.Offset, error) {
+	writer, err := s.client.Writer(ctx, s.path)
+	if err != nil {
+		return "", fmt.Errorf("durablestream: get writer: %w", err)
+	}
+
+	// Prepare event for JSON serialization
+	writeEvent := storedEventForWrite{
+		Type: event.Type,
+		Data: event.Data,
+	}
+	if !event.Timestamp.IsZero() {
+		writeEvent.Timestamp = event.Timestamp.Format(time.RFC3339Nano)
+	}
+
+	if err := writer.SendJSON(writeEvent, nil); err != nil {
+		return "", fmt.Errorf("durablestream: send: %w", err)
+	}
+
+	return eventbus.Offset(writer.Offset()), nil
+}
+
+// storedEventWithOffset is used to parse events that include their own offset.
 type storedEventWithOffset struct {
 	Offset    string          `json:"offset,omitempty"`
 	Type      string          `json:"type"`
@@ -96,25 +129,26 @@ type storedEventWithOffset struct {
 // For reliable resumption, use the nextOffset returned by Read, or ensure your
 // durable-streams server includes per-event offsets in the response.
 func (s *Store) Read(ctx context.Context, from eventbus.Offset, limit int) ([]*eventbus.StoredEvent, eventbus.Offset, error) {
-	// Map OffsetOldest to durable-streams sentinel value
-	offset := string(from)
+	// Map OffsetOldest to durable-streams zero offset
+	offset := durablestream.Offset(from)
 	if from == eventbus.OffsetOldest {
-		offset = "-1"
+		offset = durablestream.ZeroOffset
 	}
 
-	resp, err := s.client.Read(ctx, offset, limit)
+	reader := s.client.Reader(s.path, offset)
+	result, err := reader.Read(ctx)
 	if err != nil {
 		return nil, from, fmt.Errorf("durablestream: read: %w", err)
 	}
 
 	// Empty response means we're at the tail
-	if len(resp.Body) == 0 || string(resp.Body) == "[]" {
-		return nil, from, nil
+	if len(result.Data) == 0 {
+		return nil, eventbus.Offset(result.NextOffset), nil
 	}
 
 	// Parse JSON array response
 	var rawEvents []json.RawMessage
-	if err := json.Unmarshal(resp.Body, &rawEvents); err != nil {
+	if err := json.Unmarshal(result.Data, &rawEvents); err != nil {
 		return nil, from, fmt.Errorf("durablestream: unmarshal response: %w", err)
 	}
 
@@ -138,7 +172,7 @@ func (s *Store) Read(ctx context.Context, from eventbus.Offset, limit int) ([]*e
 		} else {
 			// Synthesize unique offset: "nextOffset/index"
 			// These are ephemeral - use nextOffset for reliable resumption
-			eventOffset = eventbus.Offset(fmt.Sprintf("%s/%d", resp.NextOffset, i))
+			eventOffset = eventbus.Offset(fmt.Sprintf("%s/%d", result.NextOffset, i))
 		}
 
 		events = append(events, &eventbus.StoredEvent{
@@ -147,14 +181,14 @@ func (s *Store) Read(ctx context.Context, from eventbus.Offset, limit int) ([]*e
 			Data:      eventWithOffset.Data,
 			Timestamp: parseTimestamp(eventWithOffset.Timestamp),
 		})
+
+		// Apply limit if specified
+		if limit > 0 && len(events) >= limit {
+			break
+		}
 	}
 
-	// Apply limit if specified
-	if limit > 0 && len(events) > limit {
-		events = events[:limit]
-	}
-
-	return events, eventbus.Offset(resp.NextOffset), nil
+	return events, eventbus.Offset(result.NextOffset), nil
 }
 
 // Close is a no-op for HTTP-based stores.
@@ -173,4 +207,21 @@ func parseTimestamp(s string) time.Time {
 		return time.Time{}
 	}
 	return t
+}
+
+// Client returns the underlying durablestream.Client for advanced usage.
+// This is exposed for testing and advanced scenarios.
+func (s *Store) Client() *durablestream.Client {
+	return s.client
+}
+
+// Path returns the stream path.
+func (s *Store) Path() string {
+	return s.path
+}
+
+// HTTPClient returns the HTTP client used by the store.
+// Exposed for testing.
+func (s *Store) HTTPClient() *http.Client {
+	return s.cfg.httpClient
 }

@@ -221,8 +221,10 @@ import (
 )
 
 // Connect to a durable-streams server
-store, err := durablestream.New("http://localhost:8080/v1/stream/mystream",
-    durablestream.WithRetry(3, 100*time.Millisecond),
+store, err := durablestream.New(
+    "http://localhost:4437/v1/stream",  // server base URL
+    "mystream",                          // stream name
+    durablestream.WithTimeout(30*time.Second),
 )
 if err != nil {
     log.Fatal(err)

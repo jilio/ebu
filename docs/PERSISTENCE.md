@@ -155,7 +155,9 @@ SQLite store features:
 
 ### Durable-Streams Store
 
-Remote storage using the [Durable Streams](https://electric-sql.com/blog/2025/12/09/announcing-durable-streams) protocol - an HTTP-based persistent stream primitive for reliable, resumable, real-time data streaming developed by [Electric](https://electric-sql.com):
+Remote storage using the [Durable Streams](https://electric-sql.com/blog/2025/12/09/announcing-durable-streams) protocol - an HTTP-based persistent stream primitive for reliable, resumable, real-time data streaming developed by [Electric](https://electric-sql.com).
+
+This implementation uses the [ahimsalabs/durable-streams-go](https://github.com/ahimsalabs/durable-streams-go) client library, which passes the official durable-streams conformance test suite:
 
 ```go
 import (
@@ -164,8 +166,9 @@ import (
 )
 
 // Connect to durable-streams server
-store, err := durablestream.New("http://localhost:8080/v1/stream/events",
-    durablestream.WithRetry(3, 100*time.Millisecond),
+store, err := durablestream.New(
+    "http://localhost:4437/v1/stream",  // server base URL
+    "events",                            // stream name
     durablestream.WithTimeout(30 * time.Second),
 )
 if err != nil {
@@ -181,8 +184,9 @@ eventbus.Publish(bus, UserCreatedEvent{UserID: "123"})
 
 Durable-streams features:
 - HTTP-based protocol for distributed systems
-- Automatic retries with exponential backoff
-- Configurable timeouts
+- Full protocol conformance via tested client library
+- Compatible with any durable-streams server implementation
+- Configurable timeouts and HTTP client
 - Server-assigned opaque offsets
 
 ## Replay Patterns
