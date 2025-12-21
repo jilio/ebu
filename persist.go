@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"iter"
 	"reflect"
-	"strconv"
 	"sync"
 	"time"
 )
@@ -196,6 +195,13 @@ func (bus *EventBus) Replay(ctx context.Context, from Offset, handler func(*Stor
 	// Fallback to Read for stores that don't support streaming
 	offset := from
 	for {
+		// Check context cancellation before each batch
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		events, nextOffset, err := bus.store.Read(ctx, offset, 100) // Read in batches of 100
 		if err != nil {
 			return fmt.Errorf("read events: %w", err)
@@ -211,6 +217,10 @@ func (bus *EventBus) Replay(ctx context.Context, from Offset, handler func(*Stor
 			}
 		}
 
+		// Protect against infinite loop if offset doesn't advance
+		if nextOffset == offset {
+			break
+		}
 		offset = nextOffset
 	}
 
@@ -356,7 +366,8 @@ func (m *MemoryStore) Append(ctx context.Context, event *Event) (Offset, error) 
 	defer m.mu.Unlock()
 
 	m.nextOffset++
-	offset := Offset(strconv.FormatInt(m.nextOffset, 10))
+	// Use zero-padded format for correct lexicographic ordering
+	offset := Offset(fmt.Sprintf("%020d", m.nextOffset))
 
 	stored := &StoredEvent{
 		Offset:    offset,

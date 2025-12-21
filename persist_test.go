@@ -180,10 +180,10 @@ func TestReplayFromOffset(t *testing.T) {
 		Publish(bus, TestEvent{ID: i})
 	}
 
-	// Replay from offset "2" (after the second event)
+	// Replay from offset "00000000000000000002" (after the second event)
 	var replayed []string
 	ctx := context.Background()
-	err := bus.Replay(ctx, Offset("2"), func(event *StoredEvent) error {
+	err := bus.Replay(ctx, Offset("00000000000000000002"), func(event *StoredEvent) error {
 		replayed = append(replayed, string(event.Offset))
 		return nil
 	})
@@ -280,8 +280,8 @@ func TestSubscribeWithReplay(t *testing.T) {
 		t.Fatalf("LoadOffset failed: %v", err)
 	}
 
-	if offset != Offset("5") {
-		t.Errorf("Expected subscription offset '5', got %s", offset)
+	if offset != Offset("00000000000000000005") {
+		t.Errorf("Expected subscription offset '00000000000000000005', got %s", offset)
 	}
 }
 
@@ -459,8 +459,8 @@ func TestMemoryStore(t *testing.T) {
 	if len(events) != 3 {
 		t.Errorf("Expected 3 events, got %d", len(events))
 	}
-	if offset != Offset("3") {
-		t.Errorf("Expected offset '3', got %s", offset)
+	if offset != Offset("00000000000000000003") {
+		t.Errorf("Expected offset '00000000000000000003', got %s", offset)
 	}
 
 	// Test Read with limit
@@ -473,7 +473,7 @@ func TestMemoryStore(t *testing.T) {
 	}
 
 	// Test subscription offsets
-	if err := store.SaveOffset(ctx, "sub1", Offset("2")); err != nil {
+	if err := store.SaveOffset(ctx, "sub1", Offset("00000000000000000002")); err != nil {
 		t.Fatalf("SaveOffset failed: %v", err)
 	}
 
@@ -481,8 +481,8 @@ func TestMemoryStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadOffset failed: %v", err)
 	}
-	if offset != Offset("2") {
-		t.Errorf("Expected subscription offset '2', got %s", offset)
+	if offset != Offset("00000000000000000002") {
+		t.Errorf("Expected subscription offset '00000000000000000002', got %s", offset)
 	}
 
 	// Test unknown subscription
@@ -742,8 +742,8 @@ func TestPersistenceSuccessIncrementsOffset(t *testing.T) {
 	lastOffset := bus.lastOffset
 	bus.storeMu.RUnlock()
 
-	if lastOffset != Offset("3") {
-		t.Errorf("Expected lastOffset '3', got %s", lastOffset)
+	if lastOffset != Offset("00000000000000000003") {
+		t.Errorf("Expected lastOffset '00000000000000000003', got %s", lastOffset)
 	}
 
 	// Verify all events were stored
@@ -948,19 +948,19 @@ func TestMemoryStoreReadStream(t *testing.T) {
 
 	t.Run("streams events from specific offset", func(t *testing.T) {
 		var received []*StoredEvent
-		for event, err := range store.ReadStream(ctx, Offset("2")) {
+		for event, err := range store.ReadStream(ctx, Offset("00000000000000000002")) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 			received = append(received, event)
 		}
 
-		// Should get events 3, 4, 5 (after offset "2")
+		// Should get events 3, 4, 5 (after offset "00000000000000000002")
 		if len(received) != 3 {
 			t.Errorf("expected 3 events, got %d", len(received))
 		}
-		if received[0].Offset != Offset("3") {
-			t.Errorf("expected first offset '3', got %s", received[0].Offset)
+		if received[0].Offset != Offset("00000000000000000003") {
+			t.Errorf("expected first offset '00000000000000000003', got %s", received[0].Offset)
 		}
 	})
 
@@ -971,7 +971,7 @@ func TestMemoryStoreReadStream(t *testing.T) {
 				t.Fatalf("unexpected error: %v", err)
 			}
 			count++
-			if event.Offset == Offset("2") {
+			if event.Offset == Offset("00000000000000000002") {
 				break // Early termination
 			}
 		}
@@ -1002,10 +1002,9 @@ func TestMemoryStoreReadStream(t *testing.T) {
 	})
 
 	t.Run("returns empty for out of range", func(t *testing.T) {
-		// Use an offset that's lexicographically greater than "4"
-		// Since we're using numeric strings, "5" is after "4"
+		// Use an offset that's lexicographically greater than "00000000000000000004"
 		count := 0
-		for _, err := range store.ReadStream(ctx, Offset("5")) {
+		for _, err := range store.ReadStream(ctx, Offset("00000000000000000005")) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -1050,7 +1049,7 @@ func TestReplayUsesStreaming(t *testing.T) {
 	// Replay should use streaming internally (MemoryStore implements EventStoreStreamer)
 	var replayed []string
 	ctx := context.Background()
-	err := bus.Replay(ctx, Offset("1"), func(event *StoredEvent) error {
+	err := bus.Replay(ctx, Offset("00000000000000000001"), func(event *StoredEvent) error {
 		replayed = append(replayed, string(event.Offset))
 		return nil
 	})
@@ -1129,7 +1128,7 @@ func TestReplayStreamingHandlerError(t *testing.T) {
 	ctx := context.Background()
 	handlerErr := errors.New("handler failed")
 	err := bus.Replay(ctx, OffsetOldest, func(event *StoredEvent) error {
-		if event.Offset == Offset("2") {
+		if event.Offset == Offset("00000000000000000002") {
 			return handlerErr
 		}
 		return nil
@@ -1139,8 +1138,8 @@ func TestReplayStreamingHandlerError(t *testing.T) {
 		t.Error("Expected error from Replay when handler fails")
 	}
 
-	if !strings.Contains(err.Error(), "handle event at offset 2") {
-		t.Errorf("Expected 'handle event at offset 2' in error, got: %v", err)
+	if !strings.Contains(err.Error(), "handle event at offset 00000000000000000002") {
+		t.Errorf("Expected 'handle event at offset 00000000000000000002' in error, got: %v", err)
 	}
 }
 
@@ -1153,7 +1152,7 @@ type nonStreamingStoreWithEvents struct {
 func (s *nonStreamingStoreWithEvents) Append(ctx context.Context, event *Event) (Offset, error) {
 	s.nextOffset++
 	// Use zero-padded offsets for correct lexicographic ordering
-	offset := Offset(fmt.Sprintf("%010d", s.nextOffset))
+	offset := Offset(fmt.Sprintf("%020d", s.nextOffset))
 	stored := &StoredEvent{
 		Offset:    offset,
 		Type:      event.Type,
@@ -1207,8 +1206,8 @@ func TestReplayNonStreamingHandlerError(t *testing.T) {
 
 	handlerErr := errors.New("handler failed")
 	err := bus.Replay(ctx, OffsetOldest, func(event *StoredEvent) error {
-		// Offset format is zero-padded: "0000000002"
-		if event.Offset == Offset("0000000002") {
+		// Offset format is zero-padded: "00000000000000000002"
+		if event.Offset == Offset("00000000000000000002") {
 			return handlerErr
 		}
 		return nil
@@ -1218,8 +1217,8 @@ func TestReplayNonStreamingHandlerError(t *testing.T) {
 		t.Error("Expected error from Replay when handler fails")
 	}
 
-	if !strings.Contains(err.Error(), "handle event at offset 0000000002") {
-		t.Errorf("Expected 'handle event at offset 0000000002' in error, got: %v", err)
+	if !strings.Contains(err.Error(), "handle event at offset 00000000000000000002") {
+		t.Errorf("Expected 'handle event at offset 00000000000000000002' in error, got: %v", err)
 	}
 }
 
@@ -1258,6 +1257,99 @@ func TestReplayNonStreamingReadError(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "read events") {
 		t.Errorf("Expected 'read events' in error, got: %v", err)
+	}
+}
+
+// TestReplayNonStreamingContextCancellation tests context cancellation in non-streaming fallback path
+func TestReplayNonStreamingContextCancellation(t *testing.T) {
+	store := &nonStreamingStoreWithEvents{
+		events: make([]*StoredEvent, 0),
+	}
+	bus := New(WithStore(store))
+
+	// Append some events directly to the store
+	ctx := context.Background()
+	for i := 1; i <= 3; i++ {
+		event := &Event{
+			Type:      "TestEvent",
+			Data:      []byte(fmt.Sprintf(`{"id": %d}`, i)),
+			Timestamp: time.Now(),
+		}
+		store.Append(ctx, event)
+	}
+
+	// Create a cancelled context
+	cancelCtx, cancel := context.WithCancel(ctx)
+	cancel() // Cancel immediately
+
+	err := bus.Replay(cancelCtx, OffsetOldest, func(event *StoredEvent) error {
+		return nil
+	})
+
+	if err == nil {
+		t.Error("Expected error from Replay when context is cancelled")
+	}
+
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("Expected context.Canceled error, got: %v", err)
+	}
+}
+
+// nonStreamingStoreWithStuckOffset is a store that returns events but never advances the offset
+type nonStreamingStoreWithStuckOffset struct {
+	events []*StoredEvent
+}
+
+func (s *nonStreamingStoreWithStuckOffset) Append(ctx context.Context, event *Event) (Offset, error) {
+	stored := &StoredEvent{
+		Offset:    Offset("00000000000000000001"),
+		Type:      event.Type,
+		Data:      event.Data,
+		Timestamp: event.Timestamp,
+	}
+	s.events = append(s.events, stored)
+	return stored.Offset, nil
+}
+
+func (s *nonStreamingStoreWithStuckOffset) Read(ctx context.Context, from Offset, limit int) ([]*StoredEvent, Offset, error) {
+	// Return events but always return the same offset (stuck/not advancing)
+	if from == OffsetOldest && len(s.events) > 0 {
+		return s.events, from, nil // Return 'from' as next offset - infinite loop protection should catch this
+	}
+	return nil, from, nil
+}
+
+// TestReplayNonStreamingInfiniteLoopProtection tests the infinite loop protection in non-streaming fallback
+func TestReplayNonStreamingInfiniteLoopProtection(t *testing.T) {
+	store := &nonStreamingStoreWithStuckOffset{
+		events: make([]*StoredEvent, 0),
+	}
+	bus := New(WithStore(store))
+
+	// Append an event directly to the store
+	ctx := context.Background()
+	event := &Event{
+		Type:      "TestEvent",
+		Data:      []byte(`{"id": 1}`),
+		Timestamp: time.Now(),
+	}
+	store.Append(ctx, event)
+
+	// Replay should detect the stuck offset and terminate
+	var replayed int
+	err := bus.Replay(ctx, OffsetOldest, func(event *StoredEvent) error {
+		replayed++
+		return nil
+	})
+
+	// Should not error, just terminate gracefully
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+
+	// Should have processed events exactly once (infinite loop protection kicks in)
+	if replayed != 1 {
+		t.Errorf("Expected 1 replayed event, got %d", replayed)
 	}
 }
 
@@ -1303,8 +1395,8 @@ func TestWithSubscriptionStore(t *testing.T) {
 	// Verify offset was saved in the subscription store (not event store)
 	ctx := context.Background()
 	offset, _ := subStore.LoadOffset(ctx, "test-sub")
-	if offset != Offset("3") {
-		t.Errorf("Expected offset '3' in subscription store, got %s", offset)
+	if offset != Offset("00000000000000000003") {
+		t.Errorf("Expected offset '00000000000000000003' in subscription store, got %s", offset)
 	}
 }
 
@@ -1371,13 +1463,13 @@ func TestReplayNonStreamingPagination(t *testing.T) {
 		t.Errorf("Expected 150 replayed events, got %d", len(replayed))
 	}
 
-	// Verify offsets are in order (using zero-padded format)
+	// Verify offsets are in order (using 20-digit zero-padded format)
 	if len(replayed) >= 150 {
-		if replayed[0] != "0000000001" {
-			t.Errorf("Expected first offset '0000000001', got %s", replayed[0])
+		if replayed[0] != "00000000000000000001" {
+			t.Errorf("Expected first offset '00000000000000000001', got %s", replayed[0])
 		}
-		if replayed[149] != "0000000150" {
-			t.Errorf("Expected last offset '0000000150', got %s", replayed[149])
+		if replayed[149] != "00000000000000000150" {
+			t.Errorf("Expected last offset '00000000000000000150', got %s", replayed[149])
 		}
 	}
 }
