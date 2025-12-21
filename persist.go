@@ -10,22 +10,34 @@ import (
 	"time"
 )
 
-// EventStore defines the interface for persisting events
+// Offset represents an opaque position in an event stream.
+// Implementations define the format (e.g., "123", "abc_456", timestamp-based).
+// Offsets are lexicographically comparable within the same store.
+type Offset string
+
+const (
+	// OffsetOldest represents the beginning of the stream.
+	// When passed to Read, returns events from the start.
+	OffsetOldest Offset = ""
+
+	// OffsetNewest represents the current end of the stream.
+	// Useful for subscribing to only new events.
+	OffsetNewest Offset = "$"
+)
+
+// EventStore defines the core interface for persisting events.
+// This is a minimal interface with just 2 methods for basic event storage.
+// Additional capabilities are provided through optional interfaces.
 type EventStore interface {
-	// Save an event to storage
-	Save(ctx context.Context, event *StoredEvent) error
+	// Append stores an event and returns its assigned offset.
+	// The store is responsible for generating unique, monotonically increasing offsets.
+	Append(ctx context.Context, event *Event) (Offset, error)
 
-	// Load events from storage within a range
-	Load(ctx context.Context, from, to int64) ([]*StoredEvent, error)
-
-	// Get the current position (highest event number)
-	GetPosition(ctx context.Context) (int64, error)
-
-	// Save subscription position for resumable subscriptions
-	SaveSubscriptionPosition(ctx context.Context, subscriptionID string, position int64) error
-
-	// Load subscription position
-	LoadSubscriptionPosition(ctx context.Context, subscriptionID string) (int64, error)
+	// Read returns events starting after the given offset.
+	// Use OffsetOldest to read from the beginning.
+	// The limit parameter controls max events returned (0 = no limit).
+	// Returns the events, the offset to use for the next read, and any error.
+	Read(ctx context.Context, from Offset, limit int) ([]*StoredEvent, Offset, error)
 }
 
 // EventStoreStreamer is an optional interface for memory-efficient streaming.
@@ -34,18 +46,45 @@ type EventStore interface {
 // Implementation notes:
 //   - Database-backed stores should use cursor-based iteration to minimize memory
 //   - In-memory stores may need to take a snapshot to avoid holding locks during iteration,
-//     trading memory for deadlock safety (see MemoryStore.LoadStream for an example)
+//     trading memory for deadlock safety (see MemoryStore.ReadStream for an example)
 type EventStoreStreamer interface {
-	// LoadStream returns an iterator yielding events in the given range.
-	// Use to=-1 for all events from position (same convention as Load).
+	// ReadStream returns an iterator yielding events starting after the given offset.
+	// Use OffsetOldest to read from the beginning.
 	// The iterator checks ctx.Done() before each yield and returns ctx.Err() when cancelled.
 	// A yielded error terminates iteration.
-	LoadStream(ctx context.Context, from, to int64) iter.Seq2[*StoredEvent, error]
+	ReadStream(ctx context.Context, from Offset) iter.Seq2[*StoredEvent, error]
 }
 
-// StoredEvent represents an event in storage
+// EventStoreSubscriber is an optional interface for stores that support live subscriptions.
+// This enables real-time event streaming for remote stores.
+type EventStoreSubscriber interface {
+	// Subscribe starts a live subscription from the given offset.
+	// Returns a channel that yields events as they arrive.
+	// Call the returned cancel function to stop the subscription and close the channel.
+	Subscribe(ctx context.Context, from Offset) (<-chan *StoredEvent, func(), error)
+}
+
+// SubscriptionStore tracks subscription progress separately from event storage.
+// This interface is optional and enables resumable subscriptions.
+type SubscriptionStore interface {
+	// SaveOffset persists the current offset for a subscription.
+	SaveOffset(ctx context.Context, subscriptionID string, offset Offset) error
+
+	// LoadOffset retrieves the last saved offset for a subscription.
+	// Returns OffsetOldest if the subscription has no saved offset.
+	LoadOffset(ctx context.Context, subscriptionID string) (Offset, error)
+}
+
+// Event represents an event to be stored (before it has an offset).
+type Event struct {
+	Type      string          `json:"type"`
+	Data      json.RawMessage `json:"data"`
+	Timestamp time.Time       `json:"timestamp"`
+}
+
+// StoredEvent represents an event that has been persisted with an offset.
 type StoredEvent struct {
-	Position  int64           `json:"position"`
+	Offset    Offset          `json:"offset"`
 	Type      string          `json:"type"`
 	Data      json.RawMessage `json:"data"`
 	Timestamp time.Time       `json:"timestamp"`
@@ -55,12 +94,6 @@ type StoredEvent struct {
 func WithStore(store EventStore) Option {
 	return func(bus *EventBus) {
 		bus.store = store
-
-		// Load current position
-		ctx := context.Background()
-		if pos, err := store.GetPosition(ctx); err == nil {
-			bus.storePosition = pos
-		}
 
 		// Chain the persistence hook with any existing context-aware hook
 		existingHook := bus.beforePublishCtx
@@ -72,6 +105,13 @@ func WithStore(store EventStore) Option {
 			// Then persist the event
 			bus.persistEvent(ctx, eventType, event)
 		}
+	}
+}
+
+// WithSubscriptionStore enables subscription position tracking
+func WithSubscriptionStore(store SubscriptionStore) Option {
+	return func(bus *EventBus) {
+		bus.subscriptionStore = store
 	}
 }
 
@@ -90,15 +130,10 @@ func (bus *EventBus) persistEvent(ctx context.Context, eventType reflect.Type, e
 		return
 	}
 
-	// Lock for the entire position assignment and save operation to prevent race
-	bus.storeMu.Lock()
-	position := bus.storePosition + 1
-
 	// Use EventType() to respect TypeNamer interface if implemented
 	typeName := EventType(event)
 
-	stored := &StoredEvent{
-		Position:  position,
+	toStore := &Event{
 		Type:      typeName,
 		Data:      data,
 		Timestamp: time.Now(),
@@ -113,14 +148,18 @@ func (bus *EventBus) persistEvent(ctx context.Context, eventType reflect.Type, e
 
 	// Observability: Track persistence start
 	if bus.observability != nil {
-		ctx = bus.observability.OnPersistStart(ctx, typeName, position)
+		ctx = bus.observability.OnPersistStart(ctx, typeName, 0)
 	}
 
 	start := time.Now()
-	var saveErr error
 
-	// Try to save the event
-	saveErr = bus.store.Save(ctx, stored)
+	// Append the event - the store assigns the offset
+	bus.storeMu.Lock()
+	offset, saveErr := bus.store.Append(ctx, toStore)
+	if saveErr == nil {
+		bus.lastOffset = offset
+	}
+	bus.storeMu.Unlock()
 
 	// Observability: Track persistence complete
 	if bus.observability != nil {
@@ -128,58 +167,73 @@ func (bus *EventBus) persistEvent(ctx context.Context, eventType reflect.Type, e
 	}
 
 	if saveErr != nil {
-		bus.storeMu.Unlock() // Unlock before calling error handler
 		if bus.persistenceErrorHandler != nil {
 			bus.persistenceErrorHandler(event, eventType, fmt.Errorf("failed to save event: %w", saveErr))
 		}
-		return
 	}
-
-	// Only increment position after successful save
-	bus.storePosition = position
-	bus.storeMu.Unlock()
 }
 
-// Replay replays events from a position
-func (bus *EventBus) Replay(ctx context.Context, from int64, handler func(*StoredEvent) error) error {
+// Replay replays events from an offset
+func (bus *EventBus) Replay(ctx context.Context, from Offset, handler func(*StoredEvent) error) error {
 	if bus.store == nil {
 		return fmt.Errorf("replay requires persistence (use WithStore option)")
 	}
 
-	bus.storeMu.RLock()
-	to := bus.storePosition
-	bus.storeMu.RUnlock()
-
 	// Use streaming if available for memory efficiency
 	if streamer, ok := bus.store.(EventStoreStreamer); ok {
-		for event, err := range streamer.LoadStream(ctx, from, to) {
+		for event, err := range streamer.ReadStream(ctx, from) {
 			if err != nil {
 				return fmt.Errorf("stream events: %w", err)
 			}
 			if err := handler(event); err != nil {
-				return fmt.Errorf("handle event at position %d: %w", event.Position, err)
+				return fmt.Errorf("handle event at offset %s: %w", event.Offset, err)
 			}
 		}
 		return nil
 	}
 
-	// Fallback to Load for stores that don't support streaming
-	events, err := bus.store.Load(ctx, from, to)
-	if err != nil {
-		return fmt.Errorf("load events: %w", err)
+	// Fallback to Read for stores that don't support streaming
+	batchSize := bus.replayBatchSize
+	if batchSize <= 0 {
+		batchSize = 100 // Default batch size
 	}
 
-	for _, event := range events {
-		if err := handler(event); err != nil {
-			return fmt.Errorf("handle event at position %d: %w", event.Position, err)
+	offset := from
+	for {
+		// Check context cancellation before each batch
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
 		}
+
+		events, nextOffset, err := bus.store.Read(ctx, offset, batchSize)
+		if err != nil {
+			return fmt.Errorf("read events: %w", err)
+		}
+
+		if len(events) == 0 {
+			break
+		}
+
+		for _, event := range events {
+			if err := handler(event); err != nil {
+				return fmt.Errorf("handle event at offset %s: %w", event.Offset, err)
+			}
+		}
+
+		// Protect against infinite loop if offset doesn't advance
+		if nextOffset == offset {
+			return fmt.Errorf("store returned non-advancing offset %s: possible bug in EventStore.Read implementation", offset)
+		}
+		offset = nextOffset
 	}
 
 	return nil
 }
 
-// ReplayWithUpcast replays events from a position, applying upcasts before passing to handler
-func (bus *EventBus) ReplayWithUpcast(ctx context.Context, from int64, handler func(*StoredEvent) error) error {
+// ReplayWithUpcast replays events from an offset, applying upcasts before passing to handler
+func (bus *EventBus) ReplayWithUpcast(ctx context.Context, from Offset, handler func(*StoredEvent) error) error {
 	return bus.Replay(ctx, from, func(event *StoredEvent) error {
 		// Apply upcasts if available
 		if bus.upcastRegistry != nil {
@@ -187,7 +241,7 @@ func (bus *EventBus) ReplayWithUpcast(ctx context.Context, from int64, handler f
 			if err == nil {
 				// Create a new StoredEvent with upcasted data
 				upcastedEvent := &StoredEvent{
-					Position:  event.Position,
+					Offset:    event.Offset,
 					Type:      upcastedType,
 					Data:      upcastedData,
 					Timestamp: event.Timestamp,
@@ -210,8 +264,19 @@ func (bus *EventBus) GetStore() EventStore {
 	return bus.store
 }
 
-// SubscribeWithReplay subscribes and replays missed events
+// SubscribeWithReplay subscribes and replays missed events.
+// Requires both an EventStore (for replay) and a SubscriptionStore (for tracking).
+// If the store implements SubscriptionStore, it will be used automatically.
+//
+// Context usage:
+//   - The context is used for the replay phase (loading historical events)
+//   - The context is used for saving subscription offsets
+//   - The context is NOT used for the live subscription handler (which follows the bus's lifecycle)
+//
+// Note: If the saved offset is OffsetOldest (""), replay starts from the beginning.
+// The OffsetNewest ("$") constant is typically not stored and is only used for live subscriptions.
 func SubscribeWithReplay[T any](
+	ctx context.Context,
 	bus *EventBus,
 	subscriptionID string,
 	handler Handler[T],
@@ -221,16 +286,24 @@ func SubscribeWithReplay[T any](
 		return fmt.Errorf("SubscribeWithReplay requires persistence (use WithStore option)")
 	}
 
-	ctx := context.Background()
+	// Get subscription store - either explicit or from the event store
+	subStore := bus.subscriptionStore
+	if subStore == nil {
+		if ss, ok := bus.store.(SubscriptionStore); ok {
+			subStore = ss
+		} else {
+			return fmt.Errorf("SubscribeWithReplay requires a SubscriptionStore (use WithSubscriptionStore option or use a store that implements SubscriptionStore)")
+		}
+	}
 
-	// Load last position for this subscription
-	lastPos, _ := bus.store.LoadSubscriptionPosition(ctx, subscriptionID)
+	// Load last offset for this subscription
+	lastOffset, _ := subStore.LoadOffset(ctx, subscriptionID)
 
 	// Replay missed events
 	var eventType = reflect.TypeOf((*T)(nil)).Elem()
 	// Use consistent type naming with EventType() function
 	typeName := eventType.String()
-	err := bus.Replay(ctx, lastPos+1, func(stored *StoredEvent) error {
+	err := bus.Replay(ctx, lastOffset, func(stored *StoredEvent) error {
 		// Apply upcasts if available
 		eventData, eventTypeName := stored.Data, stored.Type
 		if bus.upcastRegistry != nil {
@@ -254,8 +327,8 @@ func SubscribeWithReplay[T any](
 
 		handler(event)
 
-		// Update position
-		bus.store.SaveSubscriptionPosition(ctx, subscriptionID, stored.Position)
+		// Update offset
+		subStore.SaveOffset(ctx, subscriptionID, stored.Offset)
 		return nil
 	})
 
@@ -263,109 +336,115 @@ func SubscribeWithReplay[T any](
 		return fmt.Errorf("replay events: %w", err)
 	}
 
-	// Subscribe for future events with position tracking
+	// Subscribe for future events with offset tracking
 	wrappedHandler := func(event T) {
 		handler(event)
 
-		// Update position after handling
+		// Update offset after handling
 		bus.storeMu.RLock()
-		pos := bus.storePosition
+		offset := bus.lastOffset
 		bus.storeMu.RUnlock()
 
-		bus.store.SaveSubscriptionPosition(ctx, subscriptionID, pos)
+		subStore.SaveOffset(ctx, subscriptionID, offset)
 	}
 
 	return Subscribe(bus, wrappedHandler, opts...)
 }
 
-// MemoryStore is a simple in-memory implementation of EventStore
+// MemoryStore is a simple in-memory implementation of EventStore and SubscriptionStore.
 type MemoryStore struct {
 	events        []*StoredEvent
-	subscriptions map[string]int64
+	subscriptions map[string]Offset
+	nextOffset    int64
 	mu            sync.RWMutex
 }
 
-// Ensure MemoryStore implements EventStoreStreamer
+// Ensure MemoryStore implements all required interfaces
+var _ EventStore = (*MemoryStore)(nil)
 var _ EventStoreStreamer = (*MemoryStore)(nil)
+var _ SubscriptionStore = (*MemoryStore)(nil)
 
 // NewMemoryStore creates a new in-memory event store
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
 		events:        make([]*StoredEvent, 0),
-		subscriptions: make(map[string]int64),
+		subscriptions: make(map[string]Offset),
 	}
 }
 
-// Save implements EventStore
-func (m *MemoryStore) Save(ctx context.Context, event *StoredEvent) error {
+// Append implements EventStore
+func (m *MemoryStore) Append(ctx context.Context, event *Event) (Offset, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Set position for the event
-	event.Position = int64(len(m.events)) + 1
-	m.events = append(m.events, event)
-	return nil
+	m.nextOffset++
+	// Use zero-padded format for correct lexicographic ordering
+	offset := Offset(fmt.Sprintf("%020d", m.nextOffset))
+
+	stored := &StoredEvent{
+		Offset:    offset,
+		Type:      event.Type,
+		Data:      event.Data,
+		Timestamp: event.Timestamp,
+	}
+	m.events = append(m.events, stored)
+	return offset, nil
 }
 
-// Load implements EventStore
-func (m *MemoryStore) Load(ctx context.Context, from, to int64) ([]*StoredEvent, error) {
+// Read implements EventStore
+func (m *MemoryStore) Read(ctx context.Context, from Offset, limit int) ([]*StoredEvent, Offset, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	var result []*StoredEvent
+	var lastOffset Offset = from
+
 	for _, event := range m.events {
-		if event.Position >= from && (to == -1 || event.Position <= to) {
+		// Include events after the given offset
+		if from == OffsetOldest || event.Offset > from {
 			result = append(result, event)
+			lastOffset = event.Offset
+			if limit > 0 && len(result) >= limit {
+				break
+			}
 		}
 	}
 
-	return result, nil
+	return result, lastOffset, nil
 }
 
-// GetPosition implements EventStore
-func (m *MemoryStore) GetPosition(ctx context.Context) (int64, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	if len(m.events) == 0 {
-		return 0, nil
-	}
-
-	return m.events[len(m.events)-1].Position, nil
-}
-
-// SaveSubscriptionPosition implements EventStore
-func (m *MemoryStore) SaveSubscriptionPosition(ctx context.Context, subscriptionID string, position int64) error {
+// SaveOffset implements SubscriptionStore
+func (m *MemoryStore) SaveOffset(ctx context.Context, subscriptionID string, offset Offset) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.subscriptions[subscriptionID] = position
+	m.subscriptions[subscriptionID] = offset
 	return nil
 }
 
-// LoadSubscriptionPosition implements EventStore
-func (m *MemoryStore) LoadSubscriptionPosition(ctx context.Context, subscriptionID string) (int64, error) {
+// LoadOffset implements SubscriptionStore
+func (m *MemoryStore) LoadOffset(ctx context.Context, subscriptionID string) (Offset, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	pos, ok := m.subscriptions[subscriptionID]
+	offset, ok := m.subscriptions[subscriptionID]
 	if !ok {
-		return 0, nil
+		return OffsetOldest, nil
 	}
 
-	return pos, nil
+	return offset, nil
 }
 
-// LoadStream implements EventStoreStreamer for memory-efficient event iteration.
+// ReadStream implements EventStoreStreamer for memory-efficient event iteration.
 // Note: This takes a filtered snapshot of matching events to avoid holding the lock
 // during iteration, which could cause deadlocks if handlers call other store methods.
-func (m *MemoryStore) LoadStream(ctx context.Context, from, to int64) iter.Seq2[*StoredEvent, error] {
+func (m *MemoryStore) ReadStream(ctx context.Context, from Offset) iter.Seq2[*StoredEvent, error] {
 	return func(yield func(*StoredEvent, error) bool) {
 		// Take a filtered snapshot to avoid holding lock during iteration
 		m.mu.RLock()
 		var events []*StoredEvent
 		for _, event := range m.events {
-			if event.Position >= from && (to == -1 || event.Position <= to) {
+			if from == OffsetOldest || event.Offset > from {
 				events = append(events, event)
 			}
 		}

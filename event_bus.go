@@ -65,10 +65,12 @@ type EventBus struct {
 
 	// Optional persistence fields (nil if not using persistence)
 	store                   EventStore
-	storePosition           int64
+	subscriptionStore       SubscriptionStore
+	lastOffset              Offset
 	storeMu                 sync.RWMutex
 	persistenceErrorHandler PersistenceErrorHandler
 	persistenceTimeout      time.Duration
+	replayBatchSize         int // Batch size for Replay (default: 100)
 
 	// Upcast registry for event migration
 	upcastRegistry *upcastRegistry
@@ -591,6 +593,16 @@ func WithPersistenceErrorHandler(handler PersistenceErrorHandler) Option {
 func WithPersistenceTimeout(timeout time.Duration) Option {
 	return func(bus *EventBus) {
 		bus.persistenceTimeout = timeout
+	}
+}
+
+// WithReplayBatchSize sets the batch size for Replay operations.
+// This controls how many events are read at a time when using a store
+// that doesn't implement EventStoreStreamer.
+// Default is 100 if not set or set to 0.
+func WithReplayBatchSize(size int) Option {
+	return func(bus *EventBus) {
+		bus.replayBatchSize = size
 	}
 }
 

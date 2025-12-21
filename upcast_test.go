@@ -280,22 +280,21 @@ func TestUpcastWithSubscribeWithReplay(t *testing.T) {
 	// Manually store the event with proper setup
 	v1Data, _ := json.Marshal(v1Event)
 	ctx := context.Background()
-	stored := &StoredEvent{
-		Position:  1,
+	event := &Event{
 		Type:      "eventbus.UserCreatedV1",
 		Data:      v1Data,
 		Timestamp: time.Now(),
 	}
-	store.Save(ctx, stored)
+	offset, _ := store.Append(ctx, event)
 
-	// Update bus position to match
+	// Update bus lastOffset to match
 	bus.storeMu.Lock()
-	bus.storePosition = 1
+	bus.lastOffset = offset
 	bus.storeMu.Unlock()
 
 	// Subscribe expecting V2 events
 	var receivedEvents []UserCreatedV2
-	err = SubscribeWithReplay(bus, "test-subscription", func(event UserCreatedV2) {
+	err = SubscribeWithReplay(ctx, bus, "test-subscription", func(event UserCreatedV2) {
 		receivedEvents = append(receivedEvents, event)
 	})
 	if err != nil {
@@ -335,22 +334,21 @@ func TestReplayWithUpcast(t *testing.T) {
 	v1Event := ProductAddedV1{ProductID: 1, Name: "Widget", Price: 9.99}
 	v1Data, _ := json.Marshal(v1Event)
 	ctx := context.Background()
-	stored := &StoredEvent{
-		Position:  1,
+	event := &Event{
 		Type:      "eventbus.ProductAddedV1",
 		Data:      v1Data,
 		Timestamp: time.Now(),
 	}
-	store.Save(ctx, stored)
+	offset, _ := store.Append(ctx, event)
 
-	// Update bus position to match
+	// Update bus lastOffset to match
 	bus.storeMu.Lock()
-	bus.storePosition = 1
+	bus.lastOffset = offset
 	bus.storeMu.Unlock()
 
 	// Replay with upcast
 	var replayed []*StoredEvent
-	err = bus.ReplayWithUpcast(ctx, 0, func(event *StoredEvent) error {
+	err = bus.ReplayWithUpcast(ctx, OffsetOldest, func(event *StoredEvent) error {
 		replayed = append(replayed, event)
 		return nil
 	})
@@ -610,17 +608,17 @@ func TestReplayWithUpcastNilRegistry(t *testing.T) {
 	// Store an event
 	ctx := context.Background()
 	testData := json.RawMessage(`{"test": "data"}`)
-	store.Save(ctx, &StoredEvent{
-		Position:  1,
+	event := &Event{
 		Type:      "TestType",
 		Data:      testData,
 		Timestamp: time.Now(),
-	})
-	bus.storePosition = 1
+	}
+	offset, _ := store.Append(ctx, event)
+	bus.lastOffset = offset
 
 	// Replay with nil registry should still work
 	var replayed []*StoredEvent
-	err := bus.ReplayWithUpcast(ctx, 0, func(event *StoredEvent) error {
+	err := bus.ReplayWithUpcast(ctx, OffsetOldest, func(event *StoredEvent) error {
 		replayed = append(replayed, event)
 		return nil
 	})

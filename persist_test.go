@@ -45,8 +45,8 @@ func TestWithStoreHookChaining(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	pos, _ := store.GetPosition(ctx)
-	if pos != 1 {
+	events, _, _ := store.Read(ctx, OffsetOldest, 10)
+	if len(events) != 1 {
 		t.Error("Event should be persisted even with existing hook")
 	}
 }
@@ -87,7 +87,7 @@ func TestNonPersistentReplay(t *testing.T) {
 	bus := New() // No persistence
 
 	ctx := context.Background()
-	err := bus.Replay(ctx, 0, func(event *StoredEvent) error {
+	err := bus.Replay(ctx, OffsetOldest, func(event *StoredEvent) error {
 		return nil
 	})
 
@@ -104,7 +104,8 @@ func TestNonPersistentReplay(t *testing.T) {
 func TestSubscribeWithReplayNoPersistence(t *testing.T) {
 	bus := New() // No persistence
 
-	err := SubscribeWithReplay(bus, "test-sub", func(e TestEvent) {})
+	ctx := context.Background()
+	err := SubscribeWithReplay(ctx, bus, "test-sub", func(e TestEvent) {})
 
 	if err == nil {
 		t.Error("Expected error when calling SubscribeWithReplay on non-persistent bus")
@@ -130,21 +131,11 @@ func TestPersistentEventBus(t *testing.T) {
 	Publish(bus, TestEvent{ID: 2, Value: "second"})
 	Publish(bus, TestEvent{ID: 3, Value: "third"})
 
-	// Check position tracking
-	ctx := context.Background()
-	pos, err := store.GetPosition(ctx)
-	if err != nil {
-		t.Fatalf("GetPosition failed: %v", err)
-	}
-
-	if pos != 3 {
-		t.Errorf("Expected position 3, got %d", pos)
-	}
-
 	// Check stored events
-	events, err := store.Load(ctx, 1, 3)
+	ctx := context.Background()
+	events, _, err := store.Read(ctx, OffsetOldest, 0)
 	if err != nil {
-		t.Fatalf("Load failed: %v", err)
+		t.Fatalf("Read failed: %v", err)
 	}
 
 	if len(events) != 3 {
@@ -162,11 +153,11 @@ func TestReplay(t *testing.T) {
 		Publish(bus, TestEvent{ID: i})
 	}
 
-	// Replay from position 2
-	var replayed []int
+	// Replay from the beginning
+	var replayed []string
 	ctx := context.Background()
-	err := bus.Replay(ctx, 2, func(event *StoredEvent) error {
-		replayed = append(replayed, int(event.Position))
+	err := bus.Replay(ctx, OffsetOldest, func(event *StoredEvent) error {
+		replayed = append(replayed, string(event.Offset))
 		return nil
 	})
 
@@ -174,32 +165,53 @@ func TestReplay(t *testing.T) {
 		t.Fatalf("Replay failed: %v", err)
 	}
 
-	// Should replay events 2, 3, 4, 5
-	if len(replayed) != 4 {
-		t.Errorf("Expected 4 replayed events, got %d", len(replayed))
+	// Should replay all 5 events
+	if len(replayed) != 5 {
+		t.Errorf("Expected 5 replayed events, got %d", len(replayed))
+	}
+}
+
+// TestReplayFromOffset tests replay from a specific offset
+func TestReplayFromOffset(t *testing.T) {
+	store := NewMemoryStore()
+	bus := New(WithStore(store))
+
+	// Publish events
+	for i := 1; i <= 5; i++ {
+		Publish(bus, TestEvent{ID: i})
 	}
 
-	for i, pos := range replayed {
-		expected := i + 2
-		if pos != expected {
-			t.Errorf("Expected position %d, got %d", expected, pos)
-		}
+	// Replay from offset "00000000000000000002" (after the second event)
+	var replayed []string
+	ctx := context.Background()
+	err := bus.Replay(ctx, Offset("00000000000000000002"), func(event *StoredEvent) error {
+		replayed = append(replayed, string(event.Offset))
+		return nil
+	})
+
+	if err != nil {
+		t.Fatalf("Replay failed: %v", err)
+	}
+
+	// Should replay events 3, 4, 5 (offsets after "2")
+	if len(replayed) != 3 {
+		t.Errorf("Expected 3 replayed events, got %d", len(replayed))
 	}
 }
 
 // TestReplayWithErrors tests error handling in replay
 func TestReplayWithErrors(t *testing.T) {
-	// Test with store that fails Load
-	store := &errorStore{failLoad: true}
+	// Test with store that fails Read
+	store := &errorStore{failRead: true}
 	bus := New(WithStore(store))
 
 	ctx := context.Background()
-	err := bus.Replay(ctx, 1, func(event *StoredEvent) error {
+	err := bus.Replay(ctx, OffsetOldest, func(event *StoredEvent) error {
 		return nil
 	})
 
 	if err == nil {
-		t.Error("Expected error from Replay when Load fails")
+		t.Error("Expected error from Replay when Read fails")
 	}
 
 	// Test handler error during replay
@@ -212,7 +224,7 @@ func TestReplayWithErrors(t *testing.T) {
 
 	// Replay with handler that errors on second event
 	callCount := 0
-	err = bus2.Replay(ctx, 1, func(event *StoredEvent) error {
+	err = bus2.Replay(ctx, OffsetOldest, func(event *StoredEvent) error {
 		callCount++
 		if callCount == 2 {
 			return errors.New("handler error")
@@ -236,8 +248,9 @@ func TestSubscribeWithReplay(t *testing.T) {
 	}
 
 	// Subscribe with replay
+	ctx := context.Background()
 	var received []int
-	err := SubscribeWithReplay(bus, "test-sub", func(e TestEvent) {
+	err := SubscribeWithReplay(ctx, bus, "test-sub", func(e TestEvent) {
 		received = append(received, e.ID)
 	})
 
@@ -262,22 +275,22 @@ func TestSubscribeWithReplay(t *testing.T) {
 		t.Errorf("Expected 5 total events, got %d", len(received))
 	}
 
-	// Check subscription position was saved
-	ctx := context.Background()
-	pos, err := store.LoadSubscriptionPosition(ctx, "test-sub")
+	// Check subscription offset was saved
+	offset, err := store.LoadOffset(ctx, "test-sub")
 	if err != nil {
-		t.Fatalf("LoadSubscriptionPosition failed: %v", err)
+		t.Fatalf("LoadOffset failed: %v", err)
 	}
 
-	if pos != 5 {
-		t.Errorf("Expected subscription position 5, got %d", pos)
+	if offset != Offset("00000000000000000005") {
+		t.Errorf("Expected subscription offset '00000000000000000005', got %s", offset)
 	}
 }
 
-// TestSubscribeWithReplayResume tests resuming from saved position
+// TestSubscribeWithReplayResume tests resuming from saved offset
 func TestSubscribeWithReplayResume(t *testing.T) {
 	store := NewMemoryStore()
 	bus := New(WithStore(store))
+	ctx := context.Background()
 
 	// Publish initial events
 	for i := 1; i <= 3; i++ {
@@ -286,7 +299,7 @@ func TestSubscribeWithReplayResume(t *testing.T) {
 
 	// First subscription
 	var received1 []int
-	SubscribeWithReplay(bus, "resumable", func(e TestEvent) {
+	SubscribeWithReplay(ctx, bus, "resumable", func(e TestEvent) {
 		received1 = append(received1, e.ID)
 	})
 
@@ -307,11 +320,11 @@ func TestSubscribeWithReplayResume(t *testing.T) {
 
 	// Resume subscription - should only get new events
 	var received2 []int
-	SubscribeWithReplay(bus2, "resumable", func(e TestEvent) {
+	SubscribeWithReplay(ctx, bus2, "resumable", func(e TestEvent) {
 		received2 = append(received2, e.ID)
 	})
 
-	// Should not replay any events since position is at 6
+	// Should not replay any events since offset is at 6
 	if len(received2) != 0 {
 		t.Errorf("Expected 0 replayed events on resume, got %d", len(received2))
 	}
@@ -333,31 +346,34 @@ func TestSubscribeWithReplayUnmarshalError(t *testing.T) {
 	store := NewMemoryStore()
 	bus := New(WithStore(store))
 
-	// First publish a valid event to set the position
+	// First publish a valid event
 	Publish(bus, TestEvent{ID: 1, Value: "valid"})
 
-	// Now manually insert an event with invalid JSON that will cause unmarshal to fail
-	ctx := context.Background()
+	// Now manually insert an event with invalid JSON
 	eventType := reflect.TypeOf((*TestEvent)(nil)).Elem()
-	// Use consistent type naming
 	typeName := eventType.String()
 
-	// This JSON is syntactically invalid
-	store.Save(ctx, &StoredEvent{
-		Position:  2,
+	// Manually append an event with invalid JSON
+	store.mu.Lock()
+	store.nextOffset++
+	offset := Offset(fmt.Sprintf("%020d", store.nextOffset))
+	store.events = append(store.events, &StoredEvent{
+		Offset:    offset,
 		Type:      typeName,
 		Data:      []byte(`{"ID": "unclosed`), // Invalid JSON
 		Timestamp: time.Now(),
 	})
+	store.mu.Unlock()
 
-	// Update the bus position manually since we bypassed Publish
+	// Update the bus lastOffset
 	bus.storeMu.Lock()
-	bus.storePosition = 2
+	bus.lastOffset = offset
 	bus.storeMu.Unlock()
 
 	// Subscribe with replay - should fail due to unmarshal error
+	ctx := context.Background()
 	var received []TestEvent
-	err := SubscribeWithReplay(bus, "unmarshal-test", func(e TestEvent) {
+	err := SubscribeWithReplay(ctx, bus, "unmarshal-test", func(e TestEvent) {
 		received = append(received, e)
 	})
 
@@ -387,8 +403,9 @@ func TestSubscribeWithReplayDifferentEventTypes(t *testing.T) {
 	Publish(bus, TestEvent{ID: 3})
 
 	// Subscribe to TestEvent only
+	ctx := context.Background()
 	var received []int
-	err := SubscribeWithReplay(bus, "test-only", func(e TestEvent) {
+	err := SubscribeWithReplay(ctx, bus, "test-only", func(e TestEvent) {
 		received = append(received, e.ID)
 	})
 
@@ -414,81 +431,71 @@ func TestMemoryStore(t *testing.T) {
 	ctx := context.Background()
 
 	// Test empty store
-	pos, err := store.GetPosition(ctx)
+	events, offset, err := store.Read(ctx, OffsetOldest, 0)
 	if err != nil {
-		t.Fatalf("GetPosition on empty store failed: %v", err)
+		t.Fatalf("Read on empty store failed: %v", err)
 	}
-	if pos != 0 {
-		t.Errorf("Expected position 0 for empty store, got %d", pos)
+	if len(events) != 0 {
+		t.Errorf("Expected 0 events for empty store, got %d", len(events))
+	}
+	if offset != OffsetOldest {
+		t.Errorf("Expected OffsetOldest for empty store, got %s", offset)
 	}
 
-	// Save events
+	// Append events
 	for i := 1; i <= 3; i++ {
-		event := &StoredEvent{
-			Position:  int64(i),
+		event := &Event{
 			Type:      "TestEvent",
 			Data:      []byte(`{}`),
 			Timestamp: time.Now(),
 		}
-		if err := store.Save(ctx, event); err != nil {
-			t.Fatalf("Save failed: %v", err)
+		_, err := store.Append(ctx, event)
+		if err != nil {
+			t.Fatalf("Append failed: %v", err)
 		}
 	}
 
-	// Test GetPosition
-	pos, err = store.GetPosition(ctx)
+	// Test Read all
+	events, offset, err = store.Read(ctx, OffsetOldest, 0)
 	if err != nil {
-		t.Fatalf("GetPosition failed: %v", err)
+		t.Fatalf("Read failed: %v", err)
 	}
-	if pos != 3 {
-		t.Errorf("Expected position 3, got %d", pos)
+	if len(events) != 3 {
+		t.Errorf("Expected 3 events, got %d", len(events))
+	}
+	if offset != Offset("00000000000000000003") {
+		t.Errorf("Expected offset '00000000000000000003', got %s", offset)
 	}
 
-	// Test Load range
-	events, err := store.Load(ctx, 2, 3)
+	// Test Read with limit
+	events, offset, err = store.Read(ctx, OffsetOldest, 2)
 	if err != nil {
-		t.Fatalf("Load failed: %v", err)
+		t.Fatalf("Read with limit failed: %v", err)
 	}
 	if len(events) != 2 {
-		t.Errorf("Expected 2 events, got %d", len(events))
+		t.Errorf("Expected 2 events with limit, got %d", len(events))
 	}
 
-	// Test subscription positions
-	if err := store.SaveSubscriptionPosition(ctx, "sub1", 2); err != nil {
-		t.Fatalf("SaveSubscriptionPosition failed: %v", err)
+	// Test subscription offsets
+	if err := store.SaveOffset(ctx, "sub1", Offset("00000000000000000002")); err != nil {
+		t.Fatalf("SaveOffset failed: %v", err)
 	}
 
-	pos, err = store.LoadSubscriptionPosition(ctx, "sub1")
+	offset, err = store.LoadOffset(ctx, "sub1")
 	if err != nil {
-		t.Fatalf("LoadSubscriptionPosition failed: %v", err)
+		t.Fatalf("LoadOffset failed: %v", err)
 	}
-	if pos != 2 {
-		t.Errorf("Expected subscription position 2, got %d", pos)
+	if offset != Offset("00000000000000000002") {
+		t.Errorf("Expected subscription offset '00000000000000000002', got %s", offset)
 	}
 
 	// Test unknown subscription
-	pos, err = store.LoadSubscriptionPosition(ctx, "unknown")
+	offset, err = store.LoadOffset(ctx, "unknown")
 	if err != nil {
-		t.Fatalf("LoadSubscriptionPosition for unknown sub failed: %v", err)
+		t.Fatalf("LoadOffset for unknown sub failed: %v", err)
 	}
-	if pos != 0 {
-		t.Errorf("Expected position 0 for unknown subscription, got %d", pos)
-	}
-}
-
-// TestPersistentBusWithFailingStore tests with store that fails GetPosition
-func TestPersistentBusWithFailingStore(t *testing.T) {
-	store := &errorStore{}
-	bus := New(WithStore(store))
-
-	// Should still create bus even if GetPosition fails
-	if bus == nil {
-		t.Fatal("Expected bus to be created despite GetPosition error")
-	}
-
-	// Position should be 0 when GetPosition fails
-	if bus.storePosition != 0 {
-		t.Errorf("Expected position 0 when GetPosition fails, got %d", bus.storePosition)
+	if offset != OffsetOldest {
+		t.Errorf("Expected OffsetOldest for unknown subscription, got %s", offset)
 	}
 }
 
@@ -499,16 +506,12 @@ func TestPersistEventWithNilStore(t *testing.T) {
 	bus := New(WithStore(store))
 
 	// Now manually set store to nil to test defensive check
-	// This simulates an edge case where store becomes nil after initialization
 	bus.store = nil
 
 	// Publish an event - the hook will call persistEvent with nil store
 	Publish(bus, TestEvent{ID: 1})
 
-	// Should not panic, and position should not change
-	if bus.storePosition != 0 {
-		t.Error("Expected position to remain 0 when store is nil")
-	}
+	// Should not panic
 }
 
 // TestPersistEventWithUnmarshalableData tests persist with unmarshalable data
@@ -530,42 +533,38 @@ func TestPersistEventWithUnmarshalableData(t *testing.T) {
 
 	// Check that no event was stored
 	ctx := context.Background()
-	pos, _ := store.GetPosition(ctx)
-	if pos != 0 {
+	events, _, _ := store.Read(ctx, OffsetOldest, 0)
+	if len(events) != 0 {
 		t.Error("Expected no events to be stored when marshaling fails")
 	}
 }
 
 // errorStore is a mock store that returns errors
 type errorStore struct {
-	failLoad bool
-	failSave bool
+	failRead   bool
+	failAppend bool
 }
 
-func (e *errorStore) Save(ctx context.Context, event *StoredEvent) error {
-	if e.failSave {
-		return errors.New("save failed")
+func (e *errorStore) Append(ctx context.Context, event *Event) (Offset, error) {
+	if e.failAppend {
+		return "", errors.New("append failed")
 	}
+	return Offset("1"), nil
+}
+
+func (e *errorStore) Read(ctx context.Context, from Offset, limit int) ([]*StoredEvent, Offset, error) {
+	if e.failRead {
+		return nil, "", errors.New("read failed")
+	}
+	return []*StoredEvent{}, from, nil
+}
+
+func (e *errorStore) SaveOffset(ctx context.Context, subscriptionID string, offset Offset) error {
 	return nil
 }
 
-func (e *errorStore) Load(ctx context.Context, from, to int64) ([]*StoredEvent, error) {
-	if e.failLoad {
-		return nil, errors.New("load failed")
-	}
-	return []*StoredEvent{}, nil
-}
-
-func (e *errorStore) GetPosition(ctx context.Context) (int64, error) {
-	return 0, errors.New("get position failed")
-}
-
-func (e *errorStore) SaveSubscriptionPosition(ctx context.Context, subscriptionID string, position int64) error {
-	return nil
-}
-
-func (e *errorStore) LoadSubscriptionPosition(ctx context.Context, subscriptionID string) (int64, error) {
-	return 0, nil
+func (e *errorStore) LoadOffset(ctx context.Context, subscriptionID string) (Offset, error) {
+	return OffsetOldest, nil
 }
 
 // TestTypeNameConsistency verifies that EventType() and persistEvent use the same type naming
@@ -596,7 +595,7 @@ func TestTypeNameConsistency(t *testing.T) {
 
 			// Retrieve the last stored event
 			ctx := context.Background()
-			events, err := store.Load(ctx, 0, 100)
+			events, _, err := store.Read(ctx, OffsetOldest, 100)
 			if err != nil {
 				t.Fatalf("Failed to load events: %v", err)
 			}
@@ -622,7 +621,7 @@ func TestPersistenceErrorHandler(t *testing.T) {
 	var capturedType reflect.Type
 	var capturedError error
 
-	store := &errorStore{failSave: true}
+	store := &errorStore{failAppend: true}
 	bus := New(
 		WithStore(store),
 		WithPersistenceErrorHandler(func(event any, eventType reflect.Type, err error) {
@@ -649,13 +648,8 @@ func TestPersistenceErrorHandler(t *testing.T) {
 		t.Errorf("Wrong type captured: %v", capturedType)
 	}
 
-	if !strings.Contains(capturedError.Error(), "save failed") {
+	if !strings.Contains(capturedError.Error(), "append failed") {
 		t.Errorf("Wrong error captured: %v", capturedError)
-	}
-
-	// Verify position didn't increment on failure
-	if bus.storePosition != 0 {
-		t.Errorf("Position should not increment on save failure, got %d", bus.storePosition)
 	}
 }
 
@@ -685,11 +679,6 @@ func TestPersistenceMarshalError(t *testing.T) {
 
 	if !strings.Contains(capturedError.Error(), "marshal") {
 		t.Errorf("Expected marshal error, got: %v", capturedError)
-	}
-
-	// Verify position didn't increment
-	if bus.storePosition != 0 {
-		t.Errorf("Position should not increment on marshal failure, got %d", bus.storePosition)
 	}
 }
 
@@ -727,7 +716,7 @@ func TestPersistenceTimeout(t *testing.T) {
 func TestSetPersistenceErrorHandler(t *testing.T) {
 	var handlerCalled bool
 
-	store := &errorStore{failSave: true}
+	store := &errorStore{failAppend: true}
 	bus := New(WithStore(store))
 
 	// Set error handler at runtime
@@ -742,8 +731,8 @@ func TestSetPersistenceErrorHandler(t *testing.T) {
 	}
 }
 
-// TestPersistenceSuccessIncrementsPosition tests that position only increments on success
-func TestPersistenceSuccessIncrementsPosition(t *testing.T) {
+// TestPersistenceSuccessIncrementsOffset tests that offset is tracked on success
+func TestPersistenceSuccessIncrementsOffset(t *testing.T) {
 	store := NewMemoryStore()
 	bus := New(WithStore(store))
 
@@ -752,39 +741,30 @@ func TestPersistenceSuccessIncrementsPosition(t *testing.T) {
 		Publish(bus, TestEvent{ID: i})
 	}
 
-	// Verify position incremented correctly
-	if bus.storePosition != 3 {
-		t.Errorf("Expected position 3, got %d", bus.storePosition)
+	// Verify lastOffset was updated
+	bus.storeMu.RLock()
+	lastOffset := bus.lastOffset
+	bus.storeMu.RUnlock()
+
+	if lastOffset != Offset("00000000000000000003") {
+		t.Errorf("Expected lastOffset '00000000000000000003', got %s", lastOffset)
 	}
 
 	// Verify all events were stored
 	ctx := context.Background()
-	events, _ := store.Load(ctx, 0, 100)
+	events, _, _ := store.Read(ctx, OffsetOldest, 0)
 	if len(events) != 3 {
 		t.Errorf("Expected 3 events stored, got %d", len(events))
-	}
-
-	// Verify positions are sequential
-	for i, event := range events {
-		expectedPos := int64(i + 1)
-		if event.Position != expectedPos {
-			t.Errorf("Event %d has position %d, expected %d", i, event.Position, expectedPos)
-		}
 	}
 }
 
 // TestPersistenceWithoutErrorHandler tests that errors don't crash when no handler is set
 func TestPersistenceWithoutErrorHandler(t *testing.T) {
-	store := &errorStore{failSave: true}
+	store := &errorStore{failAppend: true}
 	bus := New(WithStore(store))
 
 	// This should not panic even without error handler
 	Publish(bus, TestEvent{ID: 1})
-
-	// Verify position didn't increment
-	if bus.storePosition != 0 {
-		t.Errorf("Position should not increment on failure, got %d", bus.storePosition)
-	}
 }
 
 // slowStore is a mock store that delays operations
@@ -792,33 +772,29 @@ type slowStore struct {
 	delay time.Duration
 }
 
-func (s *slowStore) Save(ctx context.Context, event *StoredEvent) error {
+func (s *slowStore) Append(ctx context.Context, event *Event) (Offset, error) {
 	select {
 	case <-time.After(s.delay):
-		return nil
+		return Offset("1"), nil
 	case <-ctx.Done():
-		return ctx.Err()
+		return "", ctx.Err()
 	}
 }
 
-func (s *slowStore) Load(ctx context.Context, from, to int64) ([]*StoredEvent, error) {
-	return []*StoredEvent{}, nil
+func (s *slowStore) Read(ctx context.Context, from Offset, limit int) ([]*StoredEvent, Offset, error) {
+	return []*StoredEvent{}, from, nil
 }
 
-func (s *slowStore) GetPosition(ctx context.Context) (int64, error) {
-	return 0, nil
-}
-
-func (s *slowStore) SaveSubscriptionPosition(ctx context.Context, subscriptionID string, position int64) error {
+func (s *slowStore) SaveOffset(ctx context.Context, subscriptionID string, offset Offset) error {
 	return nil
 }
 
-func (s *slowStore) LoadSubscriptionPosition(ctx context.Context, subscriptionID string) (int64, error) {
-	return 0, nil
+func (s *slowStore) LoadOffset(ctx context.Context, subscriptionID string) (Offset, error) {
+	return OffsetOldest, nil
 }
 
-// TestConcurrentPersistPositionRace tests for race condition in position assignment
-func TestConcurrentPersistPositionRace(t *testing.T) {
+// TestConcurrentPersist tests for race condition in concurrent publishing
+func TestConcurrentPersist(t *testing.T) {
 	store := NewMemoryStore()
 	bus := New(WithStore(store))
 
@@ -846,7 +822,7 @@ func TestConcurrentPersistPositionRace(t *testing.T) {
 
 	// Verify all events were persisted
 	ctx := context.Background()
-	events, err := store.Load(ctx, 0, int64(totalEvents))
+	events, _, err := store.Read(ctx, OffsetOldest, 0)
 	if err != nil {
 		t.Fatalf("Failed to load events: %v", err)
 	}
@@ -855,250 +831,31 @@ func TestConcurrentPersistPositionRace(t *testing.T) {
 		t.Errorf("Expected %d events, got %d", totalEvents, len(events))
 	}
 
-	// Check for duplicate positions (the race condition symptom)
-	positions := make(map[int64]bool)
-	duplicates := []int64{}
+	// Check for duplicate offsets (the race condition symptom)
+	offsets := make(map[Offset]bool)
+	duplicates := []Offset{}
 
 	for _, event := range events {
-		if positions[event.Position] {
-			duplicates = append(duplicates, event.Position)
+		if offsets[event.Offset] {
+			duplicates = append(duplicates, event.Offset)
 		}
-		positions[event.Position] = true
+		offsets[event.Offset] = true
 	}
 
 	if len(duplicates) > 0 {
-		t.Errorf("Found duplicate positions (race condition): %v", duplicates)
-	}
-
-	// Check that positions are sequential from 1 to totalEvents
-	for i := int64(1); i <= int64(totalEvents); i++ {
-		if !positions[i] {
-			t.Errorf("Missing position %d in sequence", i)
-		}
-	}
-
-	// Verify final position matches expected
-	finalPos, _ := store.GetPosition(ctx)
-	if finalPos != int64(totalEvents) {
-		t.Errorf("Expected final position %d, got %d", totalEvents, finalPos)
+		t.Errorf("Found duplicate offsets (race condition): %v", duplicates)
 	}
 }
 
-// slowSaveStore introduces delays to expose race conditions
-type slowSaveStore struct {
-	MemoryStore
-	saveDelay time.Duration
-}
-
-func (s *slowSaveStore) Save(ctx context.Context, event *StoredEvent) error {
-	// Add delay between reading position and saving
-	time.Sleep(s.saveDelay)
-	return s.MemoryStore.Save(ctx, event)
-}
-
-// TestConcurrentPersistPositionRaceWithDelay uses a slow store to expose the race
-func TestConcurrentPersistPositionRaceWithDelay(t *testing.T) {
-	slowStore := &slowSaveStore{
-		MemoryStore: MemoryStore{
-			events:        make([]*StoredEvent, 0),
-			subscriptions: make(map[string]int64),
-		},
-		saveDelay: 1 * time.Millisecond, // Small delay to widen race window
-	}
-
-	bus := New(WithStore(slowStore))
-
-	const numGoroutines = 50
-	totalEvents := numGoroutines
-
-	var wg sync.WaitGroup
-	wg.Add(numGoroutines)
-
-	// Publish one event from each goroutine simultaneously
-	startChan := make(chan struct{})
-	for g := 0; g < numGoroutines; g++ {
-		go func(goroutineID int) {
-			defer wg.Done()
-			<-startChan // Wait for signal to start all at once
-			Publish(bus, TestEvent{
-				ID:    goroutineID,
-				Value: fmt.Sprintf("event-%d", goroutineID),
-			})
-		}(g)
-	}
-
-	// Release all goroutines at once to maximize contention
-	close(startChan)
-	wg.Wait()
-
-	// Verify all events were persisted
-	ctx := context.Background()
-	events, err := slowStore.Load(ctx, 0, int64(totalEvents))
-	if err != nil {
-		t.Fatalf("Failed to load events: %v", err)
-	}
-
-	if len(events) != totalEvents {
-		t.Errorf("Expected %d events, got %d", totalEvents, len(events))
-	}
-
-	// Check for duplicate positions (the race condition symptom)
-	positions := make(map[int64]bool)
-	duplicates := []int64{}
-
-	for _, event := range events {
-		if positions[event.Position] {
-			duplicates = append(duplicates, event.Position)
-			t.Logf("Duplicate position found: %d", event.Position)
-		}
-		positions[event.Position] = true
-	}
-
-	if len(duplicates) > 0 {
-		t.Errorf("RACE DETECTED: Found %d duplicate positions: %v", len(duplicates), duplicates)
-	}
-
-	// Check that positions are sequential from 1 to totalEvents
-	missing := []int64{}
-	for i := int64(1); i <= int64(totalEvents); i++ {
-		if !positions[i] {
-			missing = append(missing, i)
-		}
-	}
-
-	if len(missing) > 0 {
-		t.Errorf("Missing positions in sequence: %v", missing)
-	}
-
-	// Verify final position matches expected
-	finalPos, _ := slowStore.GetPosition(ctx)
-	if finalPos != int64(totalEvents) {
-		t.Errorf("Expected final position %d, got %d", totalEvents, finalPos)
-	}
-}
-
-// realisticStore mimics a real database that respects the position from the event
-type realisticStore struct {
-	mu            sync.Mutex
-	events        []*StoredEvent
-	subscriptions map[string]int64
-}
-
-func (r *realisticStore) Save(ctx context.Context, event *StoredEvent) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	// A real database would use the position from the event, not overwrite it
-	// This is the key difference from MemoryStore
-	r.events = append(r.events, event)
-	return nil
-}
-
-func (r *realisticStore) Load(ctx context.Context, from, to int64) ([]*StoredEvent, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	var result []*StoredEvent
-	for _, event := range r.events {
-		if event.Position >= from && (to == -1 || event.Position <= to) {
-			result = append(result, event)
-		}
-	}
-	return result, nil
-}
-
-func (r *realisticStore) GetPosition(ctx context.Context) (int64, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if len(r.events) == 0 {
-		return 0, nil
-	}
-	return r.events[len(r.events)-1].Position, nil
-}
-
-func (r *realisticStore) SaveSubscriptionPosition(ctx context.Context, subscriptionID string, position int64) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.subscriptions[subscriptionID] = position
-	return nil
-}
-
-func (r *realisticStore) LoadSubscriptionPosition(ctx context.Context, subscriptionID string) (int64, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	pos, _ := r.subscriptions[subscriptionID]
-	return pos, nil
-}
-
-// TestPositionRaceWithRealisticStore exposes the actual race condition
-func TestPositionRaceWithRealisticStore(t *testing.T) {
-	store := &realisticStore{
-		events:        make([]*StoredEvent, 0),
-		subscriptions: make(map[string]int64),
-	}
-
-	bus := New(WithStore(store))
-
-	const numGoroutines = 100
-	totalEvents := numGoroutines
-
-	var wg sync.WaitGroup
-	wg.Add(numGoroutines)
-
-	// Publish one event from each goroutine simultaneously
-	startChan := make(chan struct{})
-	for g := 0; g < numGoroutines; g++ {
-		go func(goroutineID int) {
-			defer wg.Done()
-			<-startChan
-			Publish(bus, TestEvent{
-				ID:    goroutineID,
-				Value: fmt.Sprintf("event-%d", goroutineID),
-			})
-		}(g)
-	}
-
-	// Release all at once
-	close(startChan)
-	wg.Wait()
-
-	// Check for the race condition
-	ctx := context.Background()
-	events, _ := store.Load(ctx, 0, 1000)
-
-	if len(events) != totalEvents {
-		t.Errorf("Expected %d events, got %d", totalEvents, len(events))
-	}
-
-	// Check for duplicate positions - THIS SHOULD FAIL
-	positions := make(map[int64]int) // position -> count
-	for _, event := range events {
-		positions[event.Position]++
-	}
-
-	duplicates := []int64{}
-	for pos, count := range positions {
-		if count > 1 {
-			duplicates = append(duplicates, pos)
-			t.Logf("Position %d appears %d times", pos, count)
-		}
-	}
-
-	if len(duplicates) > 0 {
-		t.Errorf("RACE CONDITION DETECTED: %d positions have duplicates: %v", len(duplicates), duplicates)
-	}
-}
-
-// contextCapturingStore captures the context passed to Save for testing
+// contextCapturingStore captures the context passed to Append for testing
 type contextCapturingStore struct {
 	*MemoryStore
 	capturedCtx context.Context
 }
 
-func (s *contextCapturingStore) Save(ctx context.Context, event *StoredEvent) error {
+func (s *contextCapturingStore) Append(ctx context.Context, event *Event) (Offset, error) {
 	s.capturedCtx = ctx
-	return s.MemoryStore.Save(ctx, event)
+	return s.MemoryStore.Append(ctx, event)
 }
 
 func TestPersistenceReceivesPublishContext(t *testing.T) {
@@ -1155,7 +912,7 @@ func TestWithStoreContextHookChaining(t *testing.T) {
 	}
 
 	// Event should also be persisted
-	events, err := store.Load(context.Background(), 1, 1)
+	events, _, err := store.Read(context.Background(), OffsetOldest, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1164,25 +921,24 @@ func TestWithStoreContextHookChaining(t *testing.T) {
 	}
 }
 
-// TestMemoryStoreLoadStream tests the LoadStream implementation
-func TestMemoryStoreLoadStream(t *testing.T) {
+// TestMemoryStoreReadStream tests the ReadStream implementation
+func TestMemoryStoreReadStream(t *testing.T) {
 	store := NewMemoryStore()
 	ctx := context.Background()
 
-	// Save test events
+	// Append test events
 	for i := 1; i <= 5; i++ {
-		event := &StoredEvent{
-			Position:  int64(i),
+		event := &Event{
 			Type:      "TestEvent",
 			Data:      []byte(fmt.Sprintf(`{"id": %d}`, i)),
 			Timestamp: time.Now(),
 		}
-		store.Save(ctx, event)
+		store.Append(ctx, event)
 	}
 
-	t.Run("streams all events from position", func(t *testing.T) {
+	t.Run("streams all events from beginning", func(t *testing.T) {
 		var received []*StoredEvent
-		for event, err := range store.LoadStream(ctx, 1, -1) {
+		for event, err := range store.ReadStream(ctx, OffsetOldest) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -1194,51 +950,32 @@ func TestMemoryStoreLoadStream(t *testing.T) {
 		}
 	})
 
-	t.Run("streams events with upper bound", func(t *testing.T) {
+	t.Run("streams events from specific offset", func(t *testing.T) {
 		var received []*StoredEvent
-		for event, err := range store.LoadStream(ctx, 2, 4) {
+		for event, err := range store.ReadStream(ctx, Offset("00000000000000000002")) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 			received = append(received, event)
 		}
 
+		// Should get events 3, 4, 5 (after offset "00000000000000000002")
 		if len(received) != 3 {
 			t.Errorf("expected 3 events, got %d", len(received))
 		}
-		if received[0].Position != 2 {
-			t.Errorf("expected first position 2, got %d", received[0].Position)
-		}
-		if received[2].Position != 4 {
-			t.Errorf("expected last position 4, got %d", received[2].Position)
-		}
-	})
-
-	t.Run("streams events from middle position", func(t *testing.T) {
-		var received []*StoredEvent
-		for event, err := range store.LoadStream(ctx, 3, -1) {
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			received = append(received, event)
-		}
-
-		if len(received) != 3 {
-			t.Errorf("expected 3 events, got %d", len(received))
-		}
-		if received[0].Position != 3 {
-			t.Errorf("expected first position 3, got %d", received[0].Position)
+		if received[0].Offset != Offset("00000000000000000003") {
+			t.Errorf("expected first offset '00000000000000000003', got %s", received[0].Offset)
 		}
 	})
 
 	t.Run("handles early termination", func(t *testing.T) {
 		count := 0
-		for event, err := range store.LoadStream(ctx, 1, -1) {
+		for event, err := range store.ReadStream(ctx, OffsetOldest) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 			count++
-			if event.Position == 2 {
+			if event.Offset == Offset("00000000000000000002") {
 				break // Early termination
 			}
 		}
@@ -1253,7 +990,7 @@ func TestMemoryStoreLoadStream(t *testing.T) {
 		cancel() // Cancel immediately
 
 		var gotError bool
-		for _, err := range store.LoadStream(cancelCtx, 1, -1) {
+		for _, err := range store.ReadStream(cancelCtx, OffsetOldest) {
 			if err != nil {
 				gotError = true
 				if !errors.Is(err, context.Canceled) {
@@ -1269,8 +1006,9 @@ func TestMemoryStoreLoadStream(t *testing.T) {
 	})
 
 	t.Run("returns empty for out of range", func(t *testing.T) {
+		// Use an offset that's lexicographically greater than "00000000000000000004"
 		count := 0
-		for _, err := range store.LoadStream(ctx, 100, -1) {
+		for _, err := range store.ReadStream(ctx, Offset("00000000000000000005")) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -1295,14 +1033,14 @@ func TestEventStoreStreamerInterface(t *testing.T) {
 
 	// Verify it works
 	ctx := context.Background()
-	for _, err := range streamer.LoadStream(ctx, 0, -1) {
+	for _, err := range streamer.ReadStream(ctx, OffsetOldest) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	}
 }
 
-// TestReplayUsesStreaming tests that Replay auto-detects and uses LoadStream
+// TestReplayUsesStreaming tests that Replay auto-detects and uses ReadStream
 func TestReplayUsesStreaming(t *testing.T) {
 	store := NewMemoryStore()
 	bus := New(WithStore(store))
@@ -1313,10 +1051,10 @@ func TestReplayUsesStreaming(t *testing.T) {
 	}
 
 	// Replay should use streaming internally (MemoryStore implements EventStoreStreamer)
-	var replayed []int
+	var replayed []string
 	ctx := context.Background()
-	err := bus.Replay(ctx, 2, func(event *StoredEvent) error {
-		replayed = append(replayed, int(event.Position))
+	err := bus.Replay(ctx, Offset("00000000000000000001"), func(event *StoredEvent) error {
+		replayed = append(replayed, string(event.Offset))
 		return nil
 	})
 
@@ -1324,16 +1062,9 @@ func TestReplayUsesStreaming(t *testing.T) {
 		t.Fatalf("Replay failed: %v", err)
 	}
 
-	// Should replay events 2, 3, 4, 5
+	// Should replay events after offset "1" (2, 3, 4, 5)
 	if len(replayed) != 4 {
 		t.Errorf("Expected 4 replayed events, got %d", len(replayed))
-	}
-
-	for i, pos := range replayed {
-		expected := i + 2
-		if pos != expected {
-			t.Errorf("Expected position %d, got %d", expected, pos)
-		}
 	}
 }
 
@@ -1342,24 +1073,24 @@ type streamingErrorStore struct {
 	errorStore
 }
 
-func (s *streamingErrorStore) LoadStream(ctx context.Context, from, to int64) iter.Seq2[*StoredEvent, error] {
+func (s *streamingErrorStore) ReadStream(ctx context.Context, from Offset) iter.Seq2[*StoredEvent, error] {
 	return func(yield func(*StoredEvent, error) bool) {
 		yield(nil, errors.New("stream error"))
 	}
 }
 
-// TestReplayWithStreamingError tests error handling when LoadStream returns an error
+// TestReplayWithStreamingError tests error handling when ReadStream returns an error
 func TestReplayWithStreamingError(t *testing.T) {
 	store := &streamingErrorStore{}
 	bus := New(WithStore(store))
 
 	ctx := context.Background()
-	err := bus.Replay(ctx, 1, func(event *StoredEvent) error {
+	err := bus.Replay(ctx, OffsetOldest, func(event *StoredEvent) error {
 		return nil
 	})
 
 	if err == nil {
-		t.Error("Expected error from Replay when LoadStream fails")
+		t.Error("Expected error from Replay when ReadStream fails")
 	}
 
 	if !strings.Contains(err.Error(), "stream events") {
@@ -1372,17 +1103,17 @@ type nonStreamingStore struct {
 	errorStore
 }
 
-// TestReplayFallsBackToLoad tests that Replay falls back to Load for non-streaming stores
-func TestReplayFallsBackToLoad(t *testing.T) {
+// TestReplayFallsBackToRead tests that Replay falls back to Read for non-streaming stores
+func TestReplayFallsBackToRead(t *testing.T) {
 	store := &nonStreamingStore{}
 	bus := New(WithStore(store))
 
 	ctx := context.Background()
-	err := bus.Replay(ctx, 1, func(event *StoredEvent) error {
+	err := bus.Replay(ctx, OffsetOldest, func(event *StoredEvent) error {
 		return nil
 	})
 
-	// Should succeed with empty result since Load returns empty slice
+	// Should succeed with empty result since Read returns empty slice
 	if err != nil {
 		t.Errorf("Unexpected error: %v", err)
 	}
@@ -1400,8 +1131,8 @@ func TestReplayStreamingHandlerError(t *testing.T) {
 
 	ctx := context.Background()
 	handlerErr := errors.New("handler failed")
-	err := bus.Replay(ctx, 1, func(event *StoredEvent) error {
-		if event.Position == 2 {
+	err := bus.Replay(ctx, OffsetOldest, func(event *StoredEvent) error {
+		if event.Offset == Offset("00000000000000000002") {
 			return handlerErr
 		}
 		return nil
@@ -1411,70 +1142,76 @@ func TestReplayStreamingHandlerError(t *testing.T) {
 		t.Error("Expected error from Replay when handler fails")
 	}
 
-	if !strings.Contains(err.Error(), "handle event at position 2") {
-		t.Errorf("Expected 'handle event at position 2' in error, got: %v", err)
+	if !strings.Contains(err.Error(), "handle event at offset 00000000000000000002") {
+		t.Errorf("Expected 'handle event at offset 00000000000000000002' in error, got: %v", err)
 	}
 }
 
 // nonStreamingStoreWithEvents returns events for testing fallback path
 type nonStreamingStoreWithEvents struct {
-	events []*StoredEvent
+	events     []*StoredEvent
+	nextOffset int64
 }
 
-func (s *nonStreamingStoreWithEvents) Save(ctx context.Context, event *StoredEvent) error {
-	event.Position = int64(len(s.events)) + 1
-	s.events = append(s.events, event)
-	return nil
+func (s *nonStreamingStoreWithEvents) Append(ctx context.Context, event *Event) (Offset, error) {
+	s.nextOffset++
+	// Use zero-padded offsets for correct lexicographic ordering
+	offset := Offset(fmt.Sprintf("%020d", s.nextOffset))
+	stored := &StoredEvent{
+		Offset:    offset,
+		Type:      event.Type,
+		Data:      event.Data,
+		Timestamp: event.Timestamp,
+	}
+	s.events = append(s.events, stored)
+	return offset, nil
 }
 
-func (s *nonStreamingStoreWithEvents) Load(ctx context.Context, from, to int64) ([]*StoredEvent, error) {
+func (s *nonStreamingStoreWithEvents) Read(ctx context.Context, from Offset, limit int) ([]*StoredEvent, Offset, error) {
 	var result []*StoredEvent
+	var lastOffset Offset = from
 	for _, e := range s.events {
-		if e.Position >= from && (to == -1 || e.Position <= to) {
+		if from == OffsetOldest || e.Offset > from {
 			result = append(result, e)
+			lastOffset = e.Offset
+			if limit > 0 && len(result) >= limit {
+				break
+			}
 		}
 	}
-	return result, nil
+	return result, lastOffset, nil
 }
 
-func (s *nonStreamingStoreWithEvents) GetPosition(ctx context.Context) (int64, error) {
-	if len(s.events) == 0 {
-		return 0, nil
-	}
-	return s.events[len(s.events)-1].Position, nil
-}
-
-func (s *nonStreamingStoreWithEvents) SaveSubscriptionPosition(ctx context.Context, subscriptionID string, position int64) error {
+func (s *nonStreamingStoreWithEvents) SaveOffset(ctx context.Context, subscriptionID string, offset Offset) error {
 	return nil
 }
 
-func (s *nonStreamingStoreWithEvents) LoadSubscriptionPosition(ctx context.Context, subscriptionID string) (int64, error) {
-	return 0, nil
+func (s *nonStreamingStoreWithEvents) LoadOffset(ctx context.Context, subscriptionID string) (Offset, error) {
+	return OffsetOldest, nil
 }
 
 // TestReplayNonStreamingHandlerError tests handler error for non-streaming stores
 func TestReplayNonStreamingHandlerError(t *testing.T) {
-	store := &nonStreamingStoreWithEvents{}
+	store := &nonStreamingStoreWithEvents{
+		events: make([]*StoredEvent, 0),
+	}
 	bus := New(WithStore(store))
 
-	// Save events directly to the store
+	// Append events directly to the store
 	ctx := context.Background()
 	for i := 1; i <= 3; i++ {
-		event := &StoredEvent{
+		event := &Event{
 			Type:      "TestEvent",
 			Data:      []byte(fmt.Sprintf(`{"id": %d}`, i)),
 			Timestamp: time.Now(),
 		}
-		store.Save(ctx, event)
+		store.Append(ctx, event)
 	}
-	// Update bus store position
-	bus.storeMu.Lock()
-	bus.storePosition = 3
-	bus.storeMu.Unlock()
 
 	handlerErr := errors.New("handler failed")
-	err := bus.Replay(ctx, 1, func(event *StoredEvent) error {
-		if event.Position == 2 {
+	err := bus.Replay(ctx, OffsetOldest, func(event *StoredEvent) error {
+		// Offset format is zero-padded: "00000000000000000002"
+		if event.Offset == Offset("00000000000000000002") {
 			return handlerErr
 		}
 		return nil
@@ -1484,49 +1221,299 @@ func TestReplayNonStreamingHandlerError(t *testing.T) {
 		t.Error("Expected error from Replay when handler fails")
 	}
 
-	if !strings.Contains(err.Error(), "handle event at position 2") {
-		t.Errorf("Expected 'handle event at position 2' in error, got: %v", err)
+	if !strings.Contains(err.Error(), "handle event at offset 00000000000000000002") {
+		t.Errorf("Expected 'handle event at offset 00000000000000000002' in error, got: %v", err)
 	}
 }
 
-// nonStreamingStoreWithLoadError returns error on Load
-type nonStreamingStoreWithLoadError struct{}
+// nonStreamingStoreWithReadError returns error on Read
+type nonStreamingStoreWithReadError struct{}
 
-func (s *nonStreamingStoreWithLoadError) Save(ctx context.Context, event *StoredEvent) error {
+func (s *nonStreamingStoreWithReadError) Append(ctx context.Context, event *Event) (Offset, error) {
+	return Offset("1"), nil
+}
+
+func (s *nonStreamingStoreWithReadError) Read(ctx context.Context, from Offset, limit int) ([]*StoredEvent, Offset, error) {
+	return nil, "", errors.New("read failed")
+}
+
+func (s *nonStreamingStoreWithReadError) SaveOffset(ctx context.Context, subscriptionID string, offset Offset) error {
 	return nil
 }
 
-func (s *nonStreamingStoreWithLoadError) Load(ctx context.Context, from, to int64) ([]*StoredEvent, error) {
-	return nil, errors.New("load failed")
+func (s *nonStreamingStoreWithReadError) LoadOffset(ctx context.Context, subscriptionID string) (Offset, error) {
+	return OffsetOldest, nil
 }
 
-func (s *nonStreamingStoreWithLoadError) GetPosition(ctx context.Context) (int64, error) {
-	return 5, nil // Return non-zero so Replay tries to load
-}
-
-func (s *nonStreamingStoreWithLoadError) SaveSubscriptionPosition(ctx context.Context, subscriptionID string, position int64) error {
-	return nil
-}
-
-func (s *nonStreamingStoreWithLoadError) LoadSubscriptionPosition(ctx context.Context, subscriptionID string) (int64, error) {
-	return 0, nil
-}
-
-// TestReplayNonStreamingLoadError tests Load error for non-streaming stores
-func TestReplayNonStreamingLoadError(t *testing.T) {
-	store := &nonStreamingStoreWithLoadError{}
+// TestReplayNonStreamingReadError tests Read error for non-streaming stores
+func TestReplayNonStreamingReadError(t *testing.T) {
+	store := &nonStreamingStoreWithReadError{}
 	bus := New(WithStore(store))
 
 	ctx := context.Background()
-	err := bus.Replay(ctx, 1, func(event *StoredEvent) error {
+	err := bus.Replay(ctx, OffsetOldest, func(event *StoredEvent) error {
 		return nil
 	})
 
 	if err == nil {
-		t.Error("Expected error from Replay when Load fails")
+		t.Error("Expected error from Replay when Read fails")
 	}
 
-	if !strings.Contains(err.Error(), "load events") {
-		t.Errorf("Expected 'load events' in error, got: %v", err)
+	if !strings.Contains(err.Error(), "read events") {
+		t.Errorf("Expected 'read events' in error, got: %v", err)
+	}
+}
+
+// TestReplayNonStreamingContextCancellation tests context cancellation in non-streaming fallback path
+func TestReplayNonStreamingContextCancellation(t *testing.T) {
+	store := &nonStreamingStoreWithEvents{
+		events: make([]*StoredEvent, 0),
+	}
+	bus := New(WithStore(store))
+
+	// Append some events directly to the store
+	ctx := context.Background()
+	for i := 1; i <= 3; i++ {
+		event := &Event{
+			Type:      "TestEvent",
+			Data:      []byte(fmt.Sprintf(`{"id": %d}`, i)),
+			Timestamp: time.Now(),
+		}
+		store.Append(ctx, event)
+	}
+
+	// Create a cancelled context
+	cancelCtx, cancel := context.WithCancel(ctx)
+	cancel() // Cancel immediately
+
+	err := bus.Replay(cancelCtx, OffsetOldest, func(event *StoredEvent) error {
+		return nil
+	})
+
+	if err == nil {
+		t.Error("Expected error from Replay when context is cancelled")
+	}
+
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("Expected context.Canceled error, got: %v", err)
+	}
+}
+
+// nonStreamingStoreWithStuckOffset is a store that returns events but never advances the offset
+type nonStreamingStoreWithStuckOffset struct {
+	events []*StoredEvent
+}
+
+func (s *nonStreamingStoreWithStuckOffset) Append(ctx context.Context, event *Event) (Offset, error) {
+	stored := &StoredEvent{
+		Offset:    Offset("00000000000000000001"),
+		Type:      event.Type,
+		Data:      event.Data,
+		Timestamp: event.Timestamp,
+	}
+	s.events = append(s.events, stored)
+	return stored.Offset, nil
+}
+
+func (s *nonStreamingStoreWithStuckOffset) Read(ctx context.Context, from Offset, limit int) ([]*StoredEvent, Offset, error) {
+	// Return events but always return the same offset (stuck/not advancing)
+	if from == OffsetOldest && len(s.events) > 0 {
+		return s.events, from, nil // Return 'from' as next offset - infinite loop protection should catch this
+	}
+	return nil, from, nil
+}
+
+// TestReplayNonStreamingInfiniteLoopProtection tests the infinite loop protection in non-streaming fallback
+func TestReplayNonStreamingInfiniteLoopProtection(t *testing.T) {
+	store := &nonStreamingStoreWithStuckOffset{
+		events: make([]*StoredEvent, 0),
+	}
+	bus := New(WithStore(store))
+
+	// Append an event directly to the store
+	ctx := context.Background()
+	event := &Event{
+		Type:      "TestEvent",
+		Data:      []byte(`{"id": 1}`),
+		Timestamp: time.Now(),
+	}
+	store.Append(ctx, event)
+
+	// Replay should detect the stuck offset and return an error
+	var replayed int
+	err := bus.Replay(ctx, OffsetOldest, func(event *StoredEvent) error {
+		replayed++
+		return nil
+	})
+
+	// Should error to indicate a buggy EventStore implementation
+	if err == nil {
+		t.Error("Expected error for stuck offset, got nil")
+	}
+	if !strings.Contains(err.Error(), "non-advancing offset") {
+		t.Errorf("Expected 'non-advancing offset' error, got: %v", err)
+	}
+
+	// Should have processed events exactly once before detecting the stuck offset
+	if replayed != 1 {
+		t.Errorf("Expected 1 replayed event, got %d", replayed)
+	}
+}
+
+// TestSubscriptionStoreInterface verifies MemoryStore implements SubscriptionStore
+func TestSubscriptionStoreInterface(t *testing.T) {
+	var store interface{} = NewMemoryStore()
+
+	_, ok := store.(SubscriptionStore)
+	if !ok {
+		t.Fatal("MemoryStore should implement SubscriptionStore")
+	}
+}
+
+// TestWithSubscriptionStore tests the WithSubscriptionStore option
+func TestWithSubscriptionStore(t *testing.T) {
+	eventStore := NewMemoryStore()
+	subStore := NewMemoryStore() // Use a separate store for subscriptions
+
+	bus := New(
+		WithStore(eventStore),
+		WithSubscriptionStore(subStore),
+	)
+
+	// Publish some events
+	for i := 1; i <= 3; i++ {
+		Publish(bus, TestEvent{ID: i})
+	}
+
+	// Subscribe with replay
+	ctx := context.Background()
+	var received []int
+	err := SubscribeWithReplay(ctx, bus, "test-sub", func(e TestEvent) {
+		received = append(received, e.ID)
+	})
+
+	if err != nil {
+		t.Fatalf("SubscribeWithReplay failed: %v", err)
+	}
+
+	if len(received) != 3 {
+		t.Errorf("Expected 3 events, got %d", len(received))
+	}
+
+	// Verify offset was saved in the subscription store (not event store)
+	offset, _ := subStore.LoadOffset(ctx, "test-sub")
+	if offset != Offset("00000000000000000003") {
+		t.Errorf("Expected offset '00000000000000000003' in subscription store, got %s", offset)
+	}
+}
+
+// eventStoreOnly is a store that only implements EventStore, not SubscriptionStore
+type eventStoreOnly struct{}
+
+func (s *eventStoreOnly) Append(ctx context.Context, event *Event) (Offset, error) {
+	return Offset("1"), nil
+}
+
+func (s *eventStoreOnly) Read(ctx context.Context, from Offset, limit int) ([]*StoredEvent, Offset, error) {
+	return nil, from, nil
+}
+
+// TestSubscribeWithReplayNoSubscriptionStore tests error when no subscription store available
+func TestSubscribeWithReplayNoSubscriptionStore(t *testing.T) {
+	// Create a store that doesn't implement SubscriptionStore
+	store := &eventStoreOnly{}
+	bus := New(WithStore(store))
+
+	ctx := context.Background()
+	err := SubscribeWithReplay(ctx, bus, "test-sub", func(e TestEvent) {})
+
+	if err == nil {
+		t.Error("Expected error when no SubscriptionStore is available")
+	}
+
+	if !strings.Contains(err.Error(), "SubscriptionStore") {
+		t.Errorf("Expected error about SubscriptionStore, got: %v", err)
+	}
+}
+
+// TestReplayNonStreamingPagination tests the pagination path in Replay for non-streaming stores
+// This ensures the offset = nextOffset line is covered when reading more than 100 events
+func TestReplayNonStreamingPagination(t *testing.T) {
+	store := &nonStreamingStoreWithEvents{
+		events: make([]*StoredEvent, 0),
+	}
+	bus := New(WithStore(store))
+
+	// Append more than 100 events to trigger pagination (batch size is 100)
+	ctx := context.Background()
+	for i := 1; i <= 150; i++ {
+		event := &Event{
+			Type:      "TestEvent",
+			Data:      []byte(fmt.Sprintf(`{"id": %d}`, i)),
+			Timestamp: time.Now(),
+		}
+		store.Append(ctx, event)
+	}
+
+	// Replay all events - this will require at least 2 Read calls (100 + 50)
+	var replayed []string
+	err := bus.Replay(ctx, OffsetOldest, func(event *StoredEvent) error {
+		replayed = append(replayed, string(event.Offset))
+		return nil
+	})
+
+	if err != nil {
+		t.Fatalf("Replay failed: %v", err)
+	}
+
+	// Should replay all 150 events
+	if len(replayed) != 150 {
+		t.Errorf("Expected 150 replayed events, got %d", len(replayed))
+	}
+
+	// Verify offsets are in order (using 20-digit zero-padded format)
+	if len(replayed) >= 150 {
+		if replayed[0] != "00000000000000000001" {
+			t.Errorf("Expected first offset '00000000000000000001', got %s", replayed[0])
+		}
+		if replayed[149] != "00000000000000000150" {
+			t.Errorf("Expected last offset '00000000000000000150', got %s", replayed[149])
+		}
+	}
+}
+
+// TestWithReplayBatchSize tests the configurable replay batch size option
+func TestWithReplayBatchSize(t *testing.T) {
+	// Create a non-streaming store to test batch reading
+	store := &nonStreamingStoreWithEvents{
+		events: make([]*StoredEvent, 0),
+	}
+	bus := New(WithStore(store), WithReplayBatchSize(10))
+
+	// Append 25 events directly to the store
+	ctx := context.Background()
+	for i := 1; i <= 25; i++ {
+		event := &Event{
+			Type:      "TestEvent",
+			Data:      []byte(fmt.Sprintf(`{"id": %d}`, i)),
+			Timestamp: time.Now(),
+		}
+		store.Append(ctx, event)
+	}
+
+	// Replay all events - this will require 3 Read calls (10 + 10 + 5) with batch size 10
+	var replayed int
+	err := bus.Replay(ctx, OffsetOldest, func(event *StoredEvent) error {
+		replayed++
+		return nil
+	})
+
+	if err != nil {
+		t.Fatalf("Replay failed: %v", err)
+	}
+
+	// Should replay all 25 events
+	if replayed != 25 {
+		t.Errorf("Expected 25 replayed events, got %d", replayed)
 	}
 }
