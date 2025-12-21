@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -727,18 +728,29 @@ func (t *controlCharTransport) RoundTrip(req *http.Request) (*http.Response, err
 	}, nil
 }
 
-func TestClient_ReadWithControlCharInURL(t *testing.T) {
-	// URL with a control character that passes url.Parse but fails NewRequestWithContext
+func TestClient_ReadNewRequestError(t *testing.T) {
+	// Test the error path in readWithURL when NewRequestWithContext fails
+	// We create a URL object with an invalid host that will fail when stringified
 	cfg := defaultConfig()
 	cfg.httpClient = &http.Client{Transport: &controlCharTransport{}}
 
-	// Control character in path - url.Parse succeeds but http.NewRequestWithContext fails
-	client := newClient("http://example.com/path\x00with\x00null", cfg)
+	client := NewClientForTest("http://example.com/test", cfg)
+
+	// Create a URL with an invalid host containing a DEL character
+	// url.Parse succeeds, but u.String() produces an invalid URL for NewRequestWithContext
+	u := &url.URL{
+		Scheme: "http",
+		Host:   "example.com\x7f", // DEL character makes it invalid
+		Path:   "/test",
+	}
 
 	ctx := context.Background()
-	_, err := client.Read(ctx, "0", 0)
+	_, err := client.ReadWithURL(ctx, u, "0", 0)
 	if err == nil {
-		t.Fatal("expected error for URL with control character")
+		t.Fatal("expected error for invalid URL")
+	}
+	if !strings.Contains(err.Error(), "create request") {
+		t.Errorf("expected 'create request' error, got: %v", err)
 	}
 }
 

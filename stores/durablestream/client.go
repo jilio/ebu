@@ -85,13 +85,18 @@ func (c *Client) Append(ctx context.Context, data []byte) (string, error) {
 
 // Read fetches data from the stream starting at the given offset.
 func (c *Client) Read(ctx context.Context, offset string, limit int) (*Response, error) {
-	ctx, cancel := context.WithTimeout(ctx, c.cfg.timeout)
-	defer cancel()
-
 	u, err := url.Parse(c.baseURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse URL: %w", err)
 	}
+	return c.readWithURL(ctx, u, offset, limit)
+}
+
+// readWithURL is the internal implementation that accepts a pre-parsed URL.
+// This allows testing error paths that are unreachable through the public API.
+func (c *Client) readWithURL(ctx context.Context, u *url.URL, offset string, limit int) (*Response, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.cfg.timeout)
+	defer cancel()
 
 	q := u.Query()
 	q.Set("offset", offset)
