@@ -212,7 +212,7 @@ See [**Persistence Guide**](docs/PERSISTENCE.md) for custom stores and advanced 
 
 ### Remote Storage
 
-Use remote storage backends for distributed event persistence:
+Use remote storage backends for distributed event persistence. ebu supports [Durable Streams](https://electric-sql.com/blog/2025/12/09/announcing-durable-streams) - an HTTP protocol for reliable, resumable, real-time data streaming developed by [Electric](https://electric-sql.com):
 
 ```go
 import (
@@ -238,7 +238,7 @@ eventbus.Publish(bus, OrderCreatedEvent{OrderID: "123", Amount: 99.99})
 Available storage backends:
 - **MemoryStore** - Built-in in-memory store for development
 - **SQLite** - `stores/sqlite` - Persistent local storage
-- **Durable-Streams** - `stores/durablestream` - Remote HTTP-based storage
+- **Durable-Streams** - `stores/durablestream` - Remote HTTP-based storage ([protocol spec](https://electric-sql.com/blog/2025/12/09/announcing-durable-streams))
 
 See [**Persistence Guide**](docs/PERSISTENCE.md) for all storage options.
 

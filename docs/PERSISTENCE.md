@@ -155,7 +155,7 @@ SQLite store features:
 
 ### Durable-Streams Store
 
-Remote storage using the [durable-streams](https://github.com/jilio/durable-streams) protocol:
+Remote storage using the [Durable Streams](https://electric-sql.com/blog/2025/12/09/announcing-durable-streams) protocol - an HTTP-based persistent stream primitive for reliable, resumable, real-time data streaming developed by [Electric](https://electric-sql.com):
 
 ```go
 import (
