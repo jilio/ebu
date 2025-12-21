@@ -3044,7 +3044,7 @@ func TestTypeNamerWithPersistence(t *testing.T) {
 
 	// Load events from store
 	ctx := context.Background()
-	events, err := store.Load(ctx, 0, -1)
+	events, _, err := store.Read(ctx, OffsetOldest, 0)
 	if err != nil {
 		t.Fatalf("Failed to load events: %v", err)
 	}
@@ -3089,7 +3089,7 @@ func TestTypeNamerWithReplay(t *testing.T) {
 	versionedCount := 0
 	userCount := 0
 
-	err := bus.Replay(ctx, 0, func(event *StoredEvent) error {
+	err := bus.Replay(ctx, OffsetOldest, func(event *StoredEvent) error {
 		switch event.Type {
 		case EventType(CustomNamedEvent{}):
 			customCount++
@@ -3450,16 +3450,11 @@ type mockStore struct {
 	closeFn func() error
 }
 
-func (m *mockStore) Save(ctx context.Context, event *StoredEvent) error { return nil }
-func (m *mockStore) Load(ctx context.Context, from, to int64) ([]*StoredEvent, error) {
-	return nil, nil
+func (m *mockStore) Append(ctx context.Context, event *Event) (Offset, error) {
+	return "1", nil
 }
-func (m *mockStore) GetPosition(ctx context.Context) (int64, error) { return 0, nil }
-func (m *mockStore) SaveSubscriptionPosition(ctx context.Context, sid string, pos int64) error {
-	return nil
-}
-func (m *mockStore) LoadSubscriptionPosition(ctx context.Context, sid string) (int64, error) {
-	return 0, nil
+func (m *mockStore) Read(ctx context.Context, from Offset, limit int) ([]*StoredEvent, Offset, error) {
+	return nil, from, nil
 }
 func (m *mockStore) Close() error {
 	if m.closeFn != nil {
@@ -3470,16 +3465,11 @@ func (m *mockStore) Close() error {
 
 type mockStoreNoClose struct{}
 
-func (m *mockStoreNoClose) Save(ctx context.Context, event *StoredEvent) error { return nil }
-func (m *mockStoreNoClose) Load(ctx context.Context, from, to int64) ([]*StoredEvent, error) {
-	return nil, nil
+func (m *mockStoreNoClose) Append(ctx context.Context, event *Event) (Offset, error) {
+	return "1", nil
 }
-func (m *mockStoreNoClose) GetPosition(ctx context.Context) (int64, error) { return 0, nil }
-func (m *mockStoreNoClose) SaveSubscriptionPosition(ctx context.Context, sid string, pos int64) error {
-	return nil
-}
-func (m *mockStoreNoClose) LoadSubscriptionPosition(ctx context.Context, sid string) (int64, error) {
-	return 0, nil
+func (m *mockStoreNoClose) Read(ctx context.Context, from Offset, limit int) ([]*StoredEvent, Offset, error) {
+	return nil, from, nil
 }
 
 func TestBeforePublishContextHook(t *testing.T) {

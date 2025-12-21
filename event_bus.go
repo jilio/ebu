@@ -65,7 +65,8 @@ type EventBus struct {
 
 	// Optional persistence fields (nil if not using persistence)
 	store                   EventStore
-	storePosition           int64
+	subscriptionStore       SubscriptionStore
+	lastOffset              Offset
 	storeMu                 sync.RWMutex
 	persistenceErrorHandler PersistenceErrorHandler
 	persistenceTimeout      time.Duration
