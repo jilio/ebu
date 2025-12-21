@@ -20,7 +20,7 @@ A lightweight, type-safe event bus for Go with generics support. Build decoupled
 - 🛡️ **Panic recovery** - Handlers are isolated from each other's panics
 - 🚀 **Zero dependencies** - Pure Go standard library (core package)
 - 💾 **Event persistence** - Built-in support for event storage and replay
-- 🌍 **Remote storage** - Native support for remote backends like [durable-streams](https://github.com/jilio/durable-streams)
+- 🌍 **Remote storage** - Native support for remote backends like [durable-streams](https://github.com/durable-streams/durable-streams)
 - 🔄 **Event upcasting** - Seamless event schema migration and versioning
 - ✅ **100% test coverage** - Thoroughly tested for reliability
 
