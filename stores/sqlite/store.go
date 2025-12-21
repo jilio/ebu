@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"strconv"
 	"strings"
 	"time"
 
@@ -13,7 +14,9 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// SQLiteStore implements eventbus.EventStore using SQLite
+// SQLiteStore implements eventbus.EventStore using SQLite.
+// It stores events with integer positions internally and exposes them
+// as opaque string offsets externally.
 type SQLiteStore struct {
 	db          *sql.DB
 	cfg         *config
@@ -21,17 +24,17 @@ type SQLiteStore struct {
 	metricsHook MetricsHook
 
 	// Prepared statements
-	saveStmt        *sql.Stmt
-	loadStmt        *sql.Stmt
-	loadFromStmt    *sql.Stmt
-	getPositionStmt *sql.Stmt
-	saveSubPosStmt  *sql.Stmt
-	loadSubPosStmt  *sql.Stmt
+	appendStmt     *sql.Stmt
+	readStmt       *sql.Stmt
+	readFromStmt   *sql.Stmt
+	saveOffsetStmt *sql.Stmt
+	loadOffsetStmt *sql.Stmt
 }
 
-// Ensure SQLiteStore implements eventbus.EventStore and eventbus.EventStoreStreamer
+// Ensure SQLiteStore implements the required interfaces
 var _ eventbus.EventStore = (*SQLiteStore)(nil)
 var _ eventbus.EventStoreStreamer = (*SQLiteStore)(nil)
+var _ eventbus.SubscriptionStore = (*SQLiteStore)(nil)
 
 // dbOpener is used to open database connections, injectable for testing
 var dbOpener = sql.Open
@@ -134,14 +137,13 @@ func (s *SQLiteStore) prepareStatements() error {
 	}
 
 	stmts := []stmtDef{
-		{&s.saveStmt, "INSERT INTO events (type, data, timestamp) VALUES (?, ?, ?)"},
-		{&s.loadStmt, "SELECT position, type, data, timestamp FROM events WHERE position >= ? AND position <= ? ORDER BY position"},
-		{&s.loadFromStmt, "SELECT position, type, data, timestamp FROM events WHERE position >= ? ORDER BY position"},
-		{&s.getPositionStmt, "SELECT COALESCE(MAX(position), 0) FROM events"},
-		{&s.saveSubPosStmt, `INSERT INTO subscription_positions (subscription_id, position, updated_at)
+		{&s.appendStmt, "INSERT INTO events (type, data, timestamp) VALUES (?, ?, ?)"},
+		{&s.readStmt, "SELECT position, type, data, timestamp FROM events WHERE position > ? ORDER BY position LIMIT ?"},
+		{&s.readFromStmt, "SELECT position, type, data, timestamp FROM events WHERE position > ? ORDER BY position"},
+		{&s.saveOffsetStmt, `INSERT INTO subscription_positions (subscription_id, position, updated_at)
 			VALUES (?, ?, CURRENT_TIMESTAMP)
 			ON CONFLICT(subscription_id) DO UPDATE SET position = excluded.position, updated_at = CURRENT_TIMESTAMP`},
-		{&s.loadSubPosStmt, "SELECT position FROM subscription_positions WHERE subscription_id = ?"},
+		{&s.loadOffsetStmt, "SELECT position FROM subscription_positions WHERE subscription_id = ?"},
 	}
 
 	for _, def := range stmts {
@@ -155,31 +157,45 @@ func (s *SQLiteStore) prepareStatements() error {
 	return nil
 }
 
-// Save implements eventbus.EventStore
-func (s *SQLiteStore) Save(ctx context.Context, event *eventbus.StoredEvent) error {
+// parseOffset converts an Offset to an int64 position.
+// OffsetOldest maps to 0, otherwise parses the numeric string.
+func parseOffset(offset eventbus.Offset) (int64, error) {
+	if offset == eventbus.OffsetOldest {
+		return 0, nil
+	}
+	return strconv.ParseInt(string(offset), 10, 64)
+}
+
+// formatOffset converts an int64 position to an Offset.
+func formatOffset(position int64) eventbus.Offset {
+	return eventbus.Offset(strconv.FormatInt(position, 10))
+}
+
+// Append stores an event and returns its assigned offset.
+func (s *SQLiteStore) Append(ctx context.Context, event *eventbus.Event) (eventbus.Offset, error) {
 	start := time.Now()
 
-	result, err := s.saveStmt.ExecContext(ctx, event.Type, event.Data, event.Timestamp)
+	result, err := s.appendStmt.ExecContext(ctx, event.Type, event.Data, event.Timestamp)
 	if err != nil {
 		if s.metricsHook != nil {
-			s.metricsHook.OnSave(time.Since(start), err)
+			s.metricsHook.OnAppend(time.Since(start), err)
 		}
-		return fmt.Errorf("sqlite: save event: %w", err)
+		return "", fmt.Errorf("sqlite: append event: %w", err)
 	}
 
 	// LastInsertId is always supported by SQLite driver
 	position, _ := result.LastInsertId()
-	event.Position = position
+	offset := formatOffset(position)
 
 	if s.metricsHook != nil {
-		s.metricsHook.OnSave(time.Since(start), nil)
+		s.metricsHook.OnAppend(time.Since(start), nil)
 	}
 
 	if s.logger != nil {
-		s.logger.Debug("saved event", "position", position, "type", event.Type)
+		s.logger.Debug("appended event", "offset", offset, "type", event.Type)
 	}
 
-	return nil
+	return offset, nil
 }
 
 // rowScanner abstracts sql.Rows for testing
@@ -190,38 +206,50 @@ type rowScanner interface {
 	Close() error
 }
 
-// Load implements eventbus.EventStore
-func (s *SQLiteStore) Load(ctx context.Context, from, to int64) (events []*eventbus.StoredEvent, err error) {
+// Read returns events starting after the given offset.
+func (s *SQLiteStore) Read(ctx context.Context, from eventbus.Offset, limit int) ([]*eventbus.StoredEvent, eventbus.Offset, error) {
 	start := time.Now()
+	var events []*eventbus.StoredEvent
+	var err error
 
 	defer func() {
 		if s.metricsHook != nil {
-			s.metricsHook.OnLoad(time.Since(start), len(events), err)
+			s.metricsHook.OnRead(time.Since(start), len(events), err)
 		}
 	}()
 
-	var rows *sql.Rows
+	position, err := parseOffset(from)
+	if err != nil {
+		return nil, from, fmt.Errorf("sqlite: invalid offset: %w", err)
+	}
 
-	if to == -1 {
-		rows, err = s.loadFromStmt.QueryContext(ctx, from)
+	var rows *sql.Rows
+	if limit <= 0 {
+		rows, err = s.readFromStmt.QueryContext(ctx, position)
 	} else {
-		rows, err = s.loadStmt.QueryContext(ctx, from, to)
+		rows, err = s.readStmt.QueryContext(ctx, position, limit)
 	}
 
 	if err != nil {
-		return nil, fmt.Errorf("sqlite: load events: %w", err)
+		return nil, from, fmt.Errorf("sqlite: read events: %w", err)
 	}
 
 	events, err = s.scanEvents(rows)
 	if err != nil {
-		return nil, err
+		return nil, from, err
+	}
+
+	// Determine next offset
+	nextOffset := from
+	if len(events) > 0 {
+		nextOffset = events[len(events)-1].Offset
 	}
 
 	if s.logger != nil {
-		s.logger.Debug("loaded events", "from", from, "to", to, "count", len(events))
+		s.logger.Debug("read events", "from", from, "limit", limit, "count", len(events))
 	}
 
-	return events, nil
+	return events, nextOffset, nil
 }
 
 // scanEvents scans rows into events - extracted for testability
@@ -230,10 +258,12 @@ func (s *SQLiteStore) scanEvents(rows rowScanner) ([]*eventbus.StoredEvent, erro
 
 	var events []*eventbus.StoredEvent
 	for rows.Next() {
+		var position int64
 		event := &eventbus.StoredEvent{}
-		if err := rows.Scan(&event.Position, &event.Type, &event.Data, &event.Timestamp); err != nil {
+		if err := rows.Scan(&position, &event.Type, &event.Data, &event.Timestamp); err != nil {
 			return nil, fmt.Errorf("sqlite: scan event: %w", err)
 		}
+		event.Offset = formatOffset(position)
 		events = append(events, event)
 	}
 
@@ -244,73 +274,58 @@ func (s *SQLiteStore) scanEvents(rows rowScanner) ([]*eventbus.StoredEvent, erro
 	return events, nil
 }
 
-// GetPosition implements eventbus.EventStore
-func (s *SQLiteStore) GetPosition(ctx context.Context) (int64, error) {
+// SaveOffset implements eventbus.SubscriptionStore
+func (s *SQLiteStore) SaveOffset(ctx context.Context, subscriptionID string, offset eventbus.Offset) error {
 	start := time.Now()
 
-	var position int64
-	err := s.getPositionStmt.QueryRowContext(ctx).Scan(&position)
+	position, err := parseOffset(offset)
+	if err != nil {
+		return fmt.Errorf("sqlite: invalid offset: %w", err)
+	}
+
+	_, err = s.saveOffsetStmt.ExecContext(ctx, subscriptionID, position)
 	if err != nil {
 		if s.metricsHook != nil {
-			s.metricsHook.OnGetPosition(time.Since(start), err)
+			s.metricsHook.OnSaveOffset(time.Since(start), err)
 		}
-		return 0, fmt.Errorf("sqlite: get position: %w", err)
+		return fmt.Errorf("sqlite: save offset: %w", err)
 	}
 
 	if s.metricsHook != nil {
-		s.metricsHook.OnGetPosition(time.Since(start), nil)
-	}
-
-	return position, nil
-}
-
-// SaveSubscriptionPosition implements eventbus.EventStore
-func (s *SQLiteStore) SaveSubscriptionPosition(ctx context.Context, subscriptionID string, position int64) error {
-	start := time.Now()
-
-	_, err := s.saveSubPosStmt.ExecContext(ctx, subscriptionID, position)
-	if err != nil {
-		if s.metricsHook != nil {
-			s.metricsHook.OnSaveSubscriptionPosition(time.Since(start), err)
-		}
-		return fmt.Errorf("sqlite: save subscription position: %w", err)
-	}
-
-	if s.metricsHook != nil {
-		s.metricsHook.OnSaveSubscriptionPosition(time.Since(start), nil)
+		s.metricsHook.OnSaveOffset(time.Since(start), nil)
 	}
 
 	if s.logger != nil {
-		s.logger.Debug("saved subscription position", "subscription_id", subscriptionID, "position", position)
+		s.logger.Debug("saved subscription offset", "subscription_id", subscriptionID, "offset", offset)
 	}
 
 	return nil
 }
 
-// LoadSubscriptionPosition implements eventbus.EventStore
-func (s *SQLiteStore) LoadSubscriptionPosition(ctx context.Context, subscriptionID string) (int64, error) {
+// LoadOffset implements eventbus.SubscriptionStore
+func (s *SQLiteStore) LoadOffset(ctx context.Context, subscriptionID string) (eventbus.Offset, error) {
 	start := time.Now()
 
 	var position int64
-	err := s.loadSubPosStmt.QueryRowContext(ctx, subscriptionID).Scan(&position)
+	err := s.loadOffsetStmt.QueryRowContext(ctx, subscriptionID).Scan(&position)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			if s.metricsHook != nil {
-				s.metricsHook.OnLoadSubscriptionPosition(time.Since(start), nil)
+				s.metricsHook.OnLoadOffset(time.Since(start), nil)
 			}
-			return 0, nil
+			return eventbus.OffsetOldest, nil
 		}
 		if s.metricsHook != nil {
-			s.metricsHook.OnLoadSubscriptionPosition(time.Since(start), err)
+			s.metricsHook.OnLoadOffset(time.Since(start), err)
 		}
-		return 0, fmt.Errorf("sqlite: load subscription position: %w", err)
+		return eventbus.OffsetOldest, fmt.Errorf("sqlite: load offset: %w", err)
 	}
 
 	if s.metricsHook != nil {
-		s.metricsHook.OnLoadSubscriptionPosition(time.Since(start), nil)
+		s.metricsHook.OnLoadOffset(time.Since(start), nil)
 	}
 
-	return position, nil
+	return formatOffset(position), nil
 }
 
 // Close closes the database connection and releases resources.
@@ -319,12 +334,11 @@ func (s *SQLiteStore) LoadSubscriptionPosition(ctx context.Context, subscription
 func (s *SQLiteStore) Close() error {
 	// Close prepared statements - errors ignored as db.Close() handles cleanup
 	stmts := []*sql.Stmt{
-		s.saveStmt,
-		s.loadStmt,
-		s.loadFromStmt,
-		s.getPositionStmt,
-		s.saveSubPosStmt,
-		s.loadSubPosStmt,
+		s.appendStmt,
+		s.readStmt,
+		s.readFromStmt,
+		s.saveOffsetStmt,
+		s.loadOffsetStmt,
 	}
 	for _, stmt := range stmts {
 		if stmt != nil {
@@ -339,13 +353,13 @@ func (s *SQLiteStore) Close() error {
 	return s.db.Close()
 }
 
-// LoadStream implements eventbus.EventStoreStreamer for memory-efficient event streaming.
+// ReadStream implements eventbus.EventStoreStreamer for memory-efficient event streaming.
 // It uses cursor-based iteration, keeping only one row in memory at a time.
 // The database rows are properly closed when:
 // - The iteration completes naturally
 // - The consumer breaks out of the range loop
 // - The context is cancelled
-func (s *SQLiteStore) LoadStream(ctx context.Context, from, to int64) iter.Seq2[*eventbus.StoredEvent, error] {
+func (s *SQLiteStore) ReadStream(ctx context.Context, from eventbus.Offset) iter.Seq2[*eventbus.StoredEvent, error] {
 	return func(yield func(*eventbus.StoredEvent, error) bool) {
 		start := time.Now()
 		var eventCount int
@@ -353,26 +367,26 @@ func (s *SQLiteStore) LoadStream(ctx context.Context, from, to int64) iter.Seq2[
 
 		defer func() {
 			if s.metricsHook != nil {
-				s.metricsHook.OnLoad(time.Since(start), eventCount, iterErr)
+				s.metricsHook.OnRead(time.Since(start), eventCount, iterErr)
 			}
 		}()
 
-		// If batching is enabled, use cursor-based pagination
-		if s.cfg.streamBatchSize > 0 {
-			s.streamBatched(ctx, from, to, &eventCount, &iterErr, yield)
+		position, err := parseOffset(from)
+		if err != nil {
+			iterErr = fmt.Errorf("sqlite: invalid offset: %w", err)
+			yield(nil, iterErr)
 			return
 		}
 
-		// Use appropriate prepared statement based on to value
-		var rows *sql.Rows
-		var err error
-		if to == -1 {
-			rows, err = s.loadFromStmt.QueryContext(ctx, from)
-		} else {
-			rows, err = s.loadStmt.QueryContext(ctx, from, to)
+		// If batching is enabled, use cursor-based pagination
+		if s.cfg.streamBatchSize > 0 {
+			s.streamBatched(ctx, position, &eventCount, &iterErr, yield)
+			return
 		}
+
+		rows, err := s.readFromStmt.QueryContext(ctx, position)
 		if err != nil {
-			iterErr = fmt.Errorf("sqlite: load stream: %w", err)
+			iterErr = fmt.Errorf("sqlite: read stream: %w", err)
 			yield(nil, iterErr)
 			return
 		}
@@ -380,7 +394,7 @@ func (s *SQLiteStore) LoadStream(ctx context.Context, from, to int64) iter.Seq2[
 		s.streamRows(ctx, rows, &eventCount, &iterErr, yield)
 
 		if s.logger != nil {
-			s.logger.Debug("streamed events", "from", from, "to", to, "count", eventCount)
+			s.logger.Debug("streamed events", "from", from, "count", eventCount)
 		}
 	}
 }
@@ -404,12 +418,14 @@ func (s *SQLiteStore) streamRows(
 		default:
 		}
 
+		var position int64
 		event := &eventbus.StoredEvent{}
-		if err := rows.Scan(&event.Position, &event.Type, &event.Data, &event.Timestamp); err != nil {
+		if err := rows.Scan(&position, &event.Type, &event.Data, &event.Timestamp); err != nil {
 			*iterErr = fmt.Errorf("sqlite: scan event: %w", err)
 			yield(nil, *iterErr)
 			return
 		}
+		event.Offset = formatOffset(position)
 
 		*eventCount++
 		if !yield(event, nil) {
@@ -427,13 +443,13 @@ func (s *SQLiteStore) streamRows(
 // streamBatched fetches events in batches using cursor-based pagination
 func (s *SQLiteStore) streamBatched(
 	ctx context.Context,
-	from, to int64,
+	fromPosition int64,
 	eventCount *int,
 	iterErr *error,
 	yield func(*eventbus.StoredEvent, error) bool,
 ) {
 	batchSize := s.cfg.streamBatchSize
-	currentPos := from
+	currentPos := fromPosition
 
 	for {
 		select {
@@ -444,19 +460,10 @@ func (s *SQLiteStore) streamBatched(
 		default:
 		}
 
-		// Build query based on whether we have an upper bound
-		var query string
-		var rows *sql.Rows
-		var err error
-		if to == -1 {
-			query = "SELECT position, type, data, timestamp FROM events WHERE position >= ? ORDER BY position LIMIT ?"
-			rows, err = s.db.QueryContext(ctx, query, currentPos, batchSize)
-		} else {
-			query = "SELECT position, type, data, timestamp FROM events WHERE position >= ? AND position <= ? ORDER BY position LIMIT ?"
-			rows, err = s.db.QueryContext(ctx, query, currentPos, to, batchSize)
-		}
+		query := "SELECT position, type, data, timestamp FROM events WHERE position > ? ORDER BY position LIMIT ?"
+		rows, err := s.db.QueryContext(ctx, query, currentPos, batchSize)
 		if err != nil {
-			*iterErr = fmt.Errorf("sqlite: load stream batch: %w", err)
+			*iterErr = fmt.Errorf("sqlite: read stream batch: %w", err)
 			yield(nil, *iterErr)
 			return
 		}
@@ -472,16 +479,11 @@ func (s *SQLiteStore) streamBatched(
 		}
 
 		// Move to next batch (position after last seen)
-		currentPos = lastPos + 1
-
-		// If we've reached the upper bound, no need for another query
-		if to != -1 && currentPos > to {
-			break
-		}
+		currentPos = lastPos
 	}
 
 	if s.logger != nil {
-		s.logger.Debug("streamed events (batched)", "from", from, "to", to, "count", *eventCount, "batchSize", batchSize)
+		s.logger.Debug("streamed events (batched)", "from", fromPosition, "count", *eventCount, "batchSize", batchSize)
 	}
 }
 
@@ -494,15 +496,17 @@ func (s *SQLiteStore) streamBatch(
 	yield func(*eventbus.StoredEvent, error) bool,
 ) (batchCount int, lastPos int64, cont bool) {
 	for rows.Next() {
+		var position int64
 		event := &eventbus.StoredEvent{}
-		if err := rows.Scan(&event.Position, &event.Type, &event.Data, &event.Timestamp); err != nil {
+		if err := rows.Scan(&position, &event.Type, &event.Data, &event.Timestamp); err != nil {
 			rows.Close() // Best effort close, scan error takes precedence
 			*iterErr = fmt.Errorf("sqlite: scan event: %w", err)
 			yield(nil, *iterErr)
 			return 0, 0, false
 		}
+		event.Offset = formatOffset(position)
 
-		lastPos = event.Position
+		lastPos = position
 		batchCount++
 		*eventCount++
 
