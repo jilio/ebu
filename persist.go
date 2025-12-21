@@ -267,7 +267,14 @@ func (bus *EventBus) GetStore() EventStore {
 // SubscribeWithReplay subscribes and replays missed events.
 // Requires both an EventStore (for replay) and a SubscriptionStore (for tracking).
 // If the store implements SubscriptionStore, it will be used automatically.
-// The context is used for the replay phase and for saving offsets.
+//
+// Context usage:
+//   - The context is used for the replay phase (loading historical events)
+//   - The context is used for saving subscription offsets
+//   - The context is NOT used for the live subscription handler (which follows the bus's lifecycle)
+//
+// Note: If the saved offset is OffsetOldest (""), replay starts from the beginning.
+// The OffsetNewest ("$") constant is typically not stored and is only used for live subscriptions.
 func SubscribeWithReplay[T any](
 	ctx context.Context,
 	bus *EventBus,

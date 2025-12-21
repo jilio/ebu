@@ -356,7 +356,7 @@ func TestSubscribeWithReplayUnmarshalError(t *testing.T) {
 	// Manually append an event with invalid JSON
 	store.mu.Lock()
 	store.nextOffset++
-	offset := Offset(fmt.Sprintf("%d", store.nextOffset))
+	offset := Offset(fmt.Sprintf("%020d", store.nextOffset))
 	store.events = append(store.events, &StoredEvent{
 		Offset:    offset,
 		Type:      typeName,
