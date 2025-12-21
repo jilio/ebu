@@ -3,8 +3,11 @@ package durablestream
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -534,5 +537,234 @@ func TestStore_ReadWithLimit(t *testing.T) {
 	}
 	if len(events) > 2 {
 		t.Errorf("expected at most 2 events with limit, got %d", len(events))
+	}
+}
+
+func TestClient_InvalidURL(t *testing.T) {
+	// Test with URL that will fail parsing in Read
+	cfg := defaultConfig()
+	cfg.timeout = 100 * time.Millisecond
+
+	// URL with control character that will fail url.Parse
+	client := newClient("http://[::1]:namedport", cfg)
+
+	ctx := context.Background()
+	_, err := client.Read(ctx, "0", 0)
+	if err == nil {
+		t.Fatal("expected error for invalid URL")
+	}
+}
+
+func TestClient_CreateRequestError(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.timeout = 100 * time.Millisecond
+
+	// URL with invalid scheme will fail NewRequestWithContext
+	client := newClient("://invalid", cfg)
+
+	ctx := context.Background()
+	err := client.Create(ctx)
+	if err == nil {
+		t.Fatal("expected error for invalid URL in Create")
+	}
+}
+
+func TestClient_AppendRequestError(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.timeout = 100 * time.Millisecond
+
+	// URL with invalid scheme
+	client := newClient("://invalid", cfg)
+
+	ctx := context.Background()
+	_, err := client.Append(ctx, []byte("test"))
+	if err == nil {
+		t.Fatal("expected error for invalid URL in Append")
+	}
+}
+
+func TestClient_ReadRequestError(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.timeout = 100 * time.Millisecond
+
+	// Valid URL for parsing but invalid for request creation
+	client := newClient("://invalid", cfg)
+
+	ctx := context.Background()
+	_, err := client.Read(ctx, "0", 0)
+	if err == nil {
+		t.Fatal("expected error for invalid URL in Read")
+	}
+}
+
+func TestClient_CreateDoWithRetryError(t *testing.T) {
+	// Server that never responds
+	cfg := defaultConfig()
+	cfg.timeout = 10 * time.Millisecond
+	cfg.retryAttempts = 0
+
+	client := newClient("http://192.0.2.1:1", cfg) // Non-routable IP
+
+	ctx := context.Background()
+	err := client.Create(ctx)
+	if err == nil {
+		t.Fatal("expected error from doWithRetry")
+	}
+}
+
+func TestClient_AppendBadStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			w.WriteHeader(http.StatusCreated)
+			return
+		}
+		// Return error status for POST
+		http.Error(w, "bad request", http.StatusBadRequest)
+	}))
+	defer srv.Close()
+
+	store, err := New(srv.URL)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	ctx := context.Background()
+	event := &eventbus.Event{
+		Type:      "test.event",
+		Data:      json.RawMessage(`{}`),
+		Timestamp: time.Now(),
+	}
+	_, err = store.Append(ctx, event)
+	if err == nil {
+		t.Fatal("expected error for bad status on append")
+	}
+}
+
+func TestClient_ReadBadStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			w.WriteHeader(http.StatusCreated)
+			return
+		}
+		// Return error status for GET (not 404, not 200)
+		http.Error(w, "bad request", http.StatusBadRequest)
+	}))
+	defer srv.Close()
+
+	store, err := New(srv.URL)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	ctx := context.Background()
+	_, _, err = store.Read(ctx, eventbus.OffsetOldest, 0)
+	if err == nil {
+		t.Fatal("expected error for bad status on read")
+	}
+}
+
+// errorReader always returns an error on Read
+type errorReader struct{}
+
+func (e errorReader) Read(p []byte) (n int, err error) {
+	return 0, fmt.Errorf("read error")
+}
+
+func (e errorReader) Close() error {
+	return nil
+}
+
+// errorTransport returns a response with an errorReader body
+type errorTransport struct {
+	callCount int
+}
+
+func (t *errorTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.callCount++
+	// First call is for Create (PUT), return success
+	if req.Method == http.MethodPut {
+		return &http.Response{
+			StatusCode: http.StatusCreated,
+			Body:       io.NopCloser(strings.NewReader("")),
+			Header:     make(http.Header),
+		}, nil
+	}
+	// For Read (GET), return 200 with an error reader
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       errorReader{},
+		Header:     make(http.Header),
+	}, nil
+}
+
+func TestClient_ReadBodyError(t *testing.T) {
+	transport := &errorTransport{}
+	client := &http.Client{Transport: transport}
+
+	store, err := New("http://example.com", WithHTTPClient(client))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	ctx := context.Background()
+	_, _, err = store.Read(ctx, eventbus.OffsetOldest, 0)
+	if err == nil {
+		t.Fatal("expected error for read body error")
+	}
+	if !strings.Contains(err.Error(), "read body") {
+		t.Errorf("expected 'read body' error, got: %v", err)
+	}
+}
+
+// controlCharTransport makes Create succeed but all operations use URL with control char
+type controlCharTransport struct{}
+
+func (t *controlCharTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusCreated,
+		Body:       io.NopCloser(strings.NewReader("")),
+		Header:     make(http.Header),
+	}, nil
+}
+
+func TestClient_ReadWithControlCharInURL(t *testing.T) {
+	// URL with a control character that passes url.Parse but fails NewRequestWithContext
+	cfg := defaultConfig()
+	cfg.httpClient = &http.Client{Transport: &controlCharTransport{}}
+
+	// Control character in path - url.Parse succeeds but http.NewRequestWithContext fails
+	client := newClient("http://example.com/path\x00with\x00null", cfg)
+
+	ctx := context.Background()
+	_, err := client.Read(ctx, "0", 0)
+	if err == nil {
+		t.Fatal("expected error for URL with control character")
+	}
+}
+
+func TestStore_AppendMarshalError(t *testing.T) {
+	mock := newMockServer()
+	srv := httptest.NewServer(mock)
+	defer srv.Close()
+
+	store, err := New(srv.URL)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	ctx := context.Background()
+	// Event with invalid JSON in Data field causes json.Marshal to fail
+	event := &eventbus.Event{
+		Type:      "test.event",
+		Data:      json.RawMessage(`invalid json`),
+		Timestamp: time.Now(),
+	}
+
+	_, err = store.Append(ctx, event)
+	if err == nil {
+		t.Fatal("expected error for marshal failure")
+	}
+	if !strings.Contains(err.Error(), "marshal event") {
+		t.Errorf("expected 'marshal event' error, got: %v", err)
 	}
 }

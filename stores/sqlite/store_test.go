@@ -1383,6 +1383,331 @@ func BenchmarkConcurrentAppend(b *testing.B) {
 	})
 }
 
+func TestApplyPragmasError(t *testing.T) {
+	// To test applyPragmas error, we need a database that rejects pragmas
+	// This is typically a read-only database or one with issues
+
+	// Use a mock dbOpener that returns a db that fails on exec
+	SetDBOpener(func(driverName, dataSourceName string) (*sql.DB, error) {
+		// Open a real connection but close it immediately so pragmas fail
+		db, err := sql.Open(driverName, dataSourceName)
+		if err != nil {
+			return nil, err
+		}
+		db.Close() // Close it so all operations fail
+		return db, nil
+	})
+	defer ResetDBOpener()
+
+	_, err := New(":memory:")
+	if err == nil {
+		t.Fatal("expected error when applying pragmas")
+	}
+	if !strings.Contains(err.Error(), "apply pragmas") {
+		t.Errorf("expected 'apply pragmas' in error, got: %v", err)
+	}
+}
+
+func TestMigrateError(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "migrate_error.db")
+
+	// Create a database with a corrupted schema_version table
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open db: %v", err)
+	}
+
+	// Create schema_version as a non-table object to cause migration to fail
+	// Actually, create a schema_version table but with the wrong schema
+	_, err = db.Exec("CREATE TABLE schema_version (bad_column TEXT)")
+	if err != nil {
+		t.Fatalf("failed to create bad table: %v", err)
+	}
+	db.Close()
+
+	// Now try to open with New - migration should fail due to bad schema
+	_, err = New(dbPath)
+	if err == nil {
+		t.Fatal("expected error when migration fails")
+	}
+	if !strings.Contains(err.Error(), "migrate") {
+		t.Errorf("expected 'migrate' in error, got: %v", err)
+	}
+}
+
+func TestMigrateV1ExecSchemaError(t *testing.T) {
+	ctx := context.Background()
+
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "v1_exec_error.db")
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open db: %v", err)
+	}
+	defer db.Close()
+
+	// Create schema_version table
+	_, err = db.Exec("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+	if err != nil {
+		t.Fatalf("failed to create table: %v", err)
+	}
+
+	// Create the events table with wrong schema to cause the CREATE TABLE to fail
+	// Actually, SQLite's IF NOT EXISTS won't fail on existing table.
+	// Let's create a conflicting index name
+	_, err = db.Exec("CREATE TABLE idx_events_type (x INTEGER)")
+	if err != nil {
+		t.Fatalf("failed to create conflicting object: %v", err)
+	}
+
+	err = RunMigrateV1(ctx, db)
+	if err == nil {
+		t.Fatal("expected error when exec schema fails")
+	}
+	if !strings.Contains(err.Error(), "exec schema") {
+		t.Errorf("expected 'exec schema' in error, got: %v", err)
+	}
+}
+
+func TestMigrateGetVersionError(t *testing.T) {
+	ctx := context.Background()
+
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "version_error.db")
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open db: %v", err)
+	}
+	defer db.Close()
+
+	// Create schema_version but with columns that cause the query to fail
+	// The query is: SELECT COALESCE(MAX(version), 0) FROM schema_version
+	// If 'version' column doesn't exist, it will fail
+	_, err = db.Exec("CREATE TABLE schema_version (bad_column TEXT)")
+	if err != nil {
+		t.Fatalf("failed to create table: %v", err)
+	}
+
+	err = RunMigrate(ctx, db)
+	if err == nil {
+		t.Fatal("expected error when getting schema version fails")
+	}
+	if !strings.Contains(err.Error(), "get schema version") {
+		t.Errorf("expected 'get schema version' in error, got: %v", err)
+	}
+}
+
+func TestReadWithScanEventsError(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "scan_error.db")
+
+	// Create a database with proper schema
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open db: %v", err)
+	}
+
+	// Create schema
+	_, err = db.Exec(`
+		CREATE TABLE events (
+			position INTEGER PRIMARY KEY AUTOINCREMENT,
+			type TEXT NOT NULL,
+			data BLOB NOT NULL,
+			timestamp DATETIME NOT NULL
+		);
+		CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
+		INSERT INTO schema_version (version) VALUES (1);
+		CREATE TABLE subscription_positions (
+			subscription_id TEXT PRIMARY KEY,
+			position INTEGER NOT NULL,
+			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
+	`)
+	if err != nil {
+		t.Fatalf("failed to create schema: %v", err)
+	}
+
+	// Insert data with a string timestamp that can't be parsed into time.Time
+	// The Go driver tries to scan a string into time.Time which fails
+	_, err = db.Exec("INSERT INTO events (type, data, timestamp) VALUES (?, ?, ?)",
+		"test", []byte("{}"), "not-a-valid-timestamp")
+	if err != nil {
+		t.Fatalf("failed to insert: %v", err)
+	}
+	db.Close()
+
+	// Open with New (no migration needed since version is 1)
+	store, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	// This should fail during scan due to invalid timestamp
+	_, _, err = store.Read(ctx, eventbus.OffsetOldest, 0)
+	if err == nil {
+		t.Fatal("expected error when scan fails due to invalid timestamp")
+	}
+	if !strings.Contains(err.Error(), "scan event") {
+		t.Errorf("expected 'scan event' in error, got: %v", err)
+	}
+}
+
+func TestReadStreamWithLoggerNonBatched(t *testing.T) {
+	logger := &testLogger{t: t}
+	store, err := New(":memory:", WithLogger(logger))
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Add events
+	for i := 1; i <= 3; i++ {
+		event := &eventbus.Event{
+			Type:      "TestEvent",
+			Data:      json.RawMessage(`{}`),
+			Timestamp: time.Now(),
+		}
+		store.Append(ctx, event)
+	}
+
+	// Stream them all (non-batched mode) to trigger the logger path at line 396-398
+	var events []*eventbus.StoredEvent
+	for event, err := range store.ReadStream(ctx, eventbus.OffsetOldest) {
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		events = append(events, event)
+	}
+
+	if len(events) != 3 {
+		t.Errorf("expected 3 events, got %d", len(events))
+	}
+}
+
+func TestReadStreamWithMetricsHook(t *testing.T) {
+	metrics := &testMetricsHook{}
+	store, err := New(":memory:", WithMetricsHook(metrics))
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Add events
+	for i := 1; i <= 3; i++ {
+		event := &eventbus.Event{
+			Type:      "TestEvent",
+			Data:      json.RawMessage(`{}`),
+			Timestamp: time.Now(),
+		}
+		store.Append(ctx, event)
+	}
+
+	// Stream them to trigger metrics hook in ReadStream deferred (line 369-371)
+	var events []*eventbus.StoredEvent
+	for event, err := range store.ReadStream(ctx, eventbus.OffsetOldest) {
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		events = append(events, event)
+	}
+
+	metrics.mu.Lock()
+	defer metrics.mu.Unlock()
+
+	// The ReadStream uses OnRead hook
+	if metrics.readCount == 0 {
+		t.Error("expected readCount > 0 from ReadStream")
+	}
+}
+
+func TestStreamRowsContextCancellation(t *testing.T) {
+	store, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	// Create mock rows that will keep returning Next() = true
+	// but context will be cancelled mid-iteration
+	mock := &mockRowsWithCancel{
+		data: [][]any{
+			{int64(1), "test", []byte(`{}`), time.Now()},
+			{int64(2), "test", []byte(`{}`), time.Now()},
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var eventCount int
+	var iterErr error
+	var gotContextError bool
+
+	// Cancel context during first iteration
+	store.StreamRows(ctx, mock, &eventCount, &iterErr, func(event *eventbus.StoredEvent, err error) bool {
+		if event != nil {
+			cancel() // Cancel after first event
+		}
+		if err != nil && errors.Is(err, context.Canceled) {
+			gotContextError = true
+			return false
+		}
+		return true
+	})
+
+	if !gotContextError {
+		t.Error("expected context.Canceled error in streamRows")
+	}
+}
+
+// mockRowsWithCancel is similar to mockRows but allows testing context cancellation
+type mockRowsWithCancel struct {
+	index  int
+	data   [][]any
+	closed bool
+}
+
+func (m *mockRowsWithCancel) Next() bool {
+	if m.index >= len(m.data) {
+		return false
+	}
+	m.index++
+	return true
+}
+
+func (m *mockRowsWithCancel) Scan(dest ...any) error {
+	row := m.data[m.index-1]
+	for i, d := range dest {
+		switch ptr := d.(type) {
+		case *int64:
+			*ptr = row[i].(int64)
+		case *string:
+			*ptr = row[i].(string)
+		case *[]byte:
+			*ptr = row[i].([]byte)
+		case *time.Time:
+			*ptr = row[i].(time.Time)
+		}
+	}
+	return nil
+}
+
+func (m *mockRowsWithCancel) Err() error {
+	return nil
+}
+
+func (m *mockRowsWithCancel) Close() error {
+	m.closed = true
+	return nil
+}
+
 func BenchmarkReadVsReadStream(b *testing.B) {
 	store, _ := New(":memory:")
 	defer store.Close()
