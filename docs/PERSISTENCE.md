@@ -7,6 +7,7 @@ Complete guide to event persistence, storage, and replay in ebu.
 - [Overview](#overview)
 - [Quick Start](#quick-start)
 - [Event Stores](#event-stores)
+- [Available Storage Backends](#available-storage-backends)
 - [Replay Patterns](#replay-patterns)
 - [Resumable Subscriptions](#resumable-subscriptions)
 - [Custom Stores](#custom-stores)
@@ -98,25 +99,104 @@ Events are stored with metadata:
 
 ```go
 type StoredEvent struct {
-    Position  int64           // Sequential position number
+    Offset    Offset          // Opaque position in the stream
     Type      string          // Event type name (e.g., "main.UserCreatedEvent")
     Data      json.RawMessage // JSON-encoded event data
     Timestamp time.Time       // When the event was stored
 }
+
+// Special offset constants
+const (
+    OffsetOldest Offset = ""   // Beginning of stream
+    OffsetNewest Offset = "$"  // Current end of stream
+)
 ```
+
+## Available Storage Backends
+
+ebu provides several storage backends:
+
+| Backend | Package | Description |
+|---------|---------|-------------|
+| MemoryStore | `github.com/jilio/ebu` | In-memory store for development/testing |
+| SQLite | `github.com/jilio/ebu/stores/sqlite` | Local persistent storage with WAL mode |
+| Durable-Streams | `github.com/jilio/ebu/stores/durablestream` | Remote HTTP-based storage |
+
+### SQLite Store
+
+Production-ready local storage with excellent performance:
+
+```go
+import (
+    eventbus "github.com/jilio/ebu"
+    "github.com/jilio/ebu/stores/sqlite"
+)
+
+// Create SQLite store with WAL mode and optimizations
+store, err := sqlite.New("./events.db",
+    sqlite.WithBusyTimeout(5 * time.Second),
+    sqlite.WithStreamBatchSize(1000), // For efficient streaming
+)
+if err != nil {
+    log.Fatal(err)
+}
+defer store.Close()
+
+// Use with event bus
+bus := eventbus.New(eventbus.WithStore(store))
+```
+
+SQLite store features:
+- WAL mode for better concurrency
+- Prepared statements for performance
+- Memory-efficient streaming with `ReadStream`
+- Automatic schema migrations
+- Optional logging and metrics hooks
+
+### Durable-Streams Store
+
+Remote storage using the [durable-streams](https://github.com/jilio/durable-streams) protocol:
+
+```go
+import (
+    eventbus "github.com/jilio/ebu"
+    "github.com/jilio/ebu/stores/durablestream"
+)
+
+// Connect to durable-streams server
+store, err := durablestream.New("http://localhost:8080/v1/stream/events",
+    durablestream.WithRetry(3, 100*time.Millisecond),
+    durablestream.WithTimeout(30 * time.Second),
+)
+if err != nil {
+    log.Fatal(err)
+}
+
+// Use with event bus
+bus := eventbus.New(eventbus.WithStore(store))
+
+// Events are persisted to the remote server
+eventbus.Publish(bus, UserCreatedEvent{UserID: "123"})
+```
+
+Durable-streams features:
+- HTTP-based protocol for distributed systems
+- Automatic retries with exponential backoff
+- Configurable timeouts
+- Server-assigned opaque offsets
 
 ## Replay Patterns
 
 ### Basic Replay
 
-Replay all events from a specific position:
+Replay all events from a specific offset:
 
 ```go
 ctx := context.Background()
 
-err := bus.Replay(ctx, 0, func(event *eventbus.StoredEvent) error {
-    fmt.Printf("Position %d: %s at %v\n",
-        event.Position, event.Type, event.Timestamp)
+err := bus.Replay(ctx, eventbus.OffsetOldest, func(event *eventbus.StoredEvent) error {
+    fmt.Printf("Offset %s: %s at %v\n",
+        event.Offset, event.Type, event.Timestamp)
 
     // Process the event
     return nil
@@ -137,7 +217,7 @@ import (
     eventbus "github.com/jilio/ebu"
 )
 
-bus.Replay(ctx, 0, func(event *eventbus.StoredEvent) error {
+bus.Replay(ctx, eventbus.OffsetOldest, func(event *eventbus.StoredEvent) error {
     switch event.Type {
     case eventbus.EventType(UserCreatedEvent{}):
         var user UserCreatedEvent
@@ -166,7 +246,7 @@ Automatically transform old event versions during replay:
 
 ```go
 // Old V1 events are automatically upcasted to V2
-bus.ReplayWithUpcast(ctx, 0, func(event *eventbus.StoredEvent) error {
+bus.ReplayWithUpcast(ctx, eventbus.OffsetOldest, func(event *eventbus.StoredEvent) error {
     // event.Type and event.Data are already transformed
     if event.Type == eventbus.EventType(UserCreatedV2{}) {
         var user UserCreatedV2
@@ -177,29 +257,24 @@ bus.ReplayWithUpcast(ctx, 0, func(event *eventbus.StoredEvent) error {
 })
 ```
 
-### Ranged Replay
+### Replay from Specific Offset
 
-Replay a specific range of events:
+Replay events starting from a specific offset:
 
 ```go
-// Get current position
-pos, _ := store.GetPosition(ctx)
+// Read events to find a starting point
+events, nextOffset, _ := store.Read(ctx, eventbus.OffsetOldest, 100)
 
-// Replay only recent events (last 100)
-from := pos - 100
-if from < 0 {
-    from = 0
-}
-
-bus.Replay(ctx, from, func(event *eventbus.StoredEvent) error {
-    // Process only recent events
+// Continue reading from where we left off
+bus.Replay(ctx, nextOffset, func(event *eventbus.StoredEvent) error {
+    // Process events after the first 100
     return nil
 })
 ```
 
 ## Resumable Subscriptions
 
-Subscribe with automatic position tracking - never miss or duplicate events:
+Subscribe with automatic offset tracking - never miss or duplicate events:
 
 ```go
 type EmailNotification struct {
@@ -212,41 +287,41 @@ func main() {
     store := eventbus.NewMemoryStore()
     bus := eventbus.New(eventbus.WithStore(store))
 
-    // Subscribe with position tracking
+    // Subscribe with offset tracking
     err := eventbus.SubscribeWithReplay(bus, "email-sender",
         func(event EmailNotification) {
             sendEmail(event.To, event.Subject, event.Body)
-            // Position is automatically saved after successful handling
+            // Offset is automatically saved after successful handling
         })
 
     if err != nil {
         log.Fatal(err)
     }
 
-    // After restart, the subscription resumes from last position
+    // After restart, the subscription resumes from last offset
     // No events are missed or duplicated!
 }
 ```
 
 ### How Resumable Subscriptions Work
 
-1. **First Run**: Subscription starts from position 0, replays all historical events
+1. **First Run**: Subscription starts from `OffsetOldest`, replays all historical events
 2. **Normal Operation**: New events are handled as they're published
-3. **After Crash**: On restart, resumes from last successfully processed position
-4. **Position Tracking**: Position is saved after each successful event handling
+3. **After Crash**: On restart, resumes from last successfully processed offset
+4. **Offset Tracking**: Offset is saved after each successful event handling
 
 ### Multiple Subscriptions
 
-Different subscriptions track positions independently:
+Different subscriptions track offsets independently:
 
 ```go
-// Email sender tracks its own position
+// Email sender tracks its own offset
 eventbus.SubscribeWithReplay(bus, "email-sender", emailHandler)
 
 // Analytics tracker tracks separately
 eventbus.SubscribeWithReplay(bus, "analytics", analyticsHandler)
 
-// If email-sender crashes, it resumes from its last position
+// If email-sender crashes, it resumes from its last offset
 // Analytics continues unaffected
 ```
 
@@ -257,23 +332,32 @@ eventbus.SubscribeWithReplay(bus, "analytics", analyticsHandler)
 Implement this interface for custom storage backends:
 
 ```go
+// EventStore is the core interface (2 methods)
 type EventStore interface {
-    // Save a single event
-    Save(ctx context.Context, event *StoredEvent) error
+    // Append stores an event and returns its assigned offset
+    Append(ctx context.Context, event *Event) (Offset, error)
 
-    // Load events from position 'from' to 'to' (-1 for unlimited)
-    Load(ctx context.Context, from, to int64) ([]*StoredEvent, error)
+    // Read returns events starting after the given offset
+    // Use OffsetOldest to read from the beginning
+    // Use limit > 0 to limit results, or 0 for no limit
+    Read(ctx context.Context, from Offset, limit int) ([]*StoredEvent, Offset, error)
+}
 
-    // Get the current highest position
-    GetPosition(ctx context.Context) (int64, error)
+// SubscriptionStore is optional, for tracking subscription offsets
+type SubscriptionStore interface {
+    SaveOffset(ctx context.Context, subscriptionID string, offset Offset) error
+    LoadOffset(ctx context.Context, subscriptionID string) (Offset, error)
+}
 
-    // Save subscription position for resumable subscriptions
-    SaveSubscriptionPosition(ctx context.Context, subscriptionID string, position int64) error
-
-    // Load subscription position
-    LoadSubscriptionPosition(ctx context.Context, subscriptionID string) (int64, error)
+// EventStoreStreamer is optional, for memory-efficient streaming
+type EventStoreStreamer interface {
+    ReadStream(ctx context.Context, from Offset) iter.Seq2[*StoredEvent, error]
 }
 ```
+
+The new interface uses opaque string offsets instead of integer positions, allowing
+for better compatibility with remote storage backends that may use non-sequential
+identifiers.
 
 ### PostgreSQL Example
 
@@ -281,8 +365,7 @@ type EventStore interface {
 import (
     "context"
     "database/sql"
-    "encoding/json"
-    "time"
+    "strconv"
 
     eventbus "github.com/jilio/ebu"
     _ "github.com/lib/pq"
@@ -319,53 +402,62 @@ func NewPostgresStore(connectionString string) (*PostgresStore, error) {
     return &PostgresStore{db: db}, nil
 }
 
-func (p *PostgresStore) Save(ctx context.Context, event *eventbus.StoredEvent) error {
-    _, err := p.db.ExecContext(ctx, `
+func (p *PostgresStore) Append(ctx context.Context, event *eventbus.Event) (eventbus.Offset, error) {
+    var position int64
+    err := p.db.QueryRowContext(ctx, `
         INSERT INTO events (type, data, timestamp)
         VALUES ($1, $2, $3)
         RETURNING position
-    `, event.Type, event.Data, event.Timestamp)
+    `, event.Type, event.Data, event.Timestamp).Scan(&position)
 
-    return err
+    if err != nil {
+        return "", err
+    }
+    return eventbus.Offset(strconv.FormatInt(position, 10)), nil
 }
 
-func (p *PostgresStore) Load(ctx context.Context, from, to int64) ([]*eventbus.StoredEvent, error) {
+func (p *PostgresStore) Read(ctx context.Context, from eventbus.Offset, limit int) ([]*eventbus.StoredEvent, eventbus.Offset, error) {
+    var fromPos int64
+    if from != eventbus.OffsetOldest {
+        fromPos, _ = strconv.ParseInt(string(from), 10, 64)
+    }
+
     var query string
     var args []interface{}
 
-    if to == -1 {
-        query = "SELECT position, type, data, timestamp FROM events WHERE position >= $1 ORDER BY position"
-        args = []interface{}{from}
+    if limit <= 0 {
+        query = "SELECT position, type, data, timestamp FROM events WHERE position > $1 ORDER BY position"
+        args = []interface{}{fromPos}
     } else {
-        query = "SELECT position, type, data, timestamp FROM events WHERE position >= $1 AND position <= $2 ORDER BY position"
-        args = []interface{}{from, to}
+        query = "SELECT position, type, data, timestamp FROM events WHERE position > $1 ORDER BY position LIMIT $2"
+        args = []interface{}{fromPos, limit}
     }
 
     rows, err := p.db.QueryContext(ctx, query, args...)
     if err != nil {
-        return nil, err
+        return nil, from, err
     }
     defer rows.Close()
 
     var events []*eventbus.StoredEvent
+    var lastOffset eventbus.Offset = from
+
     for rows.Next() {
+        var position int64
         event := &eventbus.StoredEvent{}
-        if err := rows.Scan(&event.Position, &event.Type, &event.Data, &event.Timestamp); err != nil {
-            return nil, err
+        if err := rows.Scan(&position, &event.Type, &event.Data, &event.Timestamp); err != nil {
+            return nil, from, err
         }
+        event.Offset = eventbus.Offset(strconv.FormatInt(position, 10))
         events = append(events, event)
+        lastOffset = event.Offset
     }
 
-    return events, rows.Err()
+    return events, lastOffset, rows.Err()
 }
 
-func (p *PostgresStore) GetPosition(ctx context.Context) (int64, error) {
-    var position int64
-    err := p.db.QueryRowContext(ctx, "SELECT COALESCE(MAX(position), 0) FROM events").Scan(&position)
-    return position, err
-}
-
-func (p *PostgresStore) SaveSubscriptionPosition(ctx context.Context, subscriptionID string, position int64) error {
+func (p *PostgresStore) SaveOffset(ctx context.Context, subscriptionID string, offset eventbus.Offset) error {
+    position, _ := strconv.ParseInt(string(offset), 10, 64)
     _, err := p.db.ExecContext(ctx, `
         INSERT INTO subscriptions (subscription_id, position)
         VALUES ($1, $2)
@@ -375,17 +467,20 @@ func (p *PostgresStore) SaveSubscriptionPosition(ctx context.Context, subscripti
     return err
 }
 
-func (p *PostgresStore) LoadSubscriptionPosition(ctx context.Context, subscriptionID string) (int64, error) {
+func (p *PostgresStore) LoadOffset(ctx context.Context, subscriptionID string) (eventbus.Offset, error) {
     var position int64
     err := p.db.QueryRowContext(ctx,
         "SELECT position FROM subscriptions WHERE subscription_id = $1",
         subscriptionID).Scan(&position)
 
     if err == sql.ErrNoRows {
-        return 0, nil
+        return eventbus.OffsetOldest, nil
+    }
+    if err != nil {
+        return eventbus.OffsetOldest, err
     }
 
-    return position, err
+    return eventbus.Offset(strconv.FormatInt(position, 10)), nil
 }
 
 // Usage
@@ -402,144 +497,46 @@ func main() {
 
 ### SQLite Example
 
-SQLite is an excellent choice for single-node event stores - simple, reliable, and fast:
+For SQLite storage, use the official `stores/sqlite` package:
 
 ```go
 import (
-    "context"
-    "database/sql"
-    "encoding/json"
-
     eventbus "github.com/jilio/ebu"
-    _ "github.com/mattn/go-sqlite3"
+    "github.com/jilio/ebu/stores/sqlite"
 )
 
-type SQLiteStore struct {
-    db *sql.DB
-}
-
-func NewSQLiteStore(filepath string) (*SQLiteStore, error) {
-    db, err := sql.Open("sqlite3", filepath)
-    if err != nil {
-        return nil, err
-    }
-
-    // Create tables with optimal indexes
-    _, err = db.Exec(`
-        CREATE TABLE IF NOT EXISTS events (
-            position INTEGER PRIMARY KEY AUTOINCREMENT,
-            type TEXT NOT NULL,
-            data BLOB NOT NULL,
-            timestamp DATETIME NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS subscriptions (
-            subscription_id TEXT PRIMARY KEY,
-            position INTEGER NOT NULL
-        );
-
-        -- Index for efficient range queries
-        CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
-    `)
-    if err != nil {
-        return nil, err
-    }
-
-    // Enable WAL mode for better concurrency
-    db.Exec("PRAGMA journal_mode=WAL")
-
-    return &SQLiteStore{db: db}, nil
-}
-
-func (s *SQLiteStore) Save(ctx context.Context, event *eventbus.StoredEvent) error {
-    result, err := s.db.ExecContext(ctx, `
-        INSERT INTO events (type, data, timestamp)
-        VALUES (?, ?, ?)
-    `, event.Type, event.Data, event.Timestamp)
-
-    if err != nil {
-        return err
-    }
-
-    // Get the auto-generated position
-    pos, err := result.LastInsertId()
-    if err != nil {
-        return err
-    }
-
-    event.Position = pos
-    return nil
-}
-
-func (s *SQLiteStore) Load(ctx context.Context, from, to int64) ([]*eventbus.StoredEvent, error) {
-    var query string
-    var args []interface{}
-
-    if to == -1 {
-        query = "SELECT position, type, data, timestamp FROM events WHERE position >= ? ORDER BY position"
-        args = []interface{}{from}
-    } else {
-        query = "SELECT position, type, data, timestamp FROM events WHERE position >= ? AND position <= ? ORDER BY position"
-        args = []interface{}{from, to}
-    }
-
-    rows, err := s.db.QueryContext(ctx, query, args...)
-    if err != nil {
-        return nil, err
-    }
-    defer rows.Close()
-
-    var events []*eventbus.StoredEvent
-    for rows.Next() {
-        event := &eventbus.StoredEvent{}
-        if err := rows.Scan(&event.Position, &event.Type, &event.Data, &event.Timestamp); err != nil {
-            return nil, err
-        }
-        events = append(events, event)
-    }
-
-    return events, rows.Err()
-}
-
-func (s *SQLiteStore) GetPosition(ctx context.Context) (int64, error) {
-    var position int64
-    err := s.db.QueryRowContext(ctx,
-        "SELECT COALESCE(MAX(position), 0) FROM events").Scan(&position)
-    return position, err
-}
-
-func (s *SQLiteStore) SaveSubscriptionPosition(ctx context.Context, subscriptionID string, position int64) error {
-    _, err := s.db.ExecContext(ctx, `
-        INSERT OR REPLACE INTO subscriptions (subscription_id, position)
-        VALUES (?, ?)
-    `, subscriptionID, position)
-    return err
-}
-
-func (s *SQLiteStore) LoadSubscriptionPosition(ctx context.Context, subscriptionID string) (int64, error) {
-    var position int64
-    err := s.db.QueryRowContext(ctx,
-        "SELECT position FROM subscriptions WHERE subscription_id = ?",
-        subscriptionID).Scan(&position)
-
-    if err == sql.ErrNoRows {
-        return 0, nil
-    }
-
-    return position, err
-}
-
-// Usage
 func main() {
-    store, err := NewSQLiteStore("./events.db")
+    // Create SQLite store with default options
+    store, err := sqlite.New("./events.db")
     if err != nil {
         log.Fatal(err)
     }
+    defer store.Close()
+
+    // Or with custom options
+    store, err := sqlite.New("./events.db",
+        sqlite.WithBusyTimeout(10 * time.Second),
+        sqlite.WithAutoMigrate(true),
+        sqlite.WithStreamBatchSize(1000),
+        sqlite.WithLogger(myLogger),
+        sqlite.WithMetricsHook(myMetrics),
+    )
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer store.Close()
 
     bus := eventbus.New(eventbus.WithStore(store))
     // Events are now persisted to SQLite!
 }
 ```
+
+The SQLite store includes:
+- Automatic schema migrations
+- WAL mode for better concurrency
+- Prepared statements for performance
+- Memory-efficient streaming via `ReadStream`
+- Configurable batch sizes for large datasets
 
 ## Persistence Configuration
 
@@ -672,7 +669,7 @@ type MoneyWithdrawn struct{ AccountID string; Amount float64 }
 func rebuildAccount(bus *eventbus.EventBus, accountID string) (*Account, error) {
     account := &Account{ID: accountID}
 
-    err := bus.Replay(ctx, 0, func(event *eventbus.StoredEvent) error {
+    err := bus.Replay(ctx, eventbus.OffsetOldest, func(event *eventbus.StoredEvent) error {
         switch event.Type {
         case eventbus.EventType(MoneyDeposited{}):
             var e MoneyDeposited
@@ -701,7 +698,7 @@ func rebuildAccount(bus *eventbus.EventBus, accountID string) (*Account, error) 
 bus := eventbus.New(eventbus.WithStore(postgresStore))
 
 // Query audit trail
-events, _ := postgresStore.Load(ctx, 0, -1)
+events, _, _ := postgresStore.Read(ctx, eventbus.OffsetOldest, 0)
 for _, event := range events {
     fmt.Printf("%v: %s - %s\n", event.Timestamp, event.Type, event.Data)
 }
@@ -715,10 +712,10 @@ productionStore := NewPostgresStore(prodConnection)
 
 // Replay in test environment
 testBus := eventbus.New()
-productionStore.Load(ctx, 0, -1)
+events, _, _ := productionStore.Read(ctx, eventbus.OffsetOldest, 0)
 
 // Replay events to test new handler logic
-testBus.Replay(ctx, 0, func(event *eventbus.StoredEvent) error {
+testBus.Replay(ctx, eventbus.OffsetOldest, func(event *eventbus.StoredEvent) error {
     // Test new behavior against real events
     return nil
 })
@@ -729,7 +726,9 @@ testBus.Replay(ctx, 0, func(event *eventbus.StoredEvent) error {
 Event persistence in ebu provides:
 
 - ✅ Simple API - Just add `WithStore(store)` option
-- ✅ Flexible - Implement `EventStore` for any backend
+- ✅ Multiple backends - MemoryStore, SQLite, Durable-Streams, or custom
+- ✅ Remote storage - Native support for distributed event storage
+- ✅ Flexible - Implement `EventStore` interface for any backend
 - ✅ Reliable - Resumable subscriptions never miss events
 - ✅ Powerful - Full replay and event sourcing support
 - ✅ Production-ready - Error handling, timeouts, and monitoring
