@@ -95,10 +95,15 @@ func (c *Client) Read(ctx context.Context, offset string, limit int) (*Response,
 
 	q := u.Query()
 	q.Set("offset", offset)
+	if limit > 0 {
+		q.Set("limit", fmt.Sprintf("%d", limit))
+	}
 	u.RawQuery = q.Encode()
 
-	// After url.Parse succeeds, u.String() is valid for NewRequestWithContext
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
 
 	resp, err := c.doWithRetry(req)
 	if err != nil {

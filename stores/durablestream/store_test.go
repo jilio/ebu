@@ -914,11 +914,112 @@ func TestRead_SyntheticOffsets(t *testing.T) {
 		t.Fatalf("expected 2 events, got %d", len(events))
 	}
 
-	// Check that synthetic offsets are unique (batchOffset:index format)
-	if events[0].Offset != "50:0" {
-		t.Errorf("expected synthetic offset '50:0', got '%s'", events[0].Offset)
+	// Check that synthetic offsets are unique (nextOffset/index format)
+	if events[0].Offset != "50/0" {
+		t.Errorf("expected synthetic offset '50/0', got '%s'", events[0].Offset)
 	}
-	if events[1].Offset != "50:1" {
-		t.Errorf("expected synthetic offset '50:1', got '%s'", events[1].Offset)
+	if events[1].Offset != "50/1" {
+		t.Errorf("expected synthetic offset '50/1', got '%s'", events[1].Offset)
+	}
+}
+
+// testLogger captures log messages for testing
+type testLogger struct {
+	messages []string
+}
+
+func (l *testLogger) Printf(format string, v ...any) {
+	l.messages = append(l.messages, fmt.Sprintf(format, v...))
+}
+
+func TestWithLogger(t *testing.T) {
+	logger := &testLogger{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			w.WriteHeader(http.StatusCreated)
+			return
+		}
+		w.Header().Set("Stream-Next-Offset", "1")
+		// Return array with malformed event to trigger logging
+		w.Write([]byte(`[{"type":"valid","data":{}}, "not an object"]`))
+	}))
+	defer srv.Close()
+
+	store, err := New(srv.URL, WithLogger(logger))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	ctx := context.Background()
+	events, _, err := store.Read(ctx, eventbus.OffsetOldest, 0)
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+
+	// Should have 1 valid event
+	if len(events) != 1 {
+		t.Errorf("expected 1 event, got %d", len(events))
+	}
+
+	// Logger should have captured the malformed event warning
+	if len(logger.messages) != 1 {
+		t.Errorf("expected 1 log message, got %d", len(logger.messages))
+	}
+	if len(logger.messages) > 0 && !strings.Contains(logger.messages[0], "skipping malformed event") {
+		t.Errorf("expected log message about skipping malformed event, got: %s", logger.messages[0])
+	}
+}
+
+func TestClient_ReadWithLimit(t *testing.T) {
+	// Verify limit is passed to server
+	var capturedLimit string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			w.WriteHeader(http.StatusCreated)
+			return
+		}
+		capturedLimit = r.URL.Query().Get("limit")
+		w.Header().Set("Stream-Next-Offset", "1")
+		w.Write([]byte(`[]`))
+	}))
+	defer srv.Close()
+
+	store, err := New(srv.URL)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	ctx := context.Background()
+	_, _, _ = store.Read(ctx, eventbus.OffsetOldest, 42)
+
+	if capturedLimit != "42" {
+		t.Errorf("expected limit '42' in query, got '%s'", capturedLimit)
+	}
+}
+
+func TestClient_ReadWithoutLimit(t *testing.T) {
+	// Verify limit=0 is not sent
+	var hasLimit bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			w.WriteHeader(http.StatusCreated)
+			return
+		}
+		hasLimit = r.URL.Query().Has("limit")
+		w.Header().Set("Stream-Next-Offset", "1")
+		w.Write([]byte(`[]`))
+	}))
+	defer srv.Close()
+
+	store, err := New(srv.URL)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	ctx := context.Background()
+	_, _, _ = store.Read(ctx, eventbus.OffsetOldest, 0)
+
+	if hasLimit {
+		t.Error("expected no limit parameter when limit=0")
 	}
 }

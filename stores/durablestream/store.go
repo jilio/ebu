@@ -87,11 +87,14 @@ type storedEventWithOffset struct {
 
 // Read returns events starting after the given offset.
 //
-// Note on offsets: The durable-streams protocol returns a NextOffset header
-// representing the position after the batch. If individual events include
-// an "offset" field in their JSON, those are used. Otherwise, each event
-// is assigned a synthetic offset in the format "batchOffset:index" to ensure
-// uniqueness within a batch while maintaining ordering.
+// Offset handling:
+//   - If events in the JSON include an "offset" field, those are used directly
+//   - Otherwise, synthetic offsets are generated in format "nextOffset/index"
+//
+// IMPORTANT: Synthetic offsets (containing "/") are ephemeral and should NOT
+// be stored for resumption. They only ensure uniqueness within a single Read call.
+// For reliable resumption, use the nextOffset returned by Read, or ensure your
+// durable-streams server includes per-event offsets in the response.
 func (s *Store) Read(ctx context.Context, from eventbus.Offset, limit int) ([]*eventbus.StoredEvent, eventbus.Offset, error) {
 	// Map OffsetOldest to durable-streams sentinel value
 	offset := string(from)
@@ -121,7 +124,10 @@ func (s *Store) Read(ctx context.Context, from eventbus.Offset, limit int) ([]*e
 		// Try to parse as event with embedded offset first
 		var eventWithOffset storedEventWithOffset
 		if err := json.Unmarshal(raw, &eventWithOffset); err != nil {
-			// Skip malformed events
+			// Log and skip malformed events
+			if s.cfg.logger != nil {
+				s.cfg.logger.Printf("durablestream: skipping malformed event at index %d: %v", i, err)
+			}
 			continue
 		}
 
@@ -130,9 +136,9 @@ func (s *Store) Read(ctx context.Context, from eventbus.Offset, limit int) ([]*e
 		if eventWithOffset.Offset != "" {
 			eventOffset = eventbus.Offset(eventWithOffset.Offset)
 		} else {
-			// Synthesize unique offset: "batchNextOffset:index"
-			// This ensures uniqueness within a batch while maintaining order
-			eventOffset = eventbus.Offset(fmt.Sprintf("%s:%d", resp.NextOffset, i))
+			// Synthesize unique offset: "nextOffset/index"
+			// These are ephemeral - use nextOffset for reliable resumption
+			eventOffset = eventbus.Offset(fmt.Sprintf("%s/%d", resp.NextOffset, i))
 		}
 
 		events = append(events, &eventbus.StoredEvent{

@@ -5,6 +5,11 @@ import (
 	"time"
 )
 
+// Logger is the interface for logging.
+type Logger interface {
+	Printf(format string, v ...any)
+}
+
 // Option configures a Store.
 type Option func(*config)
 
@@ -14,6 +19,7 @@ type config struct {
 	retryAttempts int
 	retryBackoff  time.Duration
 	contentType   string
+	logger        Logger
 }
 
 func defaultConfig() *config {
@@ -63,5 +69,13 @@ func WithContentType(contentType string) Option {
 		if contentType != "" {
 			c.contentType = contentType
 		}
+	}
+}
+
+// WithLogger sets a logger for debugging and error reporting.
+// When set, malformed events and other issues will be logged.
+func WithLogger(logger Logger) Option {
+	return func(c *config) {
+		c.logger = logger
 	}
 }
