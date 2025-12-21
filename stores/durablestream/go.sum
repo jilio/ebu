@@ -1,0 +1,4 @@
+github.com/ahimsalabs/durable-streams-go v0.0.0-20251220072926-9430608b4163 h1:AbU80hHRlHUFyLdHtmNyYs56f9iI6F9Z0CEZjFNRlC8=
+github.com/ahimsalabs/durable-streams-go v0.0.0-20251220072926-9430608b4163/go.mod h1:CRY4a4F3s64YLkAADqKNnEg3Nm4wUYe50QP8KLxpGpE=
+github.com/go4org/hashtriemap v0.0.0-20251130024219-545ba229f689 h1:0psnKZ+N2IP43/SZC8SKx6OpFJwLmQb9m9QyV9BC2f8=
+github.com/go4org/hashtriemap v0.0.0-20251130024219-545ba229f689/go.mod h1:OGmRfY/9QEK2P5zCRtmqfbCF283xPkU2dvVA4MvbvpI=

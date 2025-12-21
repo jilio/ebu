@@ -14,21 +14,17 @@ type Logger interface {
 type Option func(*config)
 
 type config struct {
-	httpClient    *http.Client
-	timeout       time.Duration
-	retryAttempts int
-	retryBackoff  time.Duration
-	contentType   string
-	logger        Logger
+	httpClient  *http.Client
+	timeout     time.Duration
+	contentType string
+	logger      Logger
 }
 
 func defaultConfig() *config {
 	return &config{
-		httpClient:    http.DefaultClient,
-		timeout:       30 * time.Second,
-		retryAttempts: 3,
-		retryBackoff:  100 * time.Millisecond,
-		contentType:   "application/json",
+		httpClient:  http.DefaultClient,
+		timeout:     30 * time.Second,
+		contentType: "application/json",
 	}
 }
 
@@ -46,18 +42,6 @@ func WithTimeout(d time.Duration) Option {
 	return func(c *config) {
 		if d > 0 {
 			c.timeout = d
-		}
-	}
-}
-
-// WithRetry configures retry behavior.
-func WithRetry(attempts int, backoff time.Duration) Option {
-	return func(c *config) {
-		if attempts >= 0 {
-			c.retryAttempts = attempts
-		}
-		if backoff > 0 {
-			c.retryBackoff = backoff
 		}
 	}
 }

@@ -18,8 +18,9 @@ A lightweight, type-safe event bus for Go with generics support. Build decoupled
 - 🧵 **Thread-safe** - Safe for concurrent use across goroutines
 - 🌐 **Context support** - First-class context support for cancellation and tracing
 - 🛡️ **Panic recovery** - Handlers are isolated from each other's panics
-- 🚀 **Zero dependencies** - Pure Go standard library
+- 🚀 **Zero dependencies** - Pure Go standard library (core package)
 - 💾 **Event persistence** - Built-in support for event storage and replay
+- 🌍 **Remote storage** - Native support for remote backends like [durable-streams](https://github.com/durable-streams/durable-streams)
 - 🔄 **Event upcasting** - Seamless event schema migration and versioning
 - ✅ **100% test coverage** - Thoroughly tested for reliability
 
@@ -186,28 +187,62 @@ bus.ClearAll()
 Store and replay events for event sourcing, audit logs, and resumable subscriptions:
 
 ```go
-// Create persistent bus
+// Create persistent bus with in-memory store
 store := eventbus.NewMemoryStore()
 bus := eventbus.New(eventbus.WithStore(store))
 
 // Events are automatically persisted
 eventbus.Publish(bus, UserCreatedEvent{UserID: "123"})
 
-// Replay events
-bus.Replay(ctx, 0, func(event *eventbus.StoredEvent) error {
+// Replay events from the beginning
+bus.Replay(ctx, eventbus.OffsetOldest, func(event *eventbus.StoredEvent) error {
     // Process stored event
     return nil
 })
 
-// Subscribe with automatic position tracking
+// Subscribe with automatic offset tracking
 eventbus.SubscribeWithReplay(bus, "email-sender",
     func(event EmailEvent) {
         sendEmail(event)
-        // Position saved automatically after success
+        // Offset saved automatically after success
     })
 ```
 
 See [**Persistence Guide**](docs/PERSISTENCE.md) for custom stores and advanced patterns.
+
+### Remote Storage
+
+Use remote storage backends for distributed event persistence. ebu supports [Durable Streams](https://electric-sql.com/blog/2025/12/09/announcing-durable-streams) - an HTTP protocol for reliable, resumable, real-time data streaming developed by [Electric](https://electric-sql.com):
+
+```go
+import (
+    eventbus "github.com/jilio/ebu"
+    "github.com/jilio/ebu/stores/durablestream"
+)
+
+// Connect to a durable-streams server
+store, err := durablestream.New(
+    "http://localhost:4437/v1/stream",  // server base URL
+    "mystream",                          // stream name
+    durablestream.WithTimeout(30*time.Second),
+)
+if err != nil {
+    log.Fatal(err)
+}
+
+// Use with event bus - same API as local storage
+bus := eventbus.New(eventbus.WithStore(store))
+
+// Events are now persisted to the remote durable-streams server
+eventbus.Publish(bus, OrderCreatedEvent{OrderID: "123", Amount: 99.99})
+```
+
+Available storage backends:
+- **MemoryStore** - Built-in in-memory store for development
+- **SQLite** - `stores/sqlite` - Persistent local storage
+- **Durable-Streams** - `stores/durablestream` - Remote HTTP-based storage ([protocol spec](https://electric-sql.com/blog/2025/12/09/announcing-durable-streams))
+
+See [**Persistence Guide**](docs/PERSISTENCE.md) for all storage options.
 
 ### Observability
 
@@ -338,6 +373,16 @@ See [TypeNamer examples](docs/EXAMPLES.md#custom-event-type-names-typenamer) for
 - 📖 [**Complete Examples**](docs/EXAMPLES.md) - Comprehensive usage examples
 - 💾 [**Persistence Guide**](docs/PERSISTENCE.md) - Event storage and replay patterns
 - 📚 [**API Reference**](https://godoc.org/github.com/jilio/ebu) - Complete API documentation
+
+## Storage Backends
+
+| Backend | Package | Description |
+|---------|---------|-------------|
+| MemoryStore | `github.com/jilio/ebu` | In-memory store for development/testing |
+| SQLite | `github.com/jilio/ebu/stores/sqlite` | Local persistent storage with WAL mode |
+| Durable-Streams | `github.com/jilio/ebu/stores/durablestream` | Remote HTTP-based storage |
+
+See [**Persistence Guide**](docs/PERSISTENCE.md) for detailed usage.
 
 ## Best Practices
 
