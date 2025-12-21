@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	eventbus "github.com/jilio/ebu"
 )
@@ -29,7 +30,15 @@ var _ eventbus.EventStore = (*Store)(nil)
 // e.g., "https://server.example.com/v1/stream/my-events".
 //
 // By default, the store will attempt to create the stream if it doesn't exist.
+// Note: Stream creation uses context.Background() to ensure it completes fully.
+// Use NewWithContext if you need cancellable initialization.
 func New(streamURL string, opts ...Option) (*Store, error) {
+	return NewWithContext(context.Background(), streamURL, opts...)
+}
+
+// NewWithContext creates a new Store with a context for initialization.
+// The context is used for the initial stream creation request.
+func NewWithContext(ctx context.Context, streamURL string, opts ...Option) (*Store, error) {
 	if streamURL == "" {
 		return nil, fmt.Errorf("durablestream: streamURL is required")
 	}
@@ -42,7 +51,7 @@ func New(streamURL string, opts ...Option) (*Store, error) {
 	client := newClient(streamURL, cfg)
 
 	// Try to create the stream (idempotent)
-	if err := client.Create(context.Background()); err != nil {
+	if err := client.Create(ctx); err != nil {
 		return nil, fmt.Errorf("durablestream: create stream: %w", err)
 	}
 
@@ -68,7 +77,21 @@ func (s *Store) Append(ctx context.Context, event *eventbus.Event) (eventbus.Off
 	return eventbus.Offset(offset), nil
 }
 
+// storedEventWithOffset is used to parse events that include their own offset
+type storedEventWithOffset struct {
+	Offset    string          `json:"offset,omitempty"`
+	Type      string          `json:"type"`
+	Data      json.RawMessage `json:"data"`
+	Timestamp string          `json:"timestamp,omitempty"`
+}
+
 // Read returns events starting after the given offset.
+//
+// Note on offsets: The durable-streams protocol returns a NextOffset header
+// representing the position after the batch. If individual events include
+// an "offset" field in their JSON, those are used. Otherwise, each event
+// is assigned a synthetic offset in the format "batchOffset:index" to ensure
+// uniqueness within a batch while maintaining ordering.
 func (s *Store) Read(ctx context.Context, from eventbus.Offset, limit int) ([]*eventbus.StoredEvent, eventbus.Offset, error) {
 	// Map OffsetOldest to durable-streams sentinel value
 	offset := string(from)
@@ -94,18 +117,29 @@ func (s *Store) Read(ctx context.Context, from eventbus.Offset, limit int) ([]*e
 
 	// Convert to StoredEvents
 	events := make([]*eventbus.StoredEvent, 0, len(rawEvents))
-	for _, raw := range rawEvents {
-		var event eventbus.Event
-		if err := json.Unmarshal(raw, &event); err != nil {
+	for i, raw := range rawEvents {
+		// Try to parse as event with embedded offset first
+		var eventWithOffset storedEventWithOffset
+		if err := json.Unmarshal(raw, &eventWithOffset); err != nil {
 			// Skip malformed events
 			continue
 		}
 
+		// Determine offset: use embedded offset if present, otherwise synthesize
+		var eventOffset eventbus.Offset
+		if eventWithOffset.Offset != "" {
+			eventOffset = eventbus.Offset(eventWithOffset.Offset)
+		} else {
+			// Synthesize unique offset: "batchNextOffset:index"
+			// This ensures uniqueness within a batch while maintaining order
+			eventOffset = eventbus.Offset(fmt.Sprintf("%s:%d", resp.NextOffset, i))
+		}
+
 		events = append(events, &eventbus.StoredEvent{
-			Offset:    eventbus.Offset(resp.NextOffset),
-			Type:      event.Type,
-			Data:      event.Data,
-			Timestamp: event.Timestamp,
+			Offset:    eventOffset,
+			Type:      eventWithOffset.Type,
+			Data:      eventWithOffset.Data,
+			Timestamp: parseTimestamp(eventWithOffset.Timestamp),
 		})
 	}
 
@@ -120,4 +154,17 @@ func (s *Store) Read(ctx context.Context, from eventbus.Offset, limit int) ([]*e
 // Close is a no-op for HTTP-based stores.
 func (s *Store) Close() error {
 	return nil
+}
+
+// parseTimestamp parses a timestamp string and returns a time.Time.
+// Uses RFC3339Nano which is a superset of RFC3339. Returns zero time on failure.
+func parseTimestamp(s string) time.Time {
+	if s == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
 }

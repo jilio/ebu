@@ -768,3 +768,157 @@ func TestStore_AppendMarshalError(t *testing.T) {
 		t.Errorf("expected 'marshal event' error, got: %v", err)
 	}
 }
+
+func TestNewWithContext(t *testing.T) {
+	mock := newMockServer()
+	srv := httptest.NewServer(mock)
+	defer srv.Close()
+
+	t.Run("creates store with context", func(t *testing.T) {
+		ctx := context.Background()
+		store, err := NewWithContext(ctx, srv.URL)
+		if err != nil {
+			t.Fatalf("NewWithContext() error = %v", err)
+		}
+		if store == nil {
+			t.Fatal("expected non-nil store")
+		}
+	})
+
+	t.Run("errors on cancelled context", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // Cancel immediately
+
+		_, err := NewWithContext(ctx, srv.URL)
+		if err == nil {
+			t.Fatal("expected error for cancelled context")
+		}
+	})
+}
+
+func TestParseTimestamp(t *testing.T) {
+	t.Run("empty string returns zero time", func(t *testing.T) {
+		result := parseTimestamp("")
+		if !result.IsZero() {
+			t.Errorf("expected zero time, got %v", result)
+		}
+	})
+
+	t.Run("RFC3339Nano format", func(t *testing.T) {
+		ts := "2024-01-15T10:30:00.123456789Z"
+		result := parseTimestamp(ts)
+		if result.IsZero() {
+			t.Error("expected non-zero time for RFC3339Nano")
+		}
+		if result.Year() != 2024 {
+			t.Errorf("expected year 2024, got %d", result.Year())
+		}
+	})
+
+	t.Run("RFC3339 format without nanoseconds", func(t *testing.T) {
+		ts := "2024-01-15T10:30:00+05:30"
+		result := parseTimestamp(ts)
+		if result.IsZero() {
+			t.Error("expected non-zero time for RFC3339")
+		}
+		if result.Year() != 2024 {
+			t.Errorf("expected year 2024, got %d", result.Year())
+		}
+	})
+
+	t.Run("invalid format returns zero time", func(t *testing.T) {
+		result := parseTimestamp("invalid-timestamp")
+		if !result.IsZero() {
+			t.Errorf("expected zero time for invalid format, got %v", result)
+		}
+	})
+}
+
+func TestRead_EmbeddedOffsets(t *testing.T) {
+	// Server that returns events with embedded offsets
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			w.WriteHeader(http.StatusCreated)
+			return
+		}
+		w.Header().Set("Stream-Next-Offset", "100")
+		// Events with their own offset field
+		w.Write([]byte(`[
+			{"offset":"10","type":"event1","data":{},"timestamp":"2024-01-15T10:30:00Z"},
+			{"offset":"20","type":"event2","data":{},"timestamp":"2024-01-15T10:31:00.123456789Z"}
+		]`))
+	}))
+	defer srv.Close()
+
+	store, err := New(srv.URL)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	ctx := context.Background()
+	events, nextOffset, err := store.Read(ctx, eventbus.OffsetOldest, 0)
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+
+	// Check that embedded offsets are used
+	if events[0].Offset != "10" {
+		t.Errorf("expected offset '10', got '%s'", events[0].Offset)
+	}
+	if events[1].Offset != "20" {
+		t.Errorf("expected offset '20', got '%s'", events[1].Offset)
+	}
+
+	// Check timestamps are parsed
+	if events[0].Timestamp.IsZero() {
+		t.Error("expected non-zero timestamp for event 0")
+	}
+
+	if nextOffset != "100" {
+		t.Errorf("expected next offset '100', got '%s'", nextOffset)
+	}
+}
+
+func TestRead_SyntheticOffsets(t *testing.T) {
+	// Server that returns events without offsets
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			w.WriteHeader(http.StatusCreated)
+			return
+		}
+		w.Header().Set("Stream-Next-Offset", "50")
+		// Events without offset field
+		w.Write([]byte(`[
+			{"type":"event1","data":{}},
+			{"type":"event2","data":{}}
+		]`))
+	}))
+	defer srv.Close()
+
+	store, err := New(srv.URL)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	ctx := context.Background()
+	events, _, err := store.Read(ctx, eventbus.OffsetOldest, 0)
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+
+	// Check that synthetic offsets are unique (batchOffset:index format)
+	if events[0].Offset != "50:0" {
+		t.Errorf("expected synthetic offset '50:0', got '%s'", events[0].Offset)
+	}
+	if events[1].Offset != "50:1" {
+		t.Errorf("expected synthetic offset '50:1', got '%s'", events[1].Offset)
+	}
+}
