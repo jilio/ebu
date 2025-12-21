@@ -13,11 +13,10 @@ type Logger interface {
 
 // MetricsHook is called after store operations complete
 type MetricsHook interface {
-	OnSave(duration time.Duration, err error)
-	OnLoad(duration time.Duration, count int, err error)
-	OnGetPosition(duration time.Duration, err error)
-	OnSaveSubscriptionPosition(duration time.Duration, err error)
-	OnLoadSubscriptionPosition(duration time.Duration, err error)
+	OnAppend(duration time.Duration, err error)
+	OnRead(duration time.Duration, count int, err error)
+	OnSaveOffset(duration time.Duration, err error)
+	OnLoadOffset(duration time.Duration, err error)
 }
 
 // Option configures the SQLiteStore
