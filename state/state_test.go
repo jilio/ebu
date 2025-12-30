@@ -59,6 +59,14 @@ func TestCompositeKey(t *testing.T) {
 	}
 }
 
+func TestEntityTypeWithNil(t *testing.T) {
+	got := EntityType(nil)
+	want := "nil"
+	if got != want {
+		t.Errorf("EntityType(nil) = %q, want %q", got, want)
+	}
+}
+
 func TestChangeMessageEventTypeName(t *testing.T) {
 	msg := ChangeMessage{}
 	got := msg.EventTypeName()

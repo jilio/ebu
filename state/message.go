@@ -83,7 +83,11 @@ type TypeNamer interface {
 // EntityType returns the type name for an entity.
 // If the entity implements TypeNamer, returns the custom name.
 // Otherwise returns the reflect-based package-qualified name.
+// Returns "nil" if entity is nil.
 func EntityType(entity any) string {
+	if entity == nil {
+		return "nil"
+	}
 	if namer, ok := entity.(TypeNamer); ok {
 		return namer.StateTypeName()
 	}
