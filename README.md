@@ -384,6 +384,49 @@ See [TypeNamer examples](docs/EXAMPLES.md#custom-event-type-names-typenamer) for
 
 See [**Persistence Guide**](docs/PERSISTENCE.md) for detailed usage.
 
+## State Protocol
+
+The optional `state` package implements the [Durable Streams State Protocol](https://github.com/durable-streams/durable-streams) for database-style state synchronization:
+
+```go
+import (
+    eventbus "github.com/jilio/ebu"
+    "github.com/jilio/ebu/state"
+)
+
+// Define entity type
+type User struct {
+    Name  string `json:"name"`
+    Email string `json:"email"`
+}
+
+// Create and publish state changes
+bus := eventbus.New(eventbus.WithStore(eventbus.NewMemoryStore()))
+
+insertMsg, _ := state.Insert("user:1", User{Name: "Alice", Email: "alice@example.com"})
+eventbus.Publish(bus, insertMsg)
+
+updateMsg, _ := state.Update("user:1", User{Name: "Alice Smith"}, state.WithTxID("tx-123"))
+eventbus.Publish(bus, updateMsg)
+
+// Materialize state from events
+mat := state.NewMaterializer()
+users := state.NewTypedCollection[User](state.NewMemoryStore[User]())
+state.RegisterCollection(mat, users)
+
+mat.Replay(ctx, bus, eventbus.OffsetOldest)
+
+// Access materialized state
+user, ok := users.Get("user:1")  // User{Name: "Alice Smith", ...}
+```
+
+Features:
+- **Type-safe helpers**: `Insert`, `Update`, `Delete` with Go generics
+- **Options pattern**: `WithTxID`, `WithTimestamp`, `WithEntityType`
+- **Materializer**: Build typed state from event streams
+- **Control messages**: `SnapshotStart`, `SnapshotEnd`, `Reset`
+- **JSON interoperability**: Compatible with durable-streams ecosystem
+
 ## Best Practices
 
 1. **Define clear event types** - Use descriptive structs with meaningful fields
