@@ -200,7 +200,9 @@ func (m *Materializer) Apply(event *eventbus.StoredEvent) error {
 	var ctrlHeaders ControlHeaders
 	if json.Unmarshal(raw.Headers, &ctrlHeaders) == nil && ctrlHeaders.Control != "" {
 		m.applyControl(&ControlMessage{Headers: ctrlHeaders})
+		m.mu.Lock()
 		m.lastOffset = event.Offset
+		m.mu.Unlock()
 		return nil
 	}
 
@@ -214,7 +216,9 @@ func (m *Materializer) Apply(event *eventbus.StoredEvent) error {
 		return err
 	}
 
+	m.mu.Lock()
 	m.lastOffset = event.Offset
+	m.mu.Unlock()
 	return nil
 }
 
@@ -280,6 +284,8 @@ func (m *Materializer) applyControl(msg *ControlMessage) {
 
 // LastOffset returns the offset of the last applied event.
 func (m *Materializer) LastOffset() eventbus.Offset {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.lastOffset
 }
 
