@@ -2,10 +2,8 @@ module github.com/jilio/ebu/stores/sqlite
 
 go 1.24.2
 
-replace github.com/jilio/ebu => ../../
-
 require (
-	github.com/jilio/ebu v0.0.0
+	github.com/jilio/ebu v0.10.1
 	modernc.org/sqlite v1.40.1
 )
 

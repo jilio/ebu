@@ -1,0 +1,9 @@
+go 1.25.1
+
+// Local development across the ebu module and its store sub-modules. External
+// importers ignore go.work and resolve each module by its go.mod require version.
+use (
+	.
+	./stores/durablestream
+	./stores/sqlite
+)
