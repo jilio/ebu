@@ -7,7 +7,7 @@ import (
 )
 
 // Schema version for migrations
-const currentSchemaVersion = 1
+const currentSchemaVersion = 2
 
 // Schema definitions
 const (
@@ -33,6 +33,17 @@ const (
 			version INTEGER PRIMARY KEY,
 			applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`
+
+	// createSnapshotsTable (schema v2) holds one compaction snapshot per id: an
+	// opaque blob tagged with the position it reflects, so a caller can load it
+	// and replay only events with a greater position.
+	createSnapshotsTable = `
+		CREATE TABLE IF NOT EXISTS snapshots (
+			snapshot_id TEXT PRIMARY KEY,
+			position    INTEGER NOT NULL,
+			data        BLOB NOT NULL,
+			updated_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`
 )
 
 // migrate applies database migrations if needed
@@ -50,9 +61,15 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		return fmt.Errorf("get schema version: %w", err)
 	}
 
-	// Apply migrations
+	// Apply migrations in order. migrateV1 seeds version=1, so a v0 database runs
+	// v1 then v2; a v1 database runs only v2; a v2 database applies nothing.
 	if version < 1 {
-		return migrateV1(ctx, db)
+		if err := migrateV1(ctx, db); err != nil {
+			return err
+		}
+	}
+	if version < 2 {
+		return migrateV2(ctx, db)
 	}
 
 	return nil
@@ -77,6 +94,33 @@ func migrateV1(ctx context.Context, db *sql.DB) (err error) {
 		createEventsTypeIndex,
 		createSubscriptionPositionsTable,
 		"INSERT INTO schema_version (version) VALUES (1)",
+	}
+
+	for _, stmt := range statements {
+		if _, err = tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("exec schema: %w", err)
+		}
+	}
+
+	return tx.Commit()
+}
+
+// migrateV2 adds the snapshots table for log compaction.
+func migrateV2(ctx context.Context, db *sql.DB) (err error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+		}
+	}()
+
+	statements := []string{
+		createSnapshotsTable,
+		"INSERT INTO schema_version (version) VALUES (2)",
 	}
 
 	for _, stmt := range statements {

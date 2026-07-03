@@ -17,6 +17,11 @@ func RunMigrateV1(ctx context.Context, db *sql.DB) error {
 	return migrateV1(ctx, db)
 }
 
+// RunMigrateV2 runs v2 migration on a database (exported for testing)
+func RunMigrateV2(ctx context.Context, db *sql.DB) error {
+	return migrateV2(ctx, db)
+}
+
 // NewFromDB creates a store from an existing db connection (exported for testing)
 // This allows testing the error path in newFromDB when prepareStatements fails
 func NewFromDB(db *sql.DB) (*SQLiteStore, error) {

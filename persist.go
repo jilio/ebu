@@ -75,6 +75,39 @@ type SubscriptionStore interface {
 	LoadOffset(ctx context.Context, subscriptionID string) (Offset, error)
 }
 
+// EventStoreSnapshotter is an optional interface for stores that can persist a
+// materialized projection snapshot, keyed by an id and tagged with the Offset the
+// snapshot reflects. It lets a caller compact a high-churn log: save the reduced
+// state, then (with EventStoreTruncator) drop the events the snapshot subsumes,
+// bounding cold-start replay. The blob is opaque to ebu — callers define its
+// encoding. A store that does not implement this interface is simply not
+// compactable; callers fall back to a full replay from OffsetOldest.
+type EventStoreSnapshotter interface {
+	// SaveSnapshot upserts the snapshot for snapshotID, recording that blob
+	// reflects the projection state as of (and including) atOffset. atOffset MUST
+	// be a real, resumable Offset previously returned by Append/Read for THIS
+	// store (never OffsetNewest, never synthetic): a caller resumes with
+	// Replay(ctx, atOffset, ...), which reads only events strictly after it.
+	SaveSnapshot(ctx context.Context, snapshotID string, atOffset Offset, blob json.RawMessage) error
+
+	// LoadSnapshot returns the last saved snapshot for snapshotID. When none
+	// exists it returns (OffsetOldest, nil, nil) — "replay from the beginning",
+	// never an error — mirroring LoadOffset's OffsetOldest default.
+	LoadSnapshot(ctx context.Context, snapshotID string) (atOffset Offset, blob json.RawMessage, err error)
+}
+
+// EventStoreTruncator is an optional interface for log compaction: it deletes
+// events at or before a given Offset. It is only safe to call once a snapshot
+// covering that Offset is durably saved AND no live reader/subscription still
+// needs the truncated prefix. Stores whose Offsets are not deletable positions
+// (e.g. a remote append-only broker) MUST NOT implement this interface.
+type EventStoreTruncator interface {
+	// TruncateBefore deletes every event whose Offset <= beforeOffset and returns
+	// the number deleted. beforeOffset == OffsetOldest is a no-op. Idempotent:
+	// re-running with the same offset deletes nothing more.
+	TruncateBefore(ctx context.Context, beforeOffset Offset) (deleted int64, err error)
+}
+
 // Event represents an event to be stored (before it has an offset).
 type Event struct {
 	Type      string          `json:"type"`

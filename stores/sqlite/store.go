@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"iter"
@@ -24,17 +25,21 @@ type SQLiteStore struct {
 	metricsHook MetricsHook
 
 	// Prepared statements
-	appendStmt     *sql.Stmt
-	readStmt       *sql.Stmt
-	readFromStmt   *sql.Stmt
-	saveOffsetStmt *sql.Stmt
-	loadOffsetStmt *sql.Stmt
+	appendStmt       *sql.Stmt
+	readStmt         *sql.Stmt
+	readFromStmt     *sql.Stmt
+	saveOffsetStmt   *sql.Stmt
+	loadOffsetStmt   *sql.Stmt
+	saveSnapshotStmt *sql.Stmt
+	loadSnapshotStmt *sql.Stmt
 }
 
 // Ensure SQLiteStore implements the required interfaces
 var _ eventbus.EventStore = (*SQLiteStore)(nil)
 var _ eventbus.EventStoreStreamer = (*SQLiteStore)(nil)
 var _ eventbus.SubscriptionStore = (*SQLiteStore)(nil)
+var _ eventbus.EventStoreSnapshotter = (*SQLiteStore)(nil)
+var _ eventbus.EventStoreTruncator = (*SQLiteStore)(nil)
 
 // dbOpener is used to open database connections, injectable for testing
 var dbOpener = sql.Open
@@ -144,6 +149,10 @@ func (s *SQLiteStore) prepareStatements() error {
 			VALUES (?, ?, CURRENT_TIMESTAMP)
 			ON CONFLICT(subscription_id) DO UPDATE SET position = excluded.position, updated_at = CURRENT_TIMESTAMP`},
 		{&s.loadOffsetStmt, "SELECT position FROM subscription_positions WHERE subscription_id = ?"},
+		{&s.saveSnapshotStmt, `INSERT INTO snapshots (snapshot_id, position, data, updated_at)
+			VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+			ON CONFLICT(snapshot_id) DO UPDATE SET position = excluded.position, data = excluded.data, updated_at = CURRENT_TIMESTAMP`},
+		{&s.loadSnapshotStmt, "SELECT position, data FROM snapshots WHERE snapshot_id = ?"},
 	}
 
 	for _, def := range stmts {
@@ -331,6 +340,58 @@ func (s *SQLiteStore) LoadOffset(ctx context.Context, subscriptionID string) (ev
 // Close closes the database connection and releases resources.
 // Prepared statement close errors are ignored as they cannot fail in practice
 // with SQLite (the driver handles cleanup when the connection closes).
+// SaveSnapshot upserts the compaction snapshot for snapshotID, recording that
+// blob reflects the projection as of (and including) atOffset.
+func (s *SQLiteStore) SaveSnapshot(ctx context.Context, snapshotID string, atOffset eventbus.Offset, blob json.RawMessage) error {
+	position, err := parseOffset(atOffset)
+	if err != nil {
+		return fmt.Errorf("sqlite: invalid snapshot offset: %w", err)
+	}
+	if _, err := s.saveSnapshotStmt.ExecContext(ctx, snapshotID, position, []byte(blob)); err != nil {
+		return fmt.Errorf("sqlite: save snapshot: %w", err)
+	}
+	return nil
+}
+
+// LoadSnapshot returns the last saved snapshot for snapshotID, or
+// (OffsetOldest, nil, nil) when none exists.
+func (s *SQLiteStore) LoadSnapshot(ctx context.Context, snapshotID string) (eventbus.Offset, json.RawMessage, error) {
+	var position int64
+	var blob []byte
+	err := s.loadSnapshotStmt.QueryRowContext(ctx, snapshotID).Scan(&position, &blob)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return eventbus.OffsetOldest, nil, nil
+		}
+		return eventbus.OffsetOldest, nil, fmt.Errorf("sqlite: load snapshot: %w", err)
+	}
+	return formatOffset(position), json.RawMessage(blob), nil
+}
+
+// TruncateBefore deletes every event whose position is <= beforeOffset and
+// returns the number deleted. beforeOffset == OffsetOldest is a no-op. The events
+// table uses AUTOINCREMENT, so deleted positions are never reused; a snapshot
+// resumed via Replay(atOffset) (which reads position > atOffset) is unaffected.
+func (s *SQLiteStore) TruncateBefore(ctx context.Context, beforeOffset eventbus.Offset) (int64, error) {
+	position, err := parseOffset(beforeOffset)
+	if err != nil {
+		return 0, fmt.Errorf("sqlite: invalid truncate offset: %w", err)
+	}
+	if position <= 0 {
+		return 0, nil
+	}
+	res, err := s.db.ExecContext(ctx, "DELETE FROM events WHERE position <= ?", position)
+	if err != nil {
+		return 0, fmt.Errorf("sqlite: truncate events: %w", err)
+	}
+	deleted, _ := res.RowsAffected()
+	// Checkpoint in TRUNCATE mode so the freed pages actually shrink the WAL/db.
+	// Best-effort and deliberately unchecked: the rows are already durably gone; a
+	// failed checkpoint only means space reclaim lags to the next automatic one.
+	_, _ = s.db.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)")
+	return deleted, nil
+}
+
 func (s *SQLiteStore) Close() error {
 	// Close prepared statements - errors ignored as db.Close() handles cleanup
 	stmts := []*sql.Stmt{
@@ -339,6 +400,8 @@ func (s *SQLiteStore) Close() error {
 		s.readFromStmt,
 		s.saveOffsetStmt,
 		s.loadOffsetStmt,
+		s.saveSnapshotStmt,
+		s.loadSnapshotStmt,
 	}
 	for _, stmt := range stmts {
 		if stmt != nil {
