@@ -18,4 +18,3 @@ require (
 	go.opentelemetry.io/auto/sdk v1.1.0 // indirect
 	golang.org/x/sys v0.35.0 // indirect
 )
-
