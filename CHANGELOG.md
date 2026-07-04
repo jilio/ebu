@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.11.0] - 2026-07-04
+## [0.12.0] - 2026-07-04
 
 ### Fixed
 
@@ -63,7 +63,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `otel` referenced ebu versions that were never published (or used a
   `replace` directive), making them uninstallable outside this repo. All
   sub-modules now require a real, tagged ebu version and are covered by CI,
-  each tagged per Go multi-module convention (e.g. `stores/sqlite/v0.11.0`).
+  each tagged per Go multi-module convention (e.g. `stores/sqlite/v0.12.0`).
 - Publishes are no longer globally serialized around `EventStore.Append`;
   stores handle their own concurrency (all bundled stores do).
 - `MemoryStore.Read`/`ReadStream` use binary search instead of scanning the
@@ -320,8 +320,8 @@ Initial release of ebu (Event BUs) - a lightweight, type-safe event bus for Go.
 - `ClearAll`: Remove all handlers
 - `WaitAsync`: Wait for async handlers to complete
 
-[Unreleased]: https://github.com/jilio/ebu/compare/v0.11.0...HEAD
-[0.11.0]: https://github.com/jilio/ebu/compare/v0.9.2...v0.11.0
+[Unreleased]: https://github.com/jilio/ebu/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/jilio/ebu/compare/v0.11.0...v0.12.0
 [0.10.0]: https://github.com/jilio/ebu/compare/v0.9.2...v0.10.0
 [0.9.2]: https://github.com/jilio/ebu/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/jilio/ebu/compare/v0.9.0...v0.9.1
