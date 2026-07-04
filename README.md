@@ -20,6 +20,7 @@ A lightweight, type-safe event bus for Go with generics support. Build decoupled
 - 🛡️ **Panic recovery** - Handlers are isolated from each other's panics
 - 🚀 **Zero dependencies** - Pure Go standard library (core package)
 - 💾 **Event persistence** - Built-in support for event storage and replay
+- 🔗 **Cross-process delivery** - `Follow` a shared store to span processes and machines
 - 🌍 **Remote storage** - Native support for remote backends like [durable-streams](https://github.com/durable-streams/durable-streams)
 - 🔄 **Event upcasting** - Seamless event schema migration and versioning
 - ✅ **100% test coverage** - Thoroughly tested for reliability
@@ -300,6 +301,39 @@ Available storage backends:
 
 See [**Persistence Guide**](docs/PERSISTENCE.md) for all storage options.
 
+### Scaling Beyond a Single Process
+
+A shared store plus a `Follow` loop turns ebu into a cross-process bus:
+every process appends to the shared log by publishing, and receives by
+following.
+
+```go
+// Both processes: same store.
+store, _ := durablestream.New("http://streams:4437/v1/stream", "orders")
+bus := eventbus.New(eventbus.WithStore(store))
+
+eventbus.Subscribe(bus, func(e OrderCreated) { /* ... */ }) // subscribe first
+go bus.Follow(ctx)                                          // then follow
+
+eventbus.Publish(bus, OrderCreated{ID: "o-1"}) // peers receive it too
+```
+
+- The follower skips events this bus itself published (envelope `Origin`),
+  so nothing arrives twice; other processes' events are dispatched to local
+  handlers with full option semantics (filters, `Once`, `Async`, ...).
+- Stores implementing `EventStoreTailer` (durable-streams) push events via
+  live long-poll/SSE; others are polled (`FollowPollInterval`).
+- `FollowWithSubscriptionID("name")` makes the follower durable: it resumes
+  from its saved offset after a restart.
+- Duplicates from the log's at-least-once layers are dropped by event ID
+  (`FollowDedupWindow`).
+- `eventbus.New(eventbus.WithStore(store), eventbus.WithLogDelivery())`
+  makes the log the *only* delivery path: every process — including the
+  publisher — observes the same events in the same order.
+
+See [**Distributed Guide**](docs/DISTRIBUTED.md) for delivery modes,
+failure behavior, and current limitations.
+
 ### Observability
 
 Add metrics and distributed tracing with OpenTelemetry:
@@ -428,6 +462,7 @@ See [TypeNamer examples](docs/EXAMPLES.md#custom-event-type-names-typenamer) for
 
 - 📖 [**Complete Examples**](docs/EXAMPLES.md) - Comprehensive usage examples
 - 💾 [**Persistence Guide**](docs/PERSISTENCE.md) - Event storage and replay patterns
+- 🔗 [**Distributed Guide**](docs/DISTRIBUTED.md) - Cross-process delivery with Follow
 - 📚 [**API Reference**](https://godoc.org/github.com/jilio/ebu) - Complete API documentation
 
 ## Storage Backends

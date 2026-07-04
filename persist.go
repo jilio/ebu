@@ -633,6 +633,7 @@ func SubscribeWithReplay[T any](
 	// Options were already applied by buildHandler above — registering the
 	// same handler instance keeps each option's effect applied exactly once.
 	bus.addHandler(eventType, h)
+	registerFollowDecoder[T](bus)
 
 	// Catch-up pass: an event persisted after the first replay finished but
 	// before the live subscription registered would otherwise be missed

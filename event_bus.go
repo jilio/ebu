@@ -93,6 +93,18 @@ type EventBus struct {
 	// their own events apart from a peer's.
 	originID string
 
+	// logDelivery, when set, makes the store the only delivery path: Publish
+	// appends to the log and never dispatches locally; handlers receive
+	// events exclusively from a Follow loop (see WithLogDelivery).
+	logDelivery bool
+
+	// followDecoders maps a persisted type name to a closure that decodes a
+	// stored event into its Go type and dispatches it locally. Entries are
+	// registered by the generic Subscribe* entry points, which are the only
+	// places the concrete type is statically known.
+	followMu       sync.RWMutex
+	followDecoders map[string]followDecoder
+
 	// Upcast registry for event migration
 	upcastRegistry *upcastRegistry
 
@@ -206,6 +218,7 @@ func New(opts ...Option) *EventBus {
 	bus := &EventBus{
 		upcastRegistry: newUpcastRegistry(),
 		originID:       NewEventID(),
+		followDecoders: make(map[string]followDecoder),
 	}
 	bus.asyncCond = sync.NewCond(&bus.asyncMu)
 
@@ -219,6 +232,13 @@ func New(opts ...Option) *EventBus {
 	// Apply options
 	for _, opt := range opts {
 		opt(bus)
+	}
+
+	// Log-delivery mode without a store would silently drop every publish
+	// (nothing appends, nothing follows). That is a configuration bug, not a
+	// runtime condition — fail loudly at construction, mirroring WithUpcast.
+	if bus.logDelivery && bus.store == nil {
+		panic("eventbus: WithLogDelivery requires WithStore: without a store there is no log to deliver from")
 	}
 
 	return bus
@@ -334,6 +354,7 @@ func SubscribeWithHandle[T any](bus *EventBus, handler Handler[T], opts ...Subsc
 	}
 
 	bus.addHandler(eventType, h)
+	registerFollowDecoder[T](bus)
 	return &Subscription{bus: bus, eventType: eventType, h: h}, nil
 }
 
@@ -355,6 +376,7 @@ func SubscribeContextWithHandle[T any](bus *EventBus, handler ContextHandler[T],
 	}
 
 	bus.addHandler(eventType, h)
+	registerFollowDecoder[T](bus)
 	return &Subscription{bus: bus, eventType: eventType, h: h}, nil
 }
 
@@ -379,6 +401,7 @@ func Subscribe[T any](bus *EventBus, handler Handler[T], opts ...SubscribeOption
 	}
 
 	bus.addHandler(eventType, h)
+	registerFollowDecoder[T](bus)
 	return nil
 }
 
@@ -400,6 +423,7 @@ func SubscribeContext[T any](bus *EventBus, handler ContextHandler[T], opts ...S
 	}
 
 	bus.addHandler(eventType, h)
+	registerFollowDecoder[T](bus)
 	return nil
 }
 
@@ -534,21 +558,51 @@ func publishContext[T any](bus *EventBus, ctx context.Context, event T) error {
 
 	// In strict mode a failed persist skips delivery: handlers never observe
 	// an event the log did not record, so replay and live handling can never
-	// diverge. The after-publish hooks and observability below still fire so
-	// monitoring sees the attempt.
-	deliver := persistErr == nil || !bus.strictPersistence
+	// diverge. In log-delivery mode (WithLogDelivery) local dispatch is
+	// always skipped: delivery happens exclusively through the follower
+	// tailing the store (see Follow), so every process — including this one —
+	// observes the same events in the same order. The after-publish hooks and
+	// observability below still fire so monitoring sees the attempt.
+	deliver := (persistErr == nil || !bus.strictPersistence) && !bus.logDelivery
 
+	if deliver {
+		dispatch(bus, ctx, eventType, eventTypeName, event)
+	}
+
+	// For async handlers, we don't wait inline to avoid blocking
+	// Users can call bus.Wait() if they need to wait for completion
+
+	// Call after publish hooks
+	if bus.afterPublish != nil {
+		bus.afterPublish(eventType, event)
+	}
+	if bus.afterPublishCtx != nil {
+		bus.afterPublishCtx(ctx, eventType, event)
+	}
+
+	// Observability: Track publish complete (sync handlers done)
+	if bus.observability != nil {
+		bus.observability.OnPublishComplete(ctx, eventTypeName)
+	}
+
+	return persistErr
+}
+
+// dispatch delivers an event to the handlers registered for eventType. It is
+// the delivery half of the publish path, shared by publishContext (live
+// publishes) and the follower (events read back from a shared store): all
+// subscription options — filters, Once, Async, Sequential — behave
+// identically on both paths. It does not run the publish hooks or
+// publish-level observability; those belong to the publish, not to delivery.
+func dispatch[T any](bus *EventBus, ctx context.Context, eventType reflect.Type, eventTypeName string, event T) {
 	// Get handlers from appropriate shard
 	shard := bus.getShard(eventType)
-	var handlersCopy []*internalHandler
-	if deliver {
-		shard.mu.RLock()
-		handlers := shard.handlers[eventType]
-		// Create a copy to avoid holding the lock during handler execution
-		handlersCopy = make([]*internalHandler, len(handlers))
-		copy(handlersCopy, handlers)
-		shard.mu.RUnlock()
-	}
+	shard.mu.RLock()
+	handlers := shard.handlers[eventType]
+	// Create a copy to avoid holding the lock during handler execution
+	handlersCopy := make([]*internalHandler, len(handlers))
+	copy(handlersCopy, handlers)
+	shard.mu.RUnlock()
 
 	// Execute handlers without holding the lock
 	var onceHandlersToRemove []*internalHandler
@@ -628,24 +682,6 @@ func publishContext[T any](bus *EventBus, ctx context.Context, event T) error {
 		shard.handlers[eventType] = handlers
 		shard.mu.Unlock()
 	}
-
-	// For async handlers, we don't wait inline to avoid blocking
-	// Users can call bus.Wait() if they need to wait for completion
-
-	// Call after publish hooks
-	if bus.afterPublish != nil {
-		bus.afterPublish(eventType, event)
-	}
-	if bus.afterPublishCtx != nil {
-		bus.afterPublishCtx(ctx, eventType, event)
-	}
-
-	// Observability: Track publish complete (sync handlers done)
-	if bus.observability != nil {
-		bus.observability.OnPublishComplete(ctx, eventTypeName)
-	}
-
-	return persistErr
 }
 
 // Clear removes all handlers for events of type T

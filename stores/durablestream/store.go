@@ -36,6 +36,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"iter"
 	"net/http"
 	"sync"
 	"time"
@@ -63,8 +64,9 @@ type Store struct {
 	writer *durablestream.StreamWriter
 }
 
-// Ensure Store implements the EventStore interface.
+// Ensure Store implements the EventStore and EventStoreTailer interfaces.
 var _ eventbus.EventStore = (*Store)(nil)
+var _ eventbus.EventStoreTailer = (*Store)(nil)
 
 // New creates a new Store connected to a durable-streams server.
 //
@@ -325,55 +327,9 @@ func (s *Store) Read(ctx context.Context, from eventbus.Offset, limit int) ([]*e
 			return nil, from, fmt.Errorf("durablestream: read: giving up after %d attempts: %w", s.cfg.retryAttempts, lastErr)
 		}
 
-		// Parse JSON array response (an empty body yields no events).
-		var rawEvents []json.RawMessage
-		if len(result.Data) > 0 {
-			if err := json.Unmarshal(result.Data, &rawEvents); err != nil {
-				return nil, from, fmt.Errorf("durablestream: unmarshal response: %w", err)
-			}
-		}
-
-		// Convert to StoredEvents
-		events := make([]*eventbus.StoredEvent, 0, len(rawEvents))
-		allEmbedded := true
-		lastRaw := len(rawEvents) - 1
-		for i, raw := range rawEvents {
-			// Try to parse as event with embedded offset first
-			var eventWithOffset storedEventWithOffset
-			if err := json.Unmarshal(raw, &eventWithOffset); err != nil {
-				s.handleDecodeError(i, raw, err)
-				continue
-			}
-
-			// Determine the event's resume offset. Every emitted offset is
-			// server-issued and safe to store: resuming from it may re-deliver
-			// earlier events (at-least-once) but never skips a later one.
-			var eventOffset eventbus.Offset
-			switch {
-			case eventWithOffset.Offset != "":
-				// Embedded per-event offset: exact resumption.
-				eventOffset = eventbus.Offset(eventWithOffset.Offset)
-			case i == lastRaw:
-				// The server's next-offset is exactly the resume point after
-				// the chunk's last event.
-				eventOffset = eventbus.Offset(result.NextOffset)
-				allEmbedded = false
-			default:
-				// Chunk-start: resuming re-reads this chunk from the start,
-				// re-delivering earlier events but never skipping later ones.
-				eventOffset = chunkStart
-				allEmbedded = false
-			}
-
-			events = append(events, &eventbus.StoredEvent{
-				Offset:    eventOffset,
-				ID:        eventWithOffset.ID,
-				Origin:    eventWithOffset.Origin,
-				Type:      eventWithOffset.Type,
-				Data:      eventWithOffset.Data,
-				Metadata:  eventWithOffset.Metadata,
-				Timestamp: parseTimestamp(eventWithOffset.Timestamp),
-			})
+		events, allEmbedded, err := s.decodeChunk(result, chunkStart)
+		if err != nil {
+			return nil, from, err
 		}
 
 		if len(events) == 0 {
@@ -400,6 +356,147 @@ func (s *Store) Read(ctx context.Context, from eventbus.Offset, limit int) ([]*e
 		}
 
 		return events, eventbus.Offset(result.NextOffset), nil
+	}
+}
+
+// decodeChunk converts one read result into StoredEvents, assigning each a
+// resume-safe offset (see Read's offset semantics). chunkStart is the offset
+// the chunk was read from; allEmbedded reports whether every event carried
+// its own embedded offset (exact resumption possible).
+func (s *Store) decodeChunk(result *durablestream.StreamData, chunkStart eventbus.Offset) (events []*eventbus.StoredEvent, allEmbedded bool, err error) {
+	// Parse JSON array response (an empty body yields no events).
+	var rawEvents []json.RawMessage
+	if len(result.Data) > 0 {
+		if err := json.Unmarshal(result.Data, &rawEvents); err != nil {
+			return nil, false, fmt.Errorf("durablestream: unmarshal response: %w", err)
+		}
+	}
+
+	// Convert to StoredEvents
+	events = make([]*eventbus.StoredEvent, 0, len(rawEvents))
+	allEmbedded = true
+	lastRaw := len(rawEvents) - 1
+	for i, raw := range rawEvents {
+		// Try to parse as event with embedded offset first
+		var eventWithOffset storedEventWithOffset
+		if err := json.Unmarshal(raw, &eventWithOffset); err != nil {
+			s.handleDecodeError(i, raw, err)
+			continue
+		}
+
+		// Determine the event's resume offset. Every emitted offset is
+		// server-issued and safe to store: resuming from it may re-deliver
+		// earlier events (at-least-once) but never skips a later one.
+		var eventOffset eventbus.Offset
+		switch {
+		case eventWithOffset.Offset != "":
+			// Embedded per-event offset: exact resumption.
+			eventOffset = eventbus.Offset(eventWithOffset.Offset)
+		case i == lastRaw:
+			// The server's next-offset is exactly the resume point after
+			// the chunk's last event.
+			eventOffset = eventbus.Offset(result.NextOffset)
+			allEmbedded = false
+		default:
+			// Chunk-start: resuming re-reads this chunk from the start,
+			// re-delivering earlier events but never skipping later ones.
+			eventOffset = chunkStart
+			allEmbedded = false
+		}
+
+		events = append(events, &eventbus.StoredEvent{
+			Offset:    eventOffset,
+			ID:        eventWithOffset.ID,
+			Origin:    eventWithOffset.Origin,
+			Type:      eventWithOffset.Type,
+			Data:      eventWithOffset.Data,
+			Metadata:  eventWithOffset.Metadata,
+			Timestamp: parseTimestamp(eventWithOffset.Timestamp),
+		})
+	}
+	return events, allEmbedded, nil
+}
+
+// Tail implements eventbus.EventStoreTailer over the durable-streams live
+// protocol: a persistent Reader catches up with plain reads, then switches to
+// long-poll (or SSE, per the client's ReadMode), so new events are pushed to
+// the follower within one round trip instead of discovered by polling.
+//
+// Offset semantics match Read: per-event offsets are resume-safe but may
+// re-deliver on restart (at-least-once); consumers deduplicate on ID.
+//
+// Retry policy: transient failures (network errors, HTTP 5xx, 429 — and
+// notably client-side timeouts of an idle long-poll) are retried forever
+// with capped exponential backoff, because an idle stream is
+// indistinguishable from a transiently failing one. Permanent protocol
+// errors (not found, gone, bad request) and undecodable chunks are yielded
+// and end the tail. The iterator ends silently when ctx is cancelled.
+func (s *Store) Tail(ctx context.Context, from eventbus.Offset) iter.Seq2[*eventbus.StoredEvent, error] {
+	return func(yield func(*eventbus.StoredEvent, error) bool) {
+		start := from
+		if from == eventbus.OffsetNewest {
+			tail, err := s.resolveTail(ctx)
+			if err != nil {
+				if ctx.Err() == nil {
+					yield(nil, err)
+				}
+				return
+			}
+			start = tail
+		}
+
+		toServerOffset := func(o eventbus.Offset) durablestream.Offset {
+			if o == eventbus.OffsetOldest {
+				return durablestream.ZeroOffset
+			}
+			return durablestream.Offset(o)
+		}
+
+		reader := s.client.Reader(s.path, toServerOffset(start))
+		chunkStart := start
+		retry := 0
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+
+			result, err := reader.Read(ctx)
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				if !isRetryable(err) {
+					yield(nil, fmt.Errorf("durablestream: tail: %w", err))
+					return
+				}
+				// The reader may hold a stale connection or cursor; rebuild it
+				// at the last known chunk boundary and back off (capped — see
+				// maxBackoffShift — never giving up: idle long-polls time out
+				// client-side and look exactly like transient failures).
+				retry++
+				if backoff(ctx, s.cfg.retryBaseDelay, retry) != nil {
+					return
+				}
+				reader = s.client.Reader(s.path, toServerOffset(chunkStart))
+				continue
+			}
+			retry = 0
+
+			events, _, err := s.decodeChunk(result, chunkStart)
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+			for _, event := range events {
+				if !yield(event, nil) {
+					return
+				}
+			}
+			chunkStart = eventbus.Offset(result.NextOffset)
+			// An empty result (long-poll window expired, or an empty chunk)
+			// needs no sleep: the next Read blocks server-side until data
+			// arrives or the window times out again.
+		}
 	}
 }
 

@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Cross-process delivery: `Follow`.** A follower tails the bus's event
+  store and dispatches new events to local subscribers with full option
+  semantics (filters, `Once`, `Async`, `Sequential`, panic recovery, context
+  values). Every process appends by publishing and receives by following —
+  the shared log becomes the bus. Events this bus itself published are
+  skipped by `Origin` (override with `FollowIncludeOwn`); at-least-once
+  duplicates are dropped by event ID (`FollowDedupWindow`, default 1024);
+  `FollowWithSubscriptionID` makes the follower durable across restarts;
+  read errors retry and poison events are reported and skipped, so the
+  follower never wedges. See docs/DISTRIBUTED.md.
+- **`WithLogDelivery`.** Makes the store the only delivery path: `Publish`
+  appends and returns, and all delivery — including in the publishing
+  process — happens through `Follow`. Every process then observes the same
+  events in the same order, and an event that failed to persist is never
+  observed anywhere. Requires `WithStore` (New panics otherwise).
+- **`EventStoreTailer`.** Optional store capability for push-based tailing;
+  `Follow` uses it when available and falls back to polling `Read`
+  otherwise.
+- **durablestream: `Tail`** implements `EventStoreTailer` over the
+  protocol's live long-poll/SSE modes, so followers receive new events
+  within one round trip. Transient failures (including client-side timeouts
+  of idle long-polls) retry forever with capped backoff; permanent protocol
+  errors end the tail.
+
 - **Event envelope: `ID`, `Origin`, `Metadata`.** Every persisted event now
   carries a ULID `ID` minted once per publish (store-level retries reuse it,
   so it is a reliable deduplication key for at-least-once delivery), the
