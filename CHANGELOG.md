@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.13.0] - 2026-07-04
 
 ### Fixed
 
@@ -424,7 +424,8 @@ Initial release of ebu (Event BUs) - a lightweight, type-safe event bus for Go.
 - `ClearAll`: Remove all handlers
 - `WaitAsync`: Wait for async handlers to complete
 
-[Unreleased]: https://github.com/jilio/ebu/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/jilio/ebu/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/jilio/ebu/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/jilio/ebu/compare/v0.11.0...v0.12.0
 [0.10.0]: https://github.com/jilio/ebu/compare/v0.9.2...v0.10.0
 [0.9.2]: https://github.com/jilio/ebu/compare/v0.9.1...v0.9.2
