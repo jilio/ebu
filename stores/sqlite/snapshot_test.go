@@ -54,8 +54,8 @@ func TestSnapshotSaveLoadRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if at != "5" {
-		t.Errorf("offset: want 5, got %s", at)
+	if at != "00000000000000000005" {
+		t.Errorf("offset: want position 5, got %s", at)
 	}
 	if string(got) != string(blob) {
 		t.Errorf("blob mismatch: %s", got)
@@ -95,7 +95,7 @@ func TestSnapshotUpsert(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if at != "9" || string(blob) != `"second"` {
+	if at != "00000000000000000009" || string(blob) != `"second"` {
 		t.Errorf("upsert must keep the latest, got (%q, %s)", at, blob)
 	}
 	// Exactly one row for the key.
@@ -123,7 +123,7 @@ func TestSnapshotSaveAtOffsetOldest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if at != "0" { // position 0 round-trips as "0"
+	if at != "00000000000000000000" { // position 0 round-trips zero-padded
 		t.Errorf("OffsetOldest must store position 0, got %q", at)
 	}
 }
@@ -268,8 +268,8 @@ func TestTruncateThenReplayResumes(t *testing.T) {
 	if len(events) != 5 {
 		t.Fatalf("want events 8..12, got %d", len(events))
 	}
-	if events[0].Offset != "8" {
-		t.Errorf("resume must start at 8, got %s", events[0].Offset)
+	if events[0].Offset != "00000000000000000008" {
+		t.Errorf("resume must start at position 8, got %s", events[0].Offset)
 	}
 }
 

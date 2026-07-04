@@ -364,11 +364,7 @@ func TestSubscribeWithReplayUnmarshalError(t *testing.T) {
 		Timestamp: time.Now(),
 	})
 	store.mu.Unlock()
-
-	// Update the bus lastOffset
-	bus.storeMu.Lock()
-	bus.lastOffset = offset
-	bus.storeMu.Unlock()
+	_ = offset
 
 	// Subscribe with replay - should fail due to unmarshal error
 	ctx := context.Background()
@@ -731,23 +727,35 @@ func TestSetPersistenceErrorHandler(t *testing.T) {
 	}
 }
 
-// TestPersistenceSuccessIncrementsOffset tests that offset is tracked on success
+// TestPersistenceSuccessIncrementsOffset tests that each delivered event
+// carries its own persisted offset in the handler context
 func TestPersistenceSuccessIncrementsOffset(t *testing.T) {
 	store := NewMemoryStore()
 	bus := New(WithStore(store))
+
+	var offsets []Offset
+	if err := SubscribeContext(bus, func(ctx context.Context, e TestEvent) {
+		if off, ok := OffsetFromContext(ctx); ok {
+			offsets = append(offsets, off)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	// Publish multiple events successfully
 	for i := 1; i <= 3; i++ {
 		Publish(bus, TestEvent{ID: i})
 	}
 
-	// Verify lastOffset was updated
-	bus.storeMu.RLock()
-	lastOffset := bus.lastOffset
-	bus.storeMu.RUnlock()
-
-	if lastOffset != Offset("00000000000000000003") {
-		t.Errorf("Expected lastOffset '00000000000000000003', got %s", lastOffset)
+	// Verify each handler invocation saw its own event's offset
+	want := []Offset{"00000000000000000001", "00000000000000000002", "00000000000000000003"}
+	if len(offsets) != len(want) {
+		t.Fatalf("Expected %d offsets, got %d", len(want), len(offsets))
+	}
+	for i, off := range offsets {
+		if off != want[i] {
+			t.Errorf("Expected offset %s at index %d, got %s", want[i], i, off)
+		}
 	}
 
 	// Verify all events were stored

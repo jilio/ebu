@@ -7,6 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-07-04
+
+### Fixed
+
+- **SubscribeWithReplay now replays `TypeNamer` events.** The replay filter
+  compared stored type names against the reflection name, so events with a
+  custom `EventTypeName()` were silently skipped — replayed data loss.
+- **Persistence can no longer be silently disabled by option ordering.**
+  `WithStore` used to install persistence by chaining onto the
+  `beforePublishCtx` hook; a `WithBeforePublishContext` option applied after
+  it overwrote the chain. Persistence now runs directly in the publish path.
+- **SubscribeWithReplay saves the offset of the exact event it handled.** It
+  previously saved a bus-global "last persisted offset" that concurrent
+  publishes (of any event type) could advance, so a crash could skip events
+  on the next start. Each delivery now carries its own offset via the
+  handler context (see `OffsetFromContext`), and `SaveOffset` failures are
+  reported to the `PersistenceErrorHandler` instead of being dropped.
+- **durablestream: `Read` no longer skips events when `limit` truncates.**
+  It returned the chunk-end offset with a truncated result, so the events
+  beyond the limit were never delivered on the next read. Limit truncation
+  now returns the last returned event's offset when events carry real
+  offsets, and is best-effort (full chunk) when offsets are synthetic.
+- **sqlite: offsets are zero-padded** so they compare lexicographically, as
+  the `Offset` contract requires (`"999" < "1000"` fails as plain strings).
+  Legacy unpadded offsets are still accepted as input.
+- **sqlite: two `:memory:` stores no longer share a database** through
+  SQLite's shared cache; each store gets a unique in-memory database.
+- **`Wait`/`Shutdown` are now safe to call concurrently with `Publish`.**
+  Async-handler tracking used a `sync.WaitGroup`, which forbids `Add` racing
+  `Wait` at counter zero (a real data race under `-race`).
+- **A cancelled context can no longer consume a `Once` handler without
+  executing it.** Cancellation is checked before the handler's once-slot is
+  claimed; once claimed, the handler always runs.
+- **Mismatched `WithFilter` predicates are rejected at Subscribe time.**
+  Previously a predicate whose parameter type didn't match the subscription
+  compiled fine and was silently ignored — the handler received *all* events.
+- **`WithUpcast` panics on invalid registration** (self-upcast, cycle, nil
+  function) instead of silently ignoring the error.
+- Fixed a flaky test that hung the suite under `-race`; the race detector now
+  runs (and passes) in CI for all modules.
+
+### Added
+
+- `OffsetFromContext(ctx)` — inside handlers on a persistent bus, returns the
+  offset the event being handled was persisted at.
+- Delivery-semantics documentation: persistence is best-effort by default;
+  `SubscribeWithReplay` is at-least-once (make replay handlers idempotent).
+- `Publish`/`PublishContext` panic with a clear message on a nil bus;
+  `Unsubscribe` returns an error instead of panicking.
+
+### Changed
+
+- **Module packaging repaired.** `stores/sqlite`, `stores/durablestream`, and
+  `otel` referenced ebu versions that were never published (or used a
+  `replace` directive), making them uninstallable outside this repo. All
+  sub-modules now require a real, tagged ebu version and are covered by CI,
+  each tagged per Go multi-module convention (e.g. `stores/sqlite/v0.11.0`).
+- Publishes are no longer globally serialized around `EventStore.Append`;
+  stores handle their own concurrency (all bundled stores do).
+- `MemoryStore.Read`/`ReadStream` use binary search instead of scanning the
+  log from the start.
+- `SetPanicHandler`, `SetBeforePublishHook`, and `SetAfterPublishHook` are
+  deprecated in favor of the equivalent `New` options.
+
+### Removed
+
+- **`EventStoreSubscriber` interface.** It was never consumed by the bus and
+  no bundled store implemented it; keeping it implied live-subscription
+  support that did not exist.
+- Unreachable handler-dispatch branches (raw `func(T)`, `func(any)`, and
+  reflection fallbacks): handlers can only be registered as `Handler[T]` or
+  `ContextHandler[T]` through the public API.
+
 ## [0.10.0] - 2025-12-28
 
 ### Breaking Changes
@@ -247,7 +320,8 @@ Initial release of ebu (Event BUs) - a lightweight, type-safe event bus for Go.
 - `ClearAll`: Remove all handlers
 - `WaitAsync`: Wait for async handlers to complete
 
-[Unreleased]: https://github.com/jilio/ebu/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/jilio/ebu/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/jilio/ebu/compare/v0.9.2...v0.11.0
 [0.10.0]: https://github.com/jilio/ebu/compare/v0.9.2...v0.10.0
 [0.9.2]: https://github.com/jilio/ebu/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/jilio/ebu/compare/v0.9.0...v0.9.1

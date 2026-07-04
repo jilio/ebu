@@ -104,6 +104,12 @@ func main() {
 
 ### Sequential Async Processing
 
+`Sequential()` guarantees the handler never runs concurrently with itself.
+It does **not** guarantee events are processed in publish order — the
+goroutines acquire the handler's lock in whatever order the scheduler runs
+them. If you need strict ordering, process events synchronously or drain
+them from a single worker goroutine.
+
 ```go
 type PaymentEvent struct {
     ID     string

@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/ahimsalabs/durable-streams-go/durablestream"
@@ -25,6 +26,11 @@ type Store struct {
 	client *durablestream.Client
 	path   string
 	cfg    *config
+
+	// appendMu serializes Append calls. The event bus does not serialize
+	// store access, and each Append round-trips over HTTP; serializing here
+	// keeps writer offsets consistent.
+	appendMu sync.Mutex
 }
 
 // Ensure Store implements the EventStore interface.
@@ -88,7 +94,11 @@ type storedEventForWrite struct {
 }
 
 // Append stores an event and returns its assigned offset.
+// Safe for concurrent use.
 func (s *Store) Append(ctx context.Context, event *eventbus.Event) (eventbus.Offset, error) {
+	s.appendMu.Lock()
+	defer s.appendMu.Unlock()
+
 	writer, err := s.client.Writer(ctx, s.path)
 	if err != nil {
 		return "", fmt.Errorf("durablestream: get writer: %w", err)
@@ -128,6 +138,12 @@ type storedEventWithOffset struct {
 // be stored for resumption. They only ensure uniqueness within a single Read call.
 // For reliable resumption, use the nextOffset returned by Read, or ensure your
 // durable-streams server includes per-event offsets in the response.
+//
+// Limit handling: limit is honored only when events carry real embedded
+// offsets, because truncating a chunk requires a resumable per-event offset
+// for the returned nextOffset. When offsets are synthetic, the full chunk is
+// returned (limit is best-effort) — truncating would otherwise skip the
+// dropped events on the next Read.
 func (s *Store) Read(ctx context.Context, from eventbus.Offset, limit int) ([]*eventbus.StoredEvent, eventbus.Offset, error) {
 	// Map OffsetOldest to durable-streams zero offset
 	offset := durablestream.Offset(from)
@@ -154,6 +170,7 @@ func (s *Store) Read(ctx context.Context, from eventbus.Offset, limit int) ([]*e
 
 	// Convert to StoredEvents
 	events := make([]*eventbus.StoredEvent, 0, len(rawEvents))
+	allEmbedded := true
 	for i, raw := range rawEvents {
 		// Try to parse as event with embedded offset first
 		var eventWithOffset storedEventWithOffset
@@ -173,6 +190,7 @@ func (s *Store) Read(ctx context.Context, from eventbus.Offset, limit int) ([]*e
 			// Synthesize unique offset: "nextOffset/index"
 			// These are ephemeral - use nextOffset for reliable resumption
 			eventOffset = eventbus.Offset(fmt.Sprintf("%s/%d", result.NextOffset, i))
+			allEmbedded = false
 		}
 
 		events = append(events, &eventbus.StoredEvent{
@@ -181,11 +199,14 @@ func (s *Store) Read(ctx context.Context, from eventbus.Offset, limit int) ([]*e
 			Data:      eventWithOffset.Data,
 			Timestamp: parseTimestamp(eventWithOffset.Timestamp),
 		})
+	}
 
-		// Apply limit if specified
-		if limit > 0 && len(events) >= limit {
-			break
-		}
+	// Apply limit only when truncation is resumable: the returned nextOffset
+	// must point at the last event actually returned, otherwise the events
+	// beyond limit would be skipped by the caller's next Read.
+	if limit > 0 && len(events) > limit && allEmbedded {
+		events = events[:limit]
+		return events, events[len(events)-1].Offset, nil
 	}
 
 	return events, eventbus.Offset(result.NextOffset), nil

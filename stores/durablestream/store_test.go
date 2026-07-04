@@ -187,13 +187,19 @@ func TestStore_Read(t *testing.T) {
 		}
 	})
 
-	t.Run("reads with limit", func(t *testing.T) {
-		events, _, err := store.Read(ctx, eventbus.OffsetOldest, 2)
+	t.Run("reads with limit is best-effort without embedded offsets", func(t *testing.T) {
+		// These events have no per-event offsets, so truncating to the limit
+		// would skip the dropped events on the next Read (nextOffset points
+		// past them). The full chunk must be returned instead.
+		events, nextOffset, err := store.Read(ctx, eventbus.OffsetOldest, 2)
 		if err != nil {
 			t.Fatalf("Read() error = %v", err)
 		}
-		if len(events) != 2 {
-			t.Errorf("expected 2 events with limit, got %d", len(events))
+		if len(events) != 3 {
+			t.Errorf("expected full chunk of 3 events (limit is best-effort for synthetic offsets), got %d", len(events))
+		}
+		if nextOffset == "" {
+			t.Error("expected non-empty next offset")
 		}
 	})
 
@@ -473,6 +479,49 @@ func TestRead_EmbeddedOffsets(t *testing.T) {
 
 	if nextOffset != "100" {
 		t.Errorf("expected next offset '100', got '%s'", nextOffset)
+	}
+}
+
+// TestRead_LimitWithEmbeddedOffsets verifies that when events carry real
+// per-event offsets, limit truncation is resumable: nextOffset must point at
+// the last RETURNED event, not past the truncated ones. Returning the chunk's
+// end offset would silently skip the dropped events on the next Read.
+func TestRead_LimitWithEmbeddedOffsets(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/stream/", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			w.WriteHeader(http.StatusCreated)
+		case http.MethodGet:
+			w.Header().Set("Stream-Next-Offset", "100")
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`[
+				{"offset":"10","type":"event1","data":{},"timestamp":"2024-01-15T10:30:00Z"},
+				{"offset":"20","type":"event2","data":{},"timestamp":"2024-01-15T10:31:00Z"},
+				{"offset":"30","type":"event3","data":{},"timestamp":"2024-01-15T10:32:00Z"}
+			]`))
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	store, err := ds.New(srv.URL+"/v1/stream", "limit-embedded-offsets")
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	events, nextOffset, err := store.Read(context.Background(), eventbus.OffsetOldest, 2)
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events with limit, got %d", len(events))
+	}
+	if nextOffset != "20" {
+		t.Errorf("nextOffset must be the last returned event's offset '20' (resumable), got '%s'", nextOffset)
 	}
 }
 

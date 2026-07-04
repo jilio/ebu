@@ -9,6 +9,7 @@ import (
 	"iter"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	eventbus "github.com/jilio/ebu"
@@ -44,6 +45,10 @@ var _ eventbus.EventStoreTruncator = (*SQLiteStore)(nil)
 // dbOpener is used to open database connections, injectable for testing
 var dbOpener = sql.Open
 
+// memDBCounter provides unique names for in-memory databases so separate
+// :memory: stores never share state through SQLite's shared cache.
+var memDBCounter atomic.Int64
+
 // New creates a new SQLiteStore with the given path and options.
 //
 // Note: When WithAutoMigrate is enabled (the default), migrations run with
@@ -68,8 +73,10 @@ func New(path string, opts ...Option) (*SQLiteStore, error) {
 	// Build connection string with pragmas
 	var dsn string
 	if cfg.path == ":memory:" {
-		// Use shared cache mode for in-memory databases to allow multiple connections
-		dsn = "file::memory:?mode=memory&cache=shared"
+		// Shared cache mode lets database/sql's pooled connections see the
+		// same in-memory database. Each store gets a unique name so two
+		// independent :memory: stores in the same process don't share data.
+		dsn = fmt.Sprintf("file:ebu_memdb_%d?mode=memory&cache=shared", memDBCounter.Add(1))
 	} else {
 		dsn = fmt.Sprintf("file:%s?_busy_timeout=%d", cfg.path, cfg.busyTimeout.Milliseconds())
 	}
@@ -176,8 +183,11 @@ func parseOffset(offset eventbus.Offset) (int64, error) {
 }
 
 // formatOffset converts an int64 position to an Offset.
+// Offsets are zero-padded to 20 digits so they compare lexicographically,
+// as the eventbus.Offset contract requires ("999" < "1000" fails as plain
+// strings). parseOffset accepts both padded and legacy unpadded values.
 func formatOffset(position int64) eventbus.Offset {
-	return eventbus.Offset(strconv.FormatInt(position, 10))
+	return eventbus.Offset(fmt.Sprintf("%020d", position))
 }
 
 // Append stores an event and returns its assigned offset.

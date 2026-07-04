@@ -21,16 +21,15 @@ type SubscribeOption func(*internalHandler)
 
 // internalHandler wraps a handler with metadata
 type internalHandler struct {
-	handler        any
-	handlerType    reflect.Type
-	eventType      reflect.Type
-	once           bool
-	async          bool
-	sequential     bool
-	acceptsContext bool
-	filter         any // Predicate function for filtering events
-	mu             sync.Mutex
-	executed       uint32 // For once handlers, atomically tracks if executed
+	handler     any
+	handlerType reflect.Type
+	eventType   reflect.Type
+	once        bool
+	async       bool
+	sequential  bool
+	filter      any // Predicate function for filtering events
+	mu          sync.Mutex
+	executed    uint32 // For once handlers, atomically tracks if executed
 }
 
 // PanicHandler is called when a handler panics
@@ -61,13 +60,17 @@ type EventBus struct {
 	afterPublish     PublishHook
 	beforePublishCtx PublishHookContext
 	afterPublishCtx  PublishHookContext
-	wg               sync.WaitGroup
+
+	// Async handler tracking. A plain sync.WaitGroup would be racy here:
+	// Publish (Add) may legally run concurrently with Wait/Shutdown, which
+	// WaitGroup forbids when the counter is at zero.
+	asyncMu    sync.Mutex
+	asyncCond  *sync.Cond
+	asyncCount int
 
 	// Optional persistence fields (nil if not using persistence)
 	store                   EventStore
 	subscriptionStore       SubscriptionStore
-	lastOffset              Offset
-	storeMu                 sync.RWMutex
 	persistenceErrorHandler PersistenceErrorHandler
 	persistenceTimeout      time.Duration
 	replayBatchSize         int // Batch size for Replay (default: 100)
@@ -181,6 +184,7 @@ func New(opts ...Option) *EventBus {
 	bus := &EventBus{
 		upcastRegistry: newUpcastRegistry(),
 	}
+	bus.asyncCond = sync.NewCond(&bus.asyncMu)
 
 	// Initialize shards
 	for i := 0; i < numShards; i++ {
@@ -217,10 +221,9 @@ func Subscribe[T any](bus *EventBus, handler Handler[T], opts ...SubscribeOption
 	eventType := reflect.TypeOf((*T)(nil)).Elem()
 
 	h := &internalHandler{
-		handler:        handler,
-		handlerType:    reflect.TypeOf(handler),
-		eventType:      eventType,
-		acceptsContext: false,
+		handler:     handler,
+		handlerType: reflect.TypeOf(handler),
+		eventType:   eventType,
 	}
 
 	for _, opt := range opts {
@@ -228,6 +231,10 @@ func Subscribe[T any](bus *EventBus, handler Handler[T], opts ...SubscribeOption
 			return fmt.Errorf("eventbus: subscribe option cannot be nil")
 		}
 		opt(h)
+	}
+
+	if err := validateFilter(h, eventType); err != nil {
+		return err
 	}
 
 	shard := bus.getShard(eventType)
@@ -250,10 +257,9 @@ func SubscribeContext[T any](bus *EventBus, handler ContextHandler[T], opts ...S
 	eventType := reflect.TypeOf((*T)(nil)).Elem()
 
 	h := &internalHandler{
-		handler:        handler,
-		handlerType:    reflect.TypeOf(handler),
-		eventType:      eventType,
-		acceptsContext: true,
+		handler:     handler,
+		handlerType: reflect.TypeOf(handler),
+		eventType:   eventType,
 	}
 
 	for _, opt := range opts {
@@ -261,6 +267,10 @@ func SubscribeContext[T any](bus *EventBus, handler ContextHandler[T], opts ...S
 			return fmt.Errorf("eventbus: subscribe option cannot be nil")
 		}
 		opt(h)
+	}
+
+	if err := validateFilter(h, eventType); err != nil {
+		return err
 	}
 
 	shard := bus.getShard(eventType)
@@ -271,8 +281,34 @@ func SubscribeContext[T any](bus *EventBus, handler ContextHandler[T], opts ...S
 	return nil
 }
 
-// Unsubscribe removes a handler for events of type T
+// validateFilter ensures a WithFilter predicate matches the subscribed event type.
+// Without this check, a mismatched predicate (e.g. WithFilter[U] on Subscribe[T])
+// would silently never fire and the handler would receive all events unfiltered.
+func validateFilter(h *internalHandler, eventType reflect.Type) error {
+	if h.filter == nil {
+		return nil
+	}
+	ft := reflect.TypeOf(h.filter)
+	if ft.Kind() != reflect.Func || ft.NumIn() != 1 || ft.In(0) != eventType {
+		return fmt.Errorf("eventbus: filter predicate type %s does not match event type %s", ft, eventType)
+	}
+	return nil
+}
+
+// Unsubscribe removes a handler for events of type T.
+//
+// Handlers are matched by function code pointer. This has two known
+// limitations inherent to Go:
+//   - Two closures created from the same function literal share a code
+//     pointer and are indistinguishable; the first registered one is removed.
+//   - Method values on different receivers share a code pointer.
+//
+// If you need precise unsubscription of closures, keep a reference to the
+// exact handler you registered and unsubscribe with it, or use Clear[T].
 func Unsubscribe[T any, H any](bus *EventBus, handler H) error {
+	if bus == nil {
+		return fmt.Errorf("eventbus: bus cannot be nil")
+	}
 	eventType := reflect.TypeOf((*T)(nil)).Elem()
 	handlerPtr := reflect.ValueOf(handler).Pointer()
 
@@ -292,13 +328,24 @@ func Unsubscribe[T any, H any](bus *EventBus, handler H) error {
 	return fmt.Errorf("handler not found")
 }
 
-// Publish publishes an event to all registered handlers
+// Publish publishes an event to all registered handlers.
+// It panics if bus is nil.
 func Publish[T any](bus *EventBus, event T) {
 	PublishContext(bus, context.Background(), event)
 }
 
-// PublishContext publishes an event with context to all registered handlers
+// PublishContext publishes an event with context to all registered handlers.
+// It panics if bus is nil.
+//
+// When the bus has a store configured (WithStore), the event is persisted
+// before handlers run. Persistence is best-effort: on failure the event is
+// still delivered to handlers and the error is reported to the
+// PersistenceErrorHandler (see WithPersistenceErrorHandler).
 func PublishContext[T any](bus *EventBus, ctx context.Context, event T) {
+	if bus == nil {
+		panic("eventbus: Publish called with nil bus")
+	}
+
 	eventType := reflect.TypeOf(event)
 	eventTypeName := EventType(event)
 
@@ -315,6 +362,12 @@ func PublishContext[T any](bus *EventBus, ctx context.Context, event T) {
 		bus.beforePublishCtx(ctx, eventType, event)
 	}
 
+	// Persist the event before handlers run. On success the assigned offset
+	// is attached to ctx and can be retrieved with OffsetFromContext.
+	if bus.store != nil {
+		ctx = bus.persistEvent(ctx, eventType, event)
+	}
+
 	// Get handlers from appropriate shard
 	shard := bus.getShard(eventType)
 	shard.mu.RLock()
@@ -325,16 +378,24 @@ func PublishContext[T any](bus *EventBus, ctx context.Context, event T) {
 	shard.mu.RUnlock()
 
 	// Execute handlers without holding the lock
-	var wg sync.WaitGroup
 	var onceHandlersToRemove []*internalHandler
 
 	for _, h := range handlersCopy {
-		// Check filter if present
+		// Check context cancellation before doing anything with the handler.
+		// This must happen before the Once CAS so a cancelled publish never
+		// consumes a once-handler without executing it.
+		select {
+		case <-ctx.Done():
+			continue
+		default:
+		}
+
+		// Check filter if present. The predicate type is validated at
+		// Subscribe time; if the assertion still fails, fail closed.
 		if h.filter != nil {
-			if filterFunc, ok := h.filter.(func(T) bool); ok {
-				if !filterFunc(event) {
-					continue // Skip this handler as event doesn't match filter
-				}
+			filterFunc, ok := h.filter.(func(T) bool)
+			if !ok || !filterFunc(event) {
+				continue // Skip this handler as event doesn't match filter
 			}
 		}
 
@@ -348,28 +409,24 @@ func PublishContext[T any](bus *EventBus, ctx context.Context, event T) {
 		}
 
 		if h.async {
-			wg.Add(1)
-			bus.wg.Add(1)
+			bus.asyncStarted()
 			go func(handler *internalHandler) {
-				defer wg.Done()
-				defer bus.wg.Done()
+				defer bus.asyncFinished()
 
-				// Check context before executing
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					callHandlerWithContext(handler, ctx, event, bus.panicHandler, bus.observability, eventTypeName, true)
+				// Once handlers always run: their execution slot was already
+				// consumed by the CAS above, so skipping here would silently
+				// drop them forever. Other handlers re-check the context.
+				if !handler.once {
+					select {
+					case <-ctx.Done():
+						return
+					default:
+					}
 				}
+				callHandlerWithContext(handler, ctx, event, bus.panicHandler, bus.observability, eventTypeName, true)
 			}(h)
 		} else {
-			// Check context cancellation for sync handlers too
-			select {
-			case <-ctx.Done():
-				continue // Skip if context cancelled
-			default:
-				callHandlerWithContext(h, ctx, event, bus.panicHandler, bus.observability, eventTypeName, false)
-			}
+			callHandlerWithContext(h, ctx, event, bus.panicHandler, bus.observability, eventTypeName, false)
 		}
 	}
 
@@ -447,9 +504,32 @@ func HandlerCount[T any](bus *EventBus) int {
 	return len(shard.handlers[eventType])
 }
 
-// Wait blocks until all async handlers complete
+// asyncStarted records the start of an async handler goroutine.
+func (bus *EventBus) asyncStarted() {
+	bus.asyncMu.Lock()
+	bus.asyncCount++
+	bus.asyncMu.Unlock()
+}
+
+// asyncFinished records the completion of an async handler goroutine and
+// wakes Wait callers when the last one finishes.
+func (bus *EventBus) asyncFinished() {
+	bus.asyncMu.Lock()
+	bus.asyncCount--
+	if bus.asyncCount == 0 {
+		bus.asyncCond.Broadcast()
+	}
+	bus.asyncMu.Unlock()
+}
+
+// Wait blocks until all async handlers complete.
+// It is safe to call concurrently with Publish.
 func (bus *EventBus) Wait() {
-	bus.wg.Wait()
+	bus.asyncMu.Lock()
+	for bus.asyncCount > 0 {
+		bus.asyncCond.Wait()
+	}
+	bus.asyncMu.Unlock()
 }
 
 // callHandlerWithContext calls a handler with proper type checking and panic recovery
@@ -482,36 +562,13 @@ func callHandlerWithContext[T any](h *internalHandler, ctx context.Context, even
 		defer h.mu.Unlock()
 	}
 
-	// Try common handler types first for performance
+	// Handlers are always stored as Handler[T] (Subscribe) or
+	// ContextHandler[T] (SubscribeContext); no other shapes can be registered.
 	switch fn := h.handler.(type) {
 	case Handler[T]:
 		fn(event)
 	case ContextHandler[T]:
 		fn(ctx, event)
-	case func(T):
-		fn(event)
-	case func(context.Context, T):
-		fn(ctx, event)
-	case func(any):
-		fn(event)
-	case func(context.Context, any):
-		fn(ctx, event)
-	case func(context.Context, any) error:
-		_ = fn(ctx, event)
-	default:
-		// Fallback to reflection for other types
-		handlerValue := reflect.ValueOf(h.handler)
-		eventValue := reflect.ValueOf(event)
-
-		if h.handlerType.Kind() == reflect.Func {
-			numIn := h.handlerType.NumIn()
-			switch numIn {
-			case 1:
-				handlerValue.Call([]reflect.Value{eventValue})
-			case 2:
-				handlerValue.Call([]reflect.Value{reflect.ValueOf(ctx), eventValue})
-			}
-		}
 	}
 }
 
@@ -641,17 +698,23 @@ func (bus *EventBus) Shutdown(ctx context.Context) error {
 
 // Backward compatibility methods
 
-// SetPanicHandler sets the panic handler (for backward compatibility)
+// SetPanicHandler sets the panic handler.
+//
+// Deprecated: use the WithPanicHandler option with New instead.
 func (bus *EventBus) SetPanicHandler(handler PanicHandler) {
 	bus.panicHandler = handler
 }
 
-// SetBeforePublishHook sets the before publish hook (for backward compatibility)
+// SetBeforePublishHook sets the before publish hook.
+//
+// Deprecated: use the WithBeforePublish option with New instead.
 func (bus *EventBus) SetBeforePublishHook(hook PublishHook) {
 	bus.beforePublish = hook
 }
 
-// SetAfterPublishHook sets the after publish hook (for backward compatibility)
+// SetAfterPublishHook sets the after publish hook.
+//
+// Deprecated: use the WithAfterPublish option with New instead.
 func (bus *EventBus) SetAfterPublishHook(hook PublishHook) {
 	bus.afterPublish = hook
 }

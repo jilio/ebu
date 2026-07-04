@@ -285,12 +285,9 @@ func TestUpcastWithSubscribeWithReplay(t *testing.T) {
 		Data:      v1Data,
 		Timestamp: time.Now(),
 	}
-	offset, _ := store.Append(ctx, event)
-
-	// Update bus lastOffset to match
-	bus.storeMu.Lock()
-	bus.lastOffset = offset
-	bus.storeMu.Unlock()
+	if _, err := store.Append(ctx, event); err != nil {
+		t.Fatal(err)
+	}
 
 	// Subscribe expecting V2 events
 	var receivedEvents []UserCreatedV2
@@ -339,12 +336,9 @@ func TestReplayWithUpcast(t *testing.T) {
 		Data:      v1Data,
 		Timestamp: time.Now(),
 	}
-	offset, _ := store.Append(ctx, event)
-
-	// Update bus lastOffset to match
-	bus.storeMu.Lock()
-	bus.lastOffset = offset
-	bus.storeMu.Unlock()
+	if _, err := store.Append(ctx, event); err != nil {
+		t.Fatal(err)
+	}
 
 	// Replay with upcast
 	var replayed []*StoredEvent
@@ -613,8 +607,9 @@ func TestReplayWithUpcastNilRegistry(t *testing.T) {
 		Data:      testData,
 		Timestamp: time.Now(),
 	}
-	offset, _ := store.Append(ctx, event)
-	bus.lastOffset = offset
+	if _, err := store.Append(ctx, event); err != nil {
+		t.Fatal(err)
+	}
 
 	// Replay with nil registry should still work
 	var replayed []*StoredEvent

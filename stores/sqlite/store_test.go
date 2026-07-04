@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +16,11 @@ import (
 	eventbus "github.com/jilio/ebu"
 	_ "modernc.org/sqlite"
 )
+
+// paddedOffset returns the zero-padded offset format the store emits.
+func paddedOffset(n int64) eventbus.Offset {
+	return eventbus.Offset(fmt.Sprintf("%020d", n))
+}
 
 // testLogger implements Logger for testing
 type testLogger struct {
@@ -173,8 +179,8 @@ func TestAppend(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
-		if offset != "1" {
-			t.Errorf("expected offset '1', got %s", offset)
+		if offset != paddedOffset(1) {
+			t.Errorf("expected offset 1, got %s", offset)
 		}
 	})
 
@@ -191,7 +197,7 @@ func TestAppend(t *testing.T) {
 				t.Fatalf("unexpected error: %v", err)
 			}
 
-			expected := eventbus.Offset(string(rune('0' + i)))
+			expected := paddedOffset(int64(i))
 			if offset != expected {
 				t.Errorf("expected offset %s, got %s", expected, offset)
 			}
@@ -230,8 +236,8 @@ func TestRead(t *testing.T) {
 			t.Errorf("expected 10 events, got %d", len(events))
 		}
 
-		if nextOffset != "10" {
-			t.Errorf("expected next offset '10', got %s", nextOffset)
+		if nextOffset != paddedOffset(10) {
+			t.Errorf("expected next offset 10, got %s", nextOffset)
 		}
 	})
 
@@ -256,8 +262,8 @@ func TestRead(t *testing.T) {
 			t.Errorf("expected 5 events (6-10), got %d", len(events))
 		}
 
-		if events[0].Offset != "6" {
-			t.Errorf("expected first offset '6', got %s", events[0].Offset)
+		if events[0].Offset != paddedOffset(6) {
+			t.Errorf("expected first offset 6, got %s", events[0].Offset)
 		}
 	})
 
@@ -431,8 +437,8 @@ func TestSubscriptionOffset(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
-		if offset != "42" {
-			t.Errorf("expected offset '42', got %s", offset)
+		if offset != paddedOffset(42) {
+			t.Errorf("expected offset 42, got %s", offset)
 		}
 	})
 
@@ -447,8 +453,8 @@ func TestSubscriptionOffset(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
-		if offset != "100" {
-			t.Errorf("expected offset '100', got %s", offset)
+		if offset != paddedOffset(100) {
+			t.Errorf("expected offset 100, got %s", offset)
 		}
 	})
 
@@ -459,11 +465,11 @@ func TestSubscriptionOffset(t *testing.T) {
 		offset2, _ := store.LoadOffset(ctx, "sub2")
 		offset3, _ := store.LoadOffset(ctx, "sub3")
 
-		if offset2 != "50" {
-			t.Errorf("expected sub2 offset '50', got %s", offset2)
+		if offset2 != paddedOffset(50) {
+			t.Errorf("expected sub2 offset 50, got %s", offset2)
 		}
-		if offset3 != "75" {
-			t.Errorf("expected sub3 offset '75', got %s", offset3)
+		if offset3 != paddedOffset(75) {
+			t.Errorf("expected sub3 offset 75, got %s", offset3)
 		}
 	})
 
@@ -719,8 +725,8 @@ func TestPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to load offset: %v", err)
 	}
-	if subOffset != "3" {
-		t.Errorf("expected offset '3', got %s", subOffset)
+	if subOffset != paddedOffset(3) {
+		t.Errorf("expected offset 3, got %s", subOffset)
 	}
 }
 
@@ -947,7 +953,7 @@ func TestReadStream(t *testing.T) {
 				t.Fatalf("unexpected error: %v", err)
 			}
 			count++
-			if event.Offset == "3" {
+			if event.Offset == paddedOffset(3) {
 				break
 			}
 		}
@@ -1030,7 +1036,7 @@ func TestReadStreamBatched(t *testing.T) {
 				t.Fatalf("unexpected error: %v", err)
 			}
 			count++
-			if event.Offset == "5" {
+			if event.Offset == paddedOffset(5) {
 				break
 			}
 		}

@@ -11,38 +11,58 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        go-version: ['1.24']
-    
+        # Every module in the repo. `go test ./...` at the root does NOT
+        # descend into sub-modules, so each one is tested explicitly.
+        module: ['.', 'stores/sqlite', 'stores/durablestream', 'otel']
+    env:
+      # Test each module against its own go.mod/go.sum (what external
+      # importers resolve), not the local workspace.
+      GOWORK: off
+
     steps:
     - uses: actions/checkout@v4
-    
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: ${{ matrix.go-version }}
-    
-    - name: Build
-      run: go build -v ./...
-    
-    - name: Test
-      run: go test -v ./...
-  
-  coverage:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    
-    steps:
-    - uses: actions/checkout@v4
-    
+
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
         go-version: '1.24'
-    
+
+    - name: Check formatting
+      run: |
+        cd ${{ matrix.module }}
+        test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+
+    - name: Build
+      run: |
+        cd ${{ matrix.module }}
+        go build -v ./...
+
+    - name: Vet
+      run: |
+        cd ${{ matrix.module }}
+        go vet ./...
+
+    - name: Test (with race detector)
+      run: |
+        cd ${{ matrix.module }}
+        go test -v -race ./...
+
+  coverage:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.24'
+
     - name: Generate coverage report
       run: go test -v -coverprofile=coverage.out ./...
-    
+
     - name: Upload coverage reports
       uses: ncruces/go-coverage-report@v0
       with:

@@ -194,10 +194,17 @@ func RegisterUpcastFunc(bus *EventBus, fromType, toType string, upcast UpcastFun
 	return bus.upcastRegistry.register(fromType, toType, upcast)
 }
 
-// WithUpcast adds an upcast function during bus creation
+// WithUpcast adds an upcast function during bus creation.
+//
+// It panics if the registration is invalid (empty types, self-upcast, nil
+// function, or a circular dependency): these are programming errors that
+// would otherwise be silently ignored at startup. Use RegisterUpcastFunc if
+// you need an error value instead.
 func WithUpcast(fromType, toType string, upcast UpcastFunc) Option {
 	return func(bus *EventBus) {
-		bus.upcastRegistry.register(fromType, toType, upcast)
+		if err := bus.upcastRegistry.register(fromType, toType, upcast); err != nil {
+			panic(fmt.Sprintf("eventbus: WithUpcast(%q, %q): %v", fromType, toType, err))
+		}
 	}
 }
 

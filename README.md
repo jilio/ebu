@@ -106,9 +106,11 @@ eventbus.Subscribe(bus, func(event EmailEvent) {
     sendEmail(event) // Each email sent in parallel
 }, eventbus.Async())
 
-// Sequential async processing (preserves order)
+// Sequential async processing (one at a time, but arrival order
+// is not guaranteed — goroutines acquire the handler lock in
+// scheduler order, not publish order)
 eventbus.Subscribe(bus, func(event PaymentEvent) {
-    processPayment(event) // Processed one at a time
+    processPayment(event) // Never runs concurrently with itself
 }, eventbus.Async(), eventbus.Sequential())
 
 // Wait for all async handlers
@@ -172,6 +174,9 @@ if eventbus.HasHandlers[UserEvent](bus) {
 handler := func(event UserEvent) { /* ... */ }
 eventbus.Subscribe(bus, handler)
 eventbus.Unsubscribe(bus, handler)
+// Note: handlers are matched by code pointer. Keep a reference to the
+// exact handler you registered — two closures made from the same function
+// literal are indistinguishable.
 
 // Clear all handlers for a type
 eventbus.Clear[UserEvent](bus)
@@ -201,12 +206,25 @@ bus.Replay(ctx, eventbus.OffsetOldest, func(event *eventbus.StoredEvent) error {
 })
 
 // Subscribe with automatic offset tracking
-eventbus.SubscribeWithReplay(bus, "email-sender",
+eventbus.SubscribeWithReplay(ctx, bus, "email-sender",
     func(event EmailEvent) {
         sendEmail(event)
         // Offset saved automatically after success
     })
 ```
+
+#### Delivery semantics
+
+- **Persistence is best-effort by default**: events are persisted in the
+  publish path *before* handlers run, but a failed `Append` does not stop
+  delivery — the error goes to the `PersistenceErrorHandler`
+  (`WithPersistenceErrorHandler`). Monitor it in production.
+- **`SubscribeWithReplay` is at-least-once**: each handled event saves its own
+  offset after the handler returns. If the process crashes between handling
+  and the offset save, that event is redelivered on the next start — make
+  replay handlers idempotent.
+- Handlers can read the offset their event was persisted at with
+  `eventbus.OffsetFromContext(ctx)` (context-aware handlers only).
 
 See [**Persistence Guide**](docs/PERSISTENCE.md) for custom stores and advanced patterns.
 
@@ -304,7 +322,7 @@ eventbus.RegisterUpcast(bus, func(v1 UserCreatedV1) UserCreatedV2 {
 })
 
 // Old events automatically transformed when replayed
-eventbus.SubscribeWithReplay(bus, "processor", func(event UserCreatedV2) {
+eventbus.SubscribeWithReplay(ctx, bus, "processor", func(event UserCreatedV2) {
     // Receives V2 format even for old V1 events
 })
 ```

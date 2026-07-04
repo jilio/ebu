@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"iter"
 	"reflect"
+	"sort"
 	"sync"
 	"time"
 )
@@ -53,15 +54,6 @@ type EventStoreStreamer interface {
 	// The iterator checks ctx.Done() before each yield and returns ctx.Err() when cancelled.
 	// A yielded error terminates iteration.
 	ReadStream(ctx context.Context, from Offset) iter.Seq2[*StoredEvent, error]
-}
-
-// EventStoreSubscriber is an optional interface for stores that support live subscriptions.
-// This enables real-time event streaming for remote stores.
-type EventStoreSubscriber interface {
-	// Subscribe starts a live subscription from the given offset.
-	// Returns a channel that yields events as they arrive.
-	// Call the returned cancel function to stop the subscription and close the channel.
-	Subscribe(ctx context.Context, from Offset) (<-chan *StoredEvent, func(), error)
 }
 
 // SubscriptionStore tracks subscription progress separately from event storage.
@@ -123,22 +115,28 @@ type StoredEvent struct {
 	Timestamp time.Time       `json:"timestamp"`
 }
 
-// WithStore enables persistence with the given store
+// WithStore enables persistence with the given store.
+//
+// Events are persisted in the publish path, after the before-publish hooks
+// and before handlers run. Persistence is best-effort: a failed Append does
+// not prevent delivery to handlers; the error is reported to the
+// PersistenceErrorHandler instead.
 func WithStore(store EventStore) Option {
 	return func(bus *EventBus) {
 		bus.store = store
-
-		// Chain the persistence hook with any existing context-aware hook
-		existingHook := bus.beforePublishCtx
-		bus.beforePublishCtx = func(ctx context.Context, eventType reflect.Type, event any) {
-			// Call existing hook first if any
-			if existingHook != nil {
-				existingHook(ctx, eventType, event)
-			}
-			// Then persist the event
-			bus.persistEvent(ctx, eventType, event)
-		}
 	}
+}
+
+// offsetCtxKey is the context key under which the offset assigned to the
+// event being published is stored.
+type offsetCtxKey struct{}
+
+// OffsetFromContext returns the offset assigned to the event currently being
+// handled, if the bus persisted it successfully. It only returns an offset
+// inside handlers invoked by a bus configured with WithStore.
+func OffsetFromContext(ctx context.Context) (Offset, bool) {
+	offset, ok := ctx.Value(offsetCtxKey{}).(Offset)
+	return offset, ok
 }
 
 // WithSubscriptionStore enables subscription position tracking
@@ -148,19 +146,20 @@ func WithSubscriptionStore(store SubscriptionStore) Option {
 	}
 }
 
-// persistEvent saves an event to storage (only if store is configured)
-func (bus *EventBus) persistEvent(ctx context.Context, eventType reflect.Type, event any) {
-	if bus.store == nil {
-		return // No persistence configured
-	}
-
+// persistEvent saves an event to storage and returns a context that carries
+// the assigned offset on success (see OffsetFromContext). On failure it
+// reports to the PersistenceErrorHandler and returns the context unchanged.
+//
+// Concurrency note: the bus does not serialize Append calls; stores must be
+// safe for concurrent use (all bundled stores are).
+func (bus *EventBus) persistEvent(ctx context.Context, eventType reflect.Type, event any) context.Context {
 	// Marshal the event first
 	data, err := json.Marshal(event)
 	if err != nil {
 		if bus.persistenceErrorHandler != nil {
 			bus.persistenceErrorHandler(event, eventType, fmt.Errorf("failed to marshal event: %w", err))
 		}
-		return
+		return ctx
 	}
 
 	// Use EventType() to respect TypeNamer interface if implemented
@@ -172,38 +171,38 @@ func (bus *EventBus) persistEvent(ctx context.Context, eventType reflect.Type, e
 		Timestamp: time.Now(),
 	}
 
-	// Apply timeout if configured
-	var cancel context.CancelFunc
+	// Apply timeout if configured. The timeout applies to Append only; the
+	// original context is what gets returned to the publish path.
+	appendCtx := ctx
 	if bus.persistenceTimeout > 0 {
-		ctx, cancel = context.WithTimeout(ctx, bus.persistenceTimeout)
+		var cancel context.CancelFunc
+		appendCtx, cancel = context.WithTimeout(ctx, bus.persistenceTimeout)
 		defer cancel()
 	}
 
 	// Observability: Track persistence start
 	if bus.observability != nil {
-		ctx = bus.observability.OnPersistStart(ctx, typeName, 0)
+		appendCtx = bus.observability.OnPersistStart(appendCtx, typeName, 0)
 	}
 
 	start := time.Now()
 
 	// Append the event - the store assigns the offset
-	bus.storeMu.Lock()
-	offset, saveErr := bus.store.Append(ctx, toStore)
-	if saveErr == nil {
-		bus.lastOffset = offset
-	}
-	bus.storeMu.Unlock()
+	offset, saveErr := bus.store.Append(appendCtx, toStore)
 
 	// Observability: Track persistence complete
 	if bus.observability != nil {
-		bus.observability.OnPersistComplete(ctx, time.Since(start), saveErr)
+		bus.observability.OnPersistComplete(appendCtx, time.Since(start), saveErr)
 	}
 
 	if saveErr != nil {
 		if bus.persistenceErrorHandler != nil {
 			bus.persistenceErrorHandler(event, eventType, fmt.Errorf("failed to save event: %w", saveErr))
 		}
+		return ctx
 	}
+
+	return context.WithValue(ctx, offsetCtxKey{}, offset)
 }
 
 // Replay replays events from an offset
@@ -297,14 +296,39 @@ func (bus *EventBus) GetStore() EventStore {
 	return bus.store
 }
 
+// typeNamerType is the reflect.Type of the TypeNamer interface.
+var typeNamerType = reflect.TypeOf((*TypeNamer)(nil)).Elem()
+
+// typeNameOf returns the persisted type name for an event type, honoring the
+// TypeNamer interface the same way EventType does for event values.
+func typeNameOf(t reflect.Type) string {
+	if t.Implements(typeNamerType) {
+		return reflect.Zero(t).Interface().(TypeNamer).EventTypeName()
+	}
+	if reflect.PointerTo(t).Implements(typeNamerType) {
+		// EventTypeName has a pointer receiver; call it on a fresh instance
+		// rather than a nil pointer.
+		return reflect.New(t).Interface().(TypeNamer).EventTypeName()
+	}
+	return t.String()
+}
+
 // SubscribeWithReplay subscribes and replays missed events.
 // Requires both an EventStore (for replay) and a SubscriptionStore (for tracking).
 // If the store implements SubscriptionStore, it will be used automatically.
 //
 // Context usage:
 //   - The context is used for the replay phase (loading historical events)
-//   - The context is used for saving subscription offsets
-//   - The context is NOT used for the live subscription handler (which follows the bus's lifecycle)
+//   - Live-phase offset saves use the per-publish context of each event
+//
+// Offset tracking: after each handled event the subscription saves that
+// event's own offset (replay phase) or the offset assigned during publish
+// (live phase, via OffsetFromContext). Delivery is at-least-once: after a
+// crash between handling and offset save, the event is redelivered on the
+// next SubscribeWithReplay.
+//
+// SaveOffset failures do not stop delivery; they are reported to the
+// PersistenceErrorHandler.
 //
 // Note: If the saved offset is OffsetOldest (""), replay starts from the beginning.
 // The OffsetNewest ("$") constant is typically not stored and is only used for live subscriptions.
@@ -333,9 +357,17 @@ func SubscribeWithReplay[T any](
 	lastOffset, _ := subStore.LoadOffset(ctx, subscriptionID)
 
 	// Replay missed events
-	var eventType = reflect.TypeOf((*T)(nil)).Elem()
-	// Use consistent type naming with EventType() function
-	typeName := eventType.String()
+	eventType := reflect.TypeOf((*T)(nil)).Elem()
+	// Match the name events were persisted under (TypeNamer-aware).
+	typeName := typeNameOf(eventType)
+
+	saveOffset := func(saveCtx context.Context, event T, offset Offset) {
+		if err := subStore.SaveOffset(saveCtx, subscriptionID, offset); err != nil && bus.persistenceErrorHandler != nil {
+			bus.persistenceErrorHandler(event, eventType,
+				fmt.Errorf("failed to save offset for subscription %q: %w", subscriptionID, err))
+		}
+	}
+
 	err := bus.Replay(ctx, lastOffset, func(stored *StoredEvent) error {
 		// Apply upcasts if available
 		eventData, eventTypeName := stored.Data, stored.Type
@@ -360,8 +392,8 @@ func SubscribeWithReplay[T any](
 
 		handler(event)
 
-		// Update offset
-		subStore.SaveOffset(ctx, subscriptionID, stored.Offset)
+		// Save this event's own offset after successful handling
+		saveOffset(ctx, event, stored.Offset)
 		return nil
 	})
 
@@ -369,19 +401,18 @@ func SubscribeWithReplay[T any](
 		return fmt.Errorf("replay events: %w", err)
 	}
 
-	// Subscribe for future events with offset tracking
-	wrappedHandler := func(event T) {
+	// Subscribe for future events with offset tracking. The publish path
+	// attaches the persisted offset of the event being delivered to its
+	// context, so each handled event saves exactly its own offset.
+	wrappedHandler := func(hctx context.Context, event T) {
 		handler(event)
 
-		// Update offset after handling
-		bus.storeMu.RLock()
-		offset := bus.lastOffset
-		bus.storeMu.RUnlock()
-
-		subStore.SaveOffset(ctx, subscriptionID, offset)
+		if offset, ok := OffsetFromContext(hctx); ok {
+			saveOffset(hctx, event, offset)
+		}
 	}
 
-	return Subscribe(bus, wrappedHandler, opts...)
+	return SubscribeContext(bus, wrappedHandler, opts...)
 }
 
 // MemoryStore is a simple in-memory implementation of EventStore and SubscriptionStore.
@@ -424,26 +455,36 @@ func (m *MemoryStore) Append(ctx context.Context, event *Event) (Offset, error) 
 	return offset, nil
 }
 
+// searchAfter returns the index of the first event with offset > from.
+// Events are stored in ascending, zero-padded offset order, so binary
+// search applies. Caller must hold at least a read lock.
+func (m *MemoryStore) searchAfter(from Offset) int {
+	if from == OffsetOldest {
+		return 0
+	}
+	return sort.Search(len(m.events), func(i int) bool {
+		return m.events[i].Offset > from
+	})
+}
+
 // Read implements EventStore
 func (m *MemoryStore) Read(ctx context.Context, from Offset, limit int) ([]*StoredEvent, Offset, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	var result []*StoredEvent
-	var lastOffset Offset = from
-
-	for _, event := range m.events {
-		// Include events after the given offset
-		if from == OffsetOldest || event.Offset > from {
-			result = append(result, event)
-			lastOffset = event.Offset
-			if limit > 0 && len(result) >= limit {
-				break
-			}
-		}
+	start := m.searchAfter(from)
+	end := len(m.events)
+	if limit > 0 && start+limit < end {
+		end = start + limit
 	}
 
-	return result, lastOffset, nil
+	if start == end {
+		return nil, from, nil
+	}
+
+	result := make([]*StoredEvent, end-start)
+	copy(result, m.events[start:end])
+	return result, result[len(result)-1].Offset, nil
 }
 
 // SaveOffset implements SubscriptionStore
@@ -473,14 +514,11 @@ func (m *MemoryStore) LoadOffset(ctx context.Context, subscriptionID string) (Of
 // during iteration, which could cause deadlocks if handlers call other store methods.
 func (m *MemoryStore) ReadStream(ctx context.Context, from Offset) iter.Seq2[*StoredEvent, error] {
 	return func(yield func(*StoredEvent, error) bool) {
-		// Take a filtered snapshot to avoid holding lock during iteration
+		// Take a snapshot to avoid holding lock during iteration
 		m.mu.RLock()
-		var events []*StoredEvent
-		for _, event := range m.events {
-			if from == OffsetOldest || event.Offset > from {
-				events = append(events, event)
-			}
-		}
+		start := m.searchAfter(from)
+		events := make([]*StoredEvent, len(m.events)-start)
+		copy(events, m.events[start:])
 		m.mu.RUnlock()
 
 		for _, event := range events {

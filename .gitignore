@@ -8,3 +8,7 @@ coverage.html
 
 # OS files
 .DS_Store
+
+# Workspace sums are machine-local; a stale committed one breaks
+# workspace resolution of the local modules.
+go.work.sum

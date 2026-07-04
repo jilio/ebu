@@ -57,13 +57,13 @@ type Observability struct {
 	meter  metric.Meter
 
 	// Metrics
-	publishCounter    metric.Int64Counter
-	handlerCounter    metric.Int64Counter
-	handlerDuration   metric.Float64Histogram
-	handlerErrors     metric.Int64Counter
-	persistCounter    metric.Int64Counter
-	persistDuration   metric.Float64Histogram
-	persistErrors     metric.Int64Counter
+	publishCounter  metric.Int64Counter
+	handlerCounter  metric.Int64Counter
+	handlerDuration metric.Float64Histogram
+	handlerErrors   metric.Int64Counter
+	persistCounter  metric.Int64Counter
+	persistDuration metric.Float64Histogram
+	persistErrors   metric.Int64Counter
 }
 
 // Option configures the Observability

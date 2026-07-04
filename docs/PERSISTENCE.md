@@ -292,7 +292,7 @@ func main() {
     bus := eventbus.New(eventbus.WithStore(store))
 
     // Subscribe with offset tracking
-    err := eventbus.SubscribeWithReplay(bus, "email-sender",
+    err := eventbus.SubscribeWithReplay(ctx, bus, "email-sender",
         func(event EmailNotification) {
             sendEmail(event.To, event.Subject, event.Body)
             // Offset is automatically saved after successful handling
@@ -320,10 +320,10 @@ Different subscriptions track offsets independently:
 
 ```go
 // Email sender tracks its own offset
-eventbus.SubscribeWithReplay(bus, "email-sender", emailHandler)
+eventbus.SubscribeWithReplay(ctx, bus, "email-sender", emailHandler)
 
 // Analytics tracker tracks separately
-eventbus.SubscribeWithReplay(bus, "analytics", analyticsHandler)
+eventbus.SubscribeWithReplay(ctx, bus, "analytics", analyticsHandler)
 
 // If email-sender crashes, it resumes from its last offset
 // Analytics continues unaffected
@@ -600,7 +600,7 @@ For critical event processing:
 eventbus.Subscribe(bus, criticalHandler)
 
 // GOOD - resumes after crash
-eventbus.SubscribeWithReplay(bus, "critical-processor", criticalHandler)
+eventbus.SubscribeWithReplay(ctx, bus, "critical-processor", criticalHandler)
 ```
 
 ### 3. Implement Proper Indexing
@@ -644,7 +644,7 @@ func TestSubscriptionResumption(t *testing.T) {
 
     // Subscribe and process 5 events
     count := 0
-    eventbus.SubscribeWithReplay(bus, "test",
+    eventbus.SubscribeWithReplay(ctx, bus, "test",
         func(event TestEvent) {
             count++
             if count == 5 {
@@ -653,7 +653,7 @@ func TestSubscriptionResumption(t *testing.T) {
         })
 
     // Resume subscription - should start from position 5
-    eventbus.SubscribeWithReplay(bus, "test",
+    eventbus.SubscribeWithReplay(ctx, bus, "test",
         func(event TestEvent) {
             // Processes events 5-9
         })

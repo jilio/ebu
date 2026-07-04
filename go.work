@@ -1,9 +1,12 @@
 go 1.25.1
 
-// Local development across the ebu module and its store sub-modules. External
-// importers ignore go.work and resolve each module by its go.mod require version.
+// Local development across the ebu module and its sub-modules. External
+// importers ignore go.work and resolve each module by its go.mod require
+// version. Keep go.work.sum out of version control (see .gitignore): a stale
+// sum file breaks workspace resolution of the local modules.
 use (
 	.
+	./otel
 	./stores/durablestream
 	./stores/sqlite
 )
