@@ -83,6 +83,16 @@ type EventBus struct {
 	persistenceTimeout      time.Duration
 	replayBatchSize         int // Batch size for Replay (default: 100)
 
+	// strictPersistence, when set, makes a failed Append stop delivery:
+	// handlers never observe an event the log did not record (see
+	// WithStrictPersistence).
+	strictPersistence bool
+
+	// originID uniquely identifies this bus instance; it is stamped on every
+	// persisted event's Origin field so processes sharing a log can tell
+	// their own events apart from a peer's.
+	originID string
+
 	// Upcast registry for event migration
 	upcastRegistry *upcastRegistry
 
@@ -195,6 +205,7 @@ type Option func(*EventBus)
 func New(opts ...Option) *EventBus {
 	bus := &EventBus{
 		upcastRegistry: newUpcastRegistry(),
+		originID:       NewEventID(),
 	}
 	bus.asyncCond = sync.NewCond(&bus.asyncMu)
 
@@ -256,6 +267,95 @@ func (bus *EventBus) addHandler(eventType reflect.Type, h *internalHandler) {
 	shard.mu.Lock()
 	shard.handlers[eventType] = append(shard.handlers[eventType], h)
 	shard.mu.Unlock()
+}
+
+// removeHandler unregisters a handler by identity (pointer equality on the
+// internalHandler), which — unlike Unsubscribe's code-pointer matching —
+// always removes exactly the registration it was given. It is a no-op when
+// the handler is already gone (unsubscribed twice, or removed by Clear).
+func (bus *EventBus) removeHandler(eventType reflect.Type, h *internalHandler) {
+	shard := bus.getShard(eventType)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	handlers := shard.handlers[eventType]
+	for i, existing := range handlers {
+		if existing == h {
+			shard.handlers[eventType] = append(handlers[:i], handlers[i+1:]...)
+			return
+		}
+	}
+}
+
+// OriginID returns the unique identifier of this bus instance. Every event
+// the bus persists carries it as Event.Origin, so consumers of a log shared
+// by several processes can tell this instance's events from a peer's.
+func (bus *EventBus) OriginID() string {
+	return bus.originID
+}
+
+// Subscription is a handle to a single registration, returned by
+// SubscribeWithHandle and SubscribeContextWithHandle. Unlike Unsubscribe —
+// which matches handlers by function code pointer and therefore cannot tell
+// two closures from the same function literal apart — a handle identifies
+// exactly the registration that created it.
+type Subscription struct {
+	bus       *EventBus
+	eventType reflect.Type
+	h         *internalHandler
+}
+
+// Unsubscribe removes this subscription's handler from the bus. It is
+// idempotent: calling it more than once (or after Clear/ClearAll already
+// removed the handler) is a no-op. Safe for concurrent use.
+func (s *Subscription) Unsubscribe() {
+	s.bus.removeHandler(s.eventType, s.h)
+}
+
+// SubscribeWithHandle registers a handler for events of type T and returns a
+// Subscription handle for precise removal. Semantics are identical to
+// Subscribe otherwise; T must be a concrete type.
+//
+// Prefer this over Subscribe+Unsubscribe when the handler is a closure:
+// handles remove exactly the registration they came from, with none of
+// Unsubscribe's code-pointer ambiguity.
+func SubscribeWithHandle[T any](bus *EventBus, handler Handler[T], opts ...SubscribeOption) (*Subscription, error) {
+	if bus == nil {
+		return nil, fmt.Errorf("eventbus: bus cannot be nil")
+	}
+	if handler == nil {
+		return nil, fmt.Errorf("eventbus: handler cannot be nil")
+	}
+
+	eventType := reflect.TypeOf((*T)(nil)).Elem()
+	h, err := buildHandler(handler, eventType, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	bus.addHandler(eventType, h)
+	return &Subscription{bus: bus, eventType: eventType, h: h}, nil
+}
+
+// SubscribeContextWithHandle registers a context-aware handler for events of
+// type T and returns a Subscription handle for precise removal. Semantics are
+// identical to SubscribeContext otherwise; T must be a concrete type.
+func SubscribeContextWithHandle[T any](bus *EventBus, handler ContextHandler[T], opts ...SubscribeOption) (*Subscription, error) {
+	if bus == nil {
+		return nil, fmt.Errorf("eventbus: bus cannot be nil")
+	}
+	if handler == nil {
+		return nil, fmt.Errorf("eventbus: handler cannot be nil")
+	}
+
+	eventType := reflect.TypeOf((*T)(nil)).Elem()
+	h, err := buildHandler(handler, eventType, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	bus.addHandler(eventType, h)
+	return &Subscription{bus: bus, eventType: eventType, h: h}, nil
 }
 
 // Subscribe registers a handler for events of type T.
@@ -335,8 +435,10 @@ func validateFilter(h *internalHandler, eventType reflect.Type) error {
 //     pointer and are indistinguishable; the first registered one is removed.
 //   - Method values on different receivers share a code pointer.
 //
-// If you need precise unsubscription of closures, keep a reference to the
-// exact handler you registered and unsubscribe with it, or use Clear[T].
+// If you need precise unsubscription of closures, use SubscribeWithHandle
+// and the returned Subscription's Unsubscribe method instead — handles are
+// matched by identity, not code pointer. Alternatively keep a reference to
+// the exact handler you registered and unsubscribe with it, or use Clear[T].
 func Unsubscribe[T any, H any](bus *EventBus, handler H) error {
 	if bus == nil {
 		return fmt.Errorf("eventbus: bus cannot be nil")
@@ -370,10 +472,39 @@ func Publish[T any](bus *EventBus, event T) {
 // It panics if bus is nil.
 //
 // When the bus has a store configured (WithStore), the event is persisted
-// before handlers run. Persistence is best-effort: on failure the event is
-// still delivered to handlers and the error is reported to the
-// PersistenceErrorHandler (see WithPersistenceErrorHandler).
+// before handlers run. Persistence is best-effort by default: on failure the
+// event is still delivered to handlers and the error is reported to the
+// PersistenceErrorHandler (see WithPersistenceErrorHandler). With
+// WithStrictPersistence, a failed persist skips delivery instead. Use
+// TryPublish/TryPublishContext to receive the persistence error directly.
 func PublishContext[T any](bus *EventBus, ctx context.Context, event T) {
+	publishContext(bus, ctx, event)
+}
+
+// TryPublish is Publish with the persistence outcome returned: it reports the
+// error when the bus failed to persist the event (nil on success or when no
+// store is configured). It panics if bus is nil.
+func TryPublish[T any](bus *EventBus, event T) error {
+	return publishContext(bus, context.Background(), event)
+}
+
+// TryPublishContext is PublishContext with the persistence outcome returned.
+//
+// The returned error does not by itself imply handlers were skipped: in
+// best-effort mode (the default) delivery proceeds despite the error, while
+// under WithStrictPersistence delivery is skipped. Either way the error is
+// also reported to the PersistenceErrorHandler, which remains the right
+// channel for passive monitoring; TryPublishContext is for publishers that
+// must act on the failure (e.g. fail the request that caused the publish).
+// It panics if bus is nil.
+func TryPublishContext[T any](bus *EventBus, ctx context.Context, event T) error {
+	return publishContext(bus, ctx, event)
+}
+
+// publishContext is the single publish path: it persists (when configured),
+// delivers, and returns the persistence error, if any. Publish/PublishContext
+// discard the error; TryPublish/TryPublishContext surface it.
+func publishContext[T any](bus *EventBus, ctx context.Context, event T) error {
 	if bus == nil {
 		panic("eventbus: Publish called with nil bus")
 	}
@@ -396,18 +527,28 @@ func PublishContext[T any](bus *EventBus, ctx context.Context, event T) {
 
 	// Persist the event before handlers run. On success the assigned offset
 	// is attached to ctx and can be retrieved with OffsetFromContext.
+	var persistErr error
 	if bus.store != nil {
-		ctx = bus.persistEvent(ctx, eventType, event)
+		ctx, persistErr = bus.persistEvent(ctx, eventType, event)
 	}
+
+	// In strict mode a failed persist skips delivery: handlers never observe
+	// an event the log did not record, so replay and live handling can never
+	// diverge. The after-publish hooks and observability below still fire so
+	// monitoring sees the attempt.
+	deliver := persistErr == nil || !bus.strictPersistence
 
 	// Get handlers from appropriate shard
 	shard := bus.getShard(eventType)
-	shard.mu.RLock()
-	handlers := shard.handlers[eventType]
-	// Create a copy to avoid holding the lock during handler execution
-	handlersCopy := make([]*internalHandler, len(handlers))
-	copy(handlersCopy, handlers)
-	shard.mu.RUnlock()
+	var handlersCopy []*internalHandler
+	if deliver {
+		shard.mu.RLock()
+		handlers := shard.handlers[eventType]
+		// Create a copy to avoid holding the lock during handler execution
+		handlersCopy = make([]*internalHandler, len(handlers))
+		copy(handlersCopy, handlers)
+		shard.mu.RUnlock()
+	}
 
 	// Execute handlers without holding the lock
 	var onceHandlersToRemove []*internalHandler
@@ -503,6 +644,8 @@ func PublishContext[T any](bus *EventBus, ctx context.Context, event T) {
 	if bus.observability != nil {
 		bus.observability.OnPublishComplete(ctx, eventTypeName)
 	}
+
+	return persistErr
 }
 
 // Clear removes all handlers for events of type T
@@ -678,6 +821,22 @@ func WithBeforePublishContext(hook PublishHookContext) Option {
 func WithAfterPublishContext(hook PublishHookContext) Option {
 	return func(bus *EventBus) {
 		bus.afterPublishCtx = hook
+	}
+}
+
+// WithStrictPersistence makes persistence a delivery precondition: when an
+// event cannot be persisted (marshal or Append failure), it is NOT delivered
+// to handlers. Without this option persistence is best-effort — handlers can
+// observe an event the log never recorded, so a later replay would diverge
+// from what live handlers saw. Enable it when the store is the source of
+// truth (event sourcing, cross-process delivery).
+//
+// The failure is still reported to the PersistenceErrorHandler, and
+// TryPublish/TryPublishContext return it to the publisher. It has no effect
+// on a bus without a store.
+func WithStrictPersistence() Option {
+	return func(bus *EventBus) {
+		bus.strictPersistence = true
 	}
 }
 

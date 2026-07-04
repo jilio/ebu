@@ -174,13 +174,17 @@ if eventbus.HasHandlers[UserEvent](bus) {
     eventbus.Publish(bus, UserEvent{})
 }
 
-// Unsubscribe a handler
+// Unsubscribe precisely with a handle (recommended for closures)
+sub, _ := eventbus.SubscribeWithHandle(bus, func(event UserEvent) { /* ... */ })
+sub.Unsubscribe() // removes exactly this registration; idempotent
+
+// Or unsubscribe by handler reference
 handler := func(event UserEvent) { /* ... */ }
 eventbus.Subscribe(bus, handler)
 eventbus.Unsubscribe(bus, handler)
-// Note: handlers are matched by code pointer. Keep a reference to the
+// Note: Unsubscribe matches by code pointer. Keep a reference to the
 // exact handler you registered — two closures made from the same function
-// literal are indistinguishable.
+// literal are indistinguishable. Handles have no such ambiguity.
 
 // Clear all handlers for a type
 eventbus.Clear[UserEvent](bus)
@@ -223,6 +227,19 @@ eventbus.SubscribeWithReplay(ctx, bus, "email-sender",
   publish path *before* handlers run, but a failed `Append` does not stop
   delivery — the error goes to the `PersistenceErrorHandler`
   (`WithPersistenceErrorHandler`). Monitor it in production.
+- **Strict mode**: with `eventbus.WithStrictPersistence()`, a failed persist
+  *skips* delivery instead — handlers never observe an event the log did not
+  record, so replay can never diverge from what live handlers saw. Use it
+  when the store is the source of truth (event sourcing, shared logs).
+- **Publishers can observe the outcome**: `eventbus.TryPublish` /
+  `eventbus.TryPublishContext` return the persistence error (nil on success
+  or when no store is configured), so a request handler can fail the request
+  when its event was not durably recorded.
+- **Every persisted event carries an envelope**: a ULID `ID` (minted once per
+  publish — store-level retries reuse it, making it a reliable dedup key), the
+  publishing bus's `Origin`, and optional publisher `Metadata` attached via
+  `eventbus.ContextWithMetadata(ctx, map[string]string{...})`. Live handlers
+  can read the ID with `eventbus.EventIDFromContext(ctx)`.
 - **`SubscribeWithReplay` is at-least-once**: each handled event saves its own
   offset after the handler returns. If the process crashes between handling
   and the offset save, that event is redelivered on the next start — make
@@ -234,6 +251,11 @@ eventbus.SubscribeWithReplay(ctx, bus, "email-sender",
   `PersistenceErrorHandler` (as its `*StoredEvent`, so the payload can be
   parked elsewhere), its offset is saved so the skip is durable across
   restarts, and replay continues.
+- **`Async()` + `SubscribeWithReplay`**: offset saves for an async
+  subscription run concurrently and can complete out of publish order, so a
+  crash may redeliver a little more history than with a synchronous handler.
+  Still at-least-once — but prefer synchronous replay handlers, or make them
+  idempotent on `StoredEvent.ID`.
 - **Validation before replay**: `SubscribeWithReplay` validates all arguments
   and options (including the `WithFilter` predicate's type) before the replay
   pass — a call that returns a validation error has delivered nothing and

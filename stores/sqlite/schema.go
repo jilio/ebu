@@ -4,10 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 )
 
 // Schema version for migrations
-const currentSchemaVersion = 3
+const currentSchemaVersion = 4
 
 // Schema definitions
 const (
@@ -49,6 +50,14 @@ const (
 	// this store ever filters by type, so the index was pure write
 	// amplification on every Append.
 	dropEventsTypeIndex = `DROP INDEX IF EXISTS idx_events_type`
+
+	// Schema v4 adds the event envelope (see eventbus.Event): a globally
+	// unique event ID, the publishing bus's origin, and publisher-supplied
+	// metadata (stored as a JSON object). All three are nullable so rows
+	// written by earlier versions read back as empty envelope fields.
+	addEventIDColumn  = `ALTER TABLE events ADD COLUMN event_id TEXT`
+	addOriginColumn   = `ALTER TABLE events ADD COLUMN origin TEXT`
+	addMetadataColumn = `ALTER TABLE events ADD COLUMN metadata TEXT`
 )
 
 // migrate applies database migrations if needed
@@ -82,7 +91,12 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		}
 	}
 	if version < 3 {
-		return migrateV3(ctx, db)
+		if err := migrateV3(ctx, db); err != nil {
+			return err
+		}
+	}
+	if version < 4 {
+		return migrateV4(ctx, db)
 	}
 
 	return nil
@@ -170,4 +184,47 @@ func migrateV3(ctx context.Context, db *sql.DB) (err error) {
 	}
 
 	return tx.Commit()
+}
+
+// migrateV4 adds the event envelope columns (see addEventIDColumn).
+//
+// ALTER TABLE ADD COLUMN has no IF NOT EXISTS, so — unlike the earlier,
+// naturally idempotent migrations — a duplicate-column error must be treated
+// as success: two processes racing through migrate() (both reading the same
+// stale version) may both attempt the ALTERs, and the loser would otherwise
+// fail on a column the winner already added.
+func migrateV4(ctx context.Context, db *sql.DB) (err error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+		}
+	}()
+
+	for _, stmt := range []string{addEventIDColumn, addOriginColumn, addMetadataColumn} {
+		if _, err = tx.ExecContext(ctx, stmt); err != nil {
+			if isDuplicateColumn(err) {
+				err = nil
+				continue
+			}
+			return fmt.Errorf("exec schema: %w", err)
+		}
+	}
+
+	if _, err = tx.ExecContext(ctx, "INSERT OR IGNORE INTO schema_version (version) VALUES (4)"); err != nil {
+		return fmt.Errorf("exec schema: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+// isDuplicateColumn reports whether err is SQLite's "duplicate column name"
+// error from ALTER TABLE ADD COLUMN. SQLite reports it as a plain
+// SQLITE_ERROR, so the message is the only discriminator.
+func isDuplicateColumn(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "duplicate column name")
 }

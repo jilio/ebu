@@ -310,8 +310,13 @@ func (m *mockRows) Scan(dest ...any) error {
 	if m.scanErr != nil {
 		return m.scanErr
 	}
+	// Rows may carry fewer columns than dest asks for (legacy 4-column rows
+	// predating the envelope); the missing trailing columns scan as NULL.
 	row := m.data[m.index-1]
 	for i, d := range dest {
+		if i >= len(row) {
+			break
+		}
 		switch ptr := d.(type) {
 		case *int64:
 			*ptr = row[i].(int64)
@@ -321,6 +326,12 @@ func (m *mockRows) Scan(dest ...any) error {
 			*ptr = row[i].([]byte)
 		case *time.Time:
 			*ptr = row[i].(time.Time)
+		case *sql.NullString:
+			if s, ok := row[i].(string); ok {
+				*ptr = sql.NullString{String: s, Valid: true}
+			} else {
+				*ptr = sql.NullString{}
+			}
 		}
 	}
 	return nil
@@ -1136,6 +1147,12 @@ func TestMigrationsVersionInsertIdempotent(t *testing.T) {
 		}
 		if err := RunMigrateV3(ctx, db); err != nil {
 			t.Fatalf("v3 run %d: %v", run, err)
+		}
+		// The second v4 run also exercises duplicate-column tolerance: ALTER
+		// TABLE ADD COLUMN has no IF NOT EXISTS, so re-running must succeed
+		// by treating "duplicate column name" as already-applied.
+		if err := RunMigrateV4(ctx, db); err != nil {
+			t.Fatalf("v4 run %d: %v", run, err)
 		}
 	}
 

@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Event envelope: `ID`, `Origin`, `Metadata`.** Every persisted event now
+  carries a ULID `ID` minted once per publish (store-level retries reuse it,
+  so it is a reliable deduplication key for at-least-once delivery), the
+  publishing bus instance's `Origin` (`bus.OriginID()`), and optional
+  publisher-supplied `Metadata` attached with `ContextWithMetadata`. Live
+  handlers can read the ID and metadata with `EventIDFromContext` /
+  `MetadataFromContext`. All fields are optional on the wire, so existing
+  streams and external producers remain compatible. `NewEventID` (a
+  dependency-free ULID generator) is exported.
+- **`WithStrictPersistence`.** Makes persistence a delivery precondition: a
+  failed marshal or `Append` skips handler delivery, so handlers never
+  observe an event the log did not record and replay cannot diverge from
+  live handling. Default behavior (best-effort) is unchanged.
+- **`TryPublish` / `TryPublishContext`.** Publish variants that return the
+  persistence error, for publishers that must act on failure (e.g. fail the
+  originating request). Nil when persistence succeeded or no store is
+  configured.
+- **Subscription handles.** `SubscribeWithHandle` /
+  `SubscribeContextWithHandle` return a `*Subscription` whose `Unsubscribe`
+  removes exactly that registration by identity — closing the long-standing
+  `Unsubscribe` footgun where two closures from the same function literal
+  share a code pointer and cannot be told apart. Idempotent and safe for
+  concurrent use.
+- **sqlite: schema v4** adds nullable `event_id`, `origin`, and `metadata`
+  columns for the envelope. The migration tolerates concurrent migrators
+  (duplicate-column errors are treated as already-applied) and rows written
+  by earlier versions read back with empty envelope fields.
+- **durablestream: envelope fields** are written and read as optional JSON
+  keys (`id`, `origin`, `metadata`), byte-compatible with pre-envelope
+  streams.
+
+### Documented
+
+- `Async()` + `SubscribeWithReplay` offset saves can complete out of publish
+  order; delivery stays at-least-once but a crash may redeliver more history.
+  Prefer synchronous replay handlers or idempotency on `StoredEvent.ID`.
+
 ## [0.15.0] - 2026-07-05
 
 ### Fixed

@@ -129,10 +129,15 @@ func NewWithContext(ctx context.Context, baseURL string, streamPath string, opts
 }
 
 // storedEventForWrite represents the event format for writing to the stream.
+// The envelope fields (id, origin, metadata) are omitted when empty so
+// streams stay byte-compatible with events written by earlier versions.
 type storedEventForWrite struct {
-	Type      string          `json:"type"`
-	Data      json.RawMessage `json:"data"`
-	Timestamp string          `json:"timestamp,omitempty"`
+	ID        string            `json:"id,omitempty"`
+	Origin    string            `json:"origin,omitempty"`
+	Type      string            `json:"type"`
+	Data      json.RawMessage   `json:"data"`
+	Metadata  map[string]string `json:"metadata,omitempty"`
+	Timestamp string            `json:"timestamp,omitempty"`
 }
 
 // Append stores an event and returns its assigned offset.
@@ -162,8 +167,11 @@ type storedEventForWrite struct {
 // concurrent publishers until it resolves.
 func (s *Store) Append(ctx context.Context, event *eventbus.Event) (eventbus.Offset, error) {
 	writeEvent := storedEventForWrite{
-		Type: event.Type,
-		Data: event.Data,
+		ID:       event.ID,
+		Origin:   event.Origin,
+		Type:     event.Type,
+		Data:     event.Data,
+		Metadata: event.Metadata,
 	}
 	if !event.Timestamp.IsZero() {
 		writeEvent.Timestamp = event.Timestamp.Format(time.RFC3339Nano)
@@ -224,10 +232,13 @@ func (s *Store) Append(ctx context.Context, event *eventbus.Event) (eventbus.Off
 
 // storedEventWithOffset is used to parse events that include their own offset.
 type storedEventWithOffset struct {
-	Offset    string          `json:"offset,omitempty"`
-	Type      string          `json:"type"`
-	Data      json.RawMessage `json:"data"`
-	Timestamp string          `json:"timestamp,omitempty"`
+	Offset    string            `json:"offset,omitempty"`
+	ID        string            `json:"id,omitempty"`
+	Origin    string            `json:"origin,omitempty"`
+	Type      string            `json:"type"`
+	Data      json.RawMessage   `json:"data"`
+	Metadata  map[string]string `json:"metadata,omitempty"`
+	Timestamp string            `json:"timestamp,omitempty"`
 }
 
 // Read returns events appended strictly after the given offset.
@@ -356,8 +367,11 @@ func (s *Store) Read(ctx context.Context, from eventbus.Offset, limit int) ([]*e
 
 			events = append(events, &eventbus.StoredEvent{
 				Offset:    eventOffset,
+				ID:        eventWithOffset.ID,
+				Origin:    eventWithOffset.Origin,
 				Type:      eventWithOffset.Type,
 				Data:      eventWithOffset.Data,
+				Metadata:  eventWithOffset.Metadata,
 				Timestamp: parseTimestamp(eventWithOffset.Timestamp),
 			})
 		}

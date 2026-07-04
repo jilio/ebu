@@ -27,6 +27,11 @@ func RunMigrateV3(ctx context.Context, db *sql.DB) error {
 	return migrateV3(ctx, db)
 }
 
+// RunMigrateV4 runs v4 migration on a database (exported for testing)
+func RunMigrateV4(ctx context.Context, db *sql.DB) error {
+	return migrateV4(ctx, db)
+}
+
 // SetStreamBatchSize overrides the stream batch size (exported for testing).
 // A value <= 0 forces the unbatched, point-in-time snapshot stream path.
 func (s *SQLiteStore) SetStreamBatchSize(size int) {

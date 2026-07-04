@@ -202,9 +202,9 @@ func (s *SQLiteStore) prepareStatements() error {
 	}
 
 	stmts := []stmtDef{
-		{&s.appendStmt, "INSERT INTO events (type, data, timestamp) VALUES (?, ?, ?)"},
-		{&s.readStmt, "SELECT position, type, data, timestamp FROM events WHERE position > ? ORDER BY position LIMIT ?"},
-		{&s.readFromStmt, "SELECT position, type, data, timestamp FROM events WHERE position > ? ORDER BY position"},
+		{&s.appendStmt, "INSERT INTO events (type, data, timestamp, event_id, origin, metadata) VALUES (?, ?, ?, ?, ?, ?)"},
+		{&s.readStmt, "SELECT position, type, data, timestamp, event_id, origin, metadata FROM events WHERE position > ? ORDER BY position LIMIT ?"},
+		{&s.readFromStmt, "SELECT position, type, data, timestamp, event_id, origin, metadata FROM events WHERE position > ? ORDER BY position"},
 		{&s.saveOffsetStmt, `INSERT INTO subscription_positions (subscription_id, position, updated_at)
 			VALUES (?, ?, CURRENT_TIMESTAMP)
 			ON CONFLICT(subscription_id) DO UPDATE SET position = excluded.position, updated_at = CURRENT_TIMESTAMP`},
@@ -259,7 +259,18 @@ func formatOffset(position int64) eventbus.Offset {
 func (s *SQLiteStore) Append(ctx context.Context, event *eventbus.Event) (eventbus.Offset, error) {
 	start := time.Now()
 
-	result, err := s.appendStmt.ExecContext(ctx, event.Type, event.Data, event.Timestamp)
+	// Envelope fields are stored as NULL when absent so rows written through
+	// old and new cores are indistinguishable on read (both scan as empty).
+	metadataJSON, err := marshalMetadata(event.Metadata)
+	if err != nil {
+		if s.metricsHook != nil {
+			s.metricsHook.OnAppend(time.Since(start), err)
+		}
+		return "", fmt.Errorf("sqlite: marshal event metadata: %w", err)
+	}
+
+	result, err := s.appendStmt.ExecContext(ctx, event.Type, event.Data, event.Timestamp,
+		nullifyEmpty(event.ID), nullifyEmpty(event.Origin), metadataJSON)
 	if err != nil {
 		if s.metricsHook != nil {
 			s.metricsHook.OnAppend(time.Since(start), err)
@@ -351,18 +362,59 @@ func (s *SQLiteStore) Read(ctx context.Context, from eventbus.Offset, limit int)
 	return events, nextOffset, nil
 }
 
+// nullifyEmpty maps an empty string to NULL so envelope fields absent at
+// publish time do not store empty-string values.
+func nullifyEmpty(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+// marshalMetadata encodes non-empty metadata as a JSON object, or NULL.
+func marshalMetadata(md map[string]string) (any, error) {
+	if len(md) == 0 {
+		return nil, nil
+	}
+	data, err := json.Marshal(md)
+	if err != nil {
+		return nil, err
+	}
+	return string(data), nil
+}
+
+// scanEvent scans one events row (position, type, data, timestamp, envelope)
+// into a StoredEvent, returning the raw position alongside. Envelope columns
+// are NULL for rows written before schema v4 or through an older core; they
+// scan as empty values.
+func scanEvent(rows rowScanner) (*eventbus.StoredEvent, int64, error) {
+	var position int64
+	var eventID, origin, metadata sql.NullString
+	event := &eventbus.StoredEvent{}
+	if err := rows.Scan(&position, &event.Type, &event.Data, &event.Timestamp, &eventID, &origin, &metadata); err != nil {
+		return nil, 0, fmt.Errorf("sqlite: scan event: %w", err)
+	}
+	event.Offset = formatOffset(position)
+	event.ID = eventID.String
+	event.Origin = origin.String
+	if metadata.Valid && metadata.String != "" {
+		if err := json.Unmarshal([]byte(metadata.String), &event.Metadata); err != nil {
+			return nil, 0, fmt.Errorf("sqlite: unmarshal event metadata at offset %s: %w", event.Offset, err)
+		}
+	}
+	return event, position, nil
+}
+
 // scanEvents scans rows into events - extracted for testability
 func (s *SQLiteStore) scanEvents(rows rowScanner) ([]*eventbus.StoredEvent, error) {
 	defer rows.Close()
 
 	var events []*eventbus.StoredEvent
 	for rows.Next() {
-		var position int64
-		event := &eventbus.StoredEvent{}
-		if err := rows.Scan(&position, &event.Type, &event.Data, &event.Timestamp); err != nil {
-			return nil, fmt.Errorf("sqlite: scan event: %w", err)
+		event, _, err := scanEvent(rows)
+		if err != nil {
+			return nil, err
 		}
-		event.Offset = formatOffset(position)
 		events = append(events, event)
 	}
 
@@ -599,14 +651,12 @@ func (s *SQLiteStore) streamRows(
 		default:
 		}
 
-		var position int64
-		event := &eventbus.StoredEvent{}
-		if err := rows.Scan(&position, &event.Type, &event.Data, &event.Timestamp); err != nil {
-			*iterErr = fmt.Errorf("sqlite: scan event: %w", err)
+		event, _, err := scanEvent(rows)
+		if err != nil {
+			*iterErr = err
 			yield(nil, *iterErr)
 			return
 		}
-		event.Offset = formatOffset(position)
 
 		*eventCount++
 		if !yield(event, nil) {
@@ -688,15 +738,13 @@ func (s *SQLiteStore) streamBatch(
 		default:
 		}
 
-		var position int64
-		event := &eventbus.StoredEvent{}
-		if err := rows.Scan(&position, &event.Type, &event.Data, &event.Timestamp); err != nil {
+		event, position, err := scanEvent(rows)
+		if err != nil {
 			rows.Close() // Best effort close, scan error takes precedence
-			*iterErr = fmt.Errorf("sqlite: scan event: %w", err)
+			*iterErr = err
 			yield(nil, *iterErr)
 			return 0, 0, false
 		}
-		event.Offset = formatOffset(position)
 
 		lastPos = position
 		batchCount++

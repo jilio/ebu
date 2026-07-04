@@ -114,18 +114,45 @@ type EventStoreTruncator interface {
 }
 
 // Event represents an event to be stored (before it has an offset).
+//
+// ID, Origin, and Metadata form the event envelope. All three are optional
+// at the storage level (`omitempty`), so streams written by earlier ebu
+// versions or by external producers decode cleanly with empty values.
 type Event struct {
-	Type      string          `json:"type"`
-	Data      json.RawMessage `json:"data"`
-	Timestamp time.Time       `json:"timestamp"`
+	// ID is a globally unique identifier for the publish that produced this
+	// event (a ULID, see NewEventID). The bus assigns it once, before the
+	// first Append attempt, so a store that retries a failed append writes
+	// the SAME ID for every attempt — consumers can deduplicate at-least-once
+	// deliveries on it.
+	ID string `json:"id,omitempty"`
+
+	// Origin identifies the bus instance that published the event (each
+	// EventBus gets a unique origin at New). On a log shared by several
+	// processes it tells "my own event echoed back" apart from a peer's.
+	Origin string `json:"origin,omitempty"`
+
+	Type string          `json:"type"`
+	Data json.RawMessage `json:"data"`
+
+	// Metadata carries publisher-supplied key/value pairs (correlation IDs,
+	// causation IDs, tenant tags, ...). Attach it to the publish context with
+	// ContextWithMetadata. The bus never reads or writes keys itself.
+	Metadata map[string]string `json:"metadata,omitempty"`
+
+	Timestamp time.Time `json:"timestamp"`
 }
 
 // StoredEvent represents an event that has been persisted with an offset.
+// ID, Origin, and Metadata mirror the Event envelope; they are empty for
+// events written before the envelope existed or by external producers.
 type StoredEvent struct {
-	Offset    Offset          `json:"offset"`
-	Type      string          `json:"type"`
-	Data      json.RawMessage `json:"data"`
-	Timestamp time.Time       `json:"timestamp"`
+	Offset    Offset            `json:"offset"`
+	ID        string            `json:"id,omitempty"`
+	Origin    string            `json:"origin,omitempty"`
+	Type      string            `json:"type"`
+	Data      json.RawMessage   `json:"data"`
+	Metadata  map[string]string `json:"metadata,omitempty"`
+	Timestamp time.Time         `json:"timestamp"`
 }
 
 // WithStore enables persistence with the given store.
@@ -152,6 +179,47 @@ func OffsetFromContext(ctx context.Context) (Offset, bool) {
 	return offset, ok
 }
 
+// eventIDCtxKey is the context key under which the ID assigned to the event
+// being published is stored.
+type eventIDCtxKey struct{}
+
+// EventIDFromContext returns the ID assigned to the event currently being
+// handled. It is set for every publish on a bus configured with WithStore —
+// including publishes whose Append failed in best-effort mode, since the ID
+// identifies the publish, not the storage outcome. Context-aware handlers can
+// use it for idempotency keys and correlation.
+func EventIDFromContext(ctx context.Context) (string, bool) {
+	id, ok := ctx.Value(eventIDCtxKey{}).(string)
+	return id, ok
+}
+
+// metadataCtxKey is the context key under which publisher-supplied event
+// metadata travels from PublishContext to persistEvent.
+type metadataCtxKey struct{}
+
+// ContextWithMetadata returns a context that attaches metadata to every event
+// subsequently published with it on a bus configured with WithStore. The map
+// is stored on the persisted event's envelope (Event.Metadata) and surfaces
+// on replay via StoredEvent.Metadata.
+//
+// The map is not copied: callers must not mutate it after publishing.
+// Publishing with a context that already carries metadata replaces the whole
+// map (no merging). A nil or empty map attaches nothing.
+func ContextWithMetadata(ctx context.Context, md map[string]string) context.Context {
+	if len(md) == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, metadataCtxKey{}, md)
+}
+
+// MetadataFromContext returns the event metadata attached to ctx with
+// ContextWithMetadata, if any. Inside handlers it returns the metadata of the
+// event being delivered, since the publish context is what handlers receive.
+func MetadataFromContext(ctx context.Context) (map[string]string, bool) {
+	md, ok := ctx.Value(metadataCtxKey{}).(map[string]string)
+	return md, ok
+}
+
 // WithSubscriptionStore enables subscription position tracking
 func WithSubscriptionStore(store SubscriptionStore) Option {
 	return func(bus *EventBus) {
@@ -159,28 +227,42 @@ func WithSubscriptionStore(store SubscriptionStore) Option {
 	}
 }
 
-// persistEvent saves an event to storage and returns a context that carries
-// the assigned offset on success (see OffsetFromContext). On failure it
-// reports to the PersistenceErrorHandler and returns the context unchanged.
+// persistEvent saves an event to storage. It returns a context that carries
+// the event's assigned ID (always) and its offset (on success, see
+// OffsetFromContext), plus the persistence error, if any. Every error is
+// reported to the PersistenceErrorHandler before being returned; the caller
+// decides — based on WithStrictPersistence — whether the error also stops
+// delivery.
 //
 // Concurrency note: the bus does not serialize Append calls; stores must be
 // safe for concurrent use (all bundled stores are).
-func (bus *EventBus) persistEvent(ctx context.Context, eventType reflect.Type, event any) context.Context {
+func (bus *EventBus) persistEvent(ctx context.Context, eventType reflect.Type, event any) (context.Context, error) {
+	// The ID identifies this publish: it is minted before the first Append
+	// attempt so retries inside a store write the same ID, and it is attached
+	// to ctx even when persistence fails (see EventIDFromContext).
+	eventID := NewEventID()
+	ctx = context.WithValue(ctx, eventIDCtxKey{}, eventID)
+
 	// Marshal the event first
 	data, err := json.Marshal(event)
 	if err != nil {
+		err = fmt.Errorf("failed to marshal event: %w", err)
 		if bus.persistenceErrorHandler != nil {
-			bus.persistenceErrorHandler(event, eventType, fmt.Errorf("failed to marshal event: %w", err))
+			bus.persistenceErrorHandler(event, eventType, err)
 		}
-		return ctx
+		return ctx, err
 	}
 
 	// Use EventType() to respect TypeNamer interface if implemented
 	typeName := EventType(event)
 
+	metadata, _ := MetadataFromContext(ctx)
 	toStore := &Event{
+		ID:        eventID,
+		Origin:    bus.originID,
 		Type:      typeName,
 		Data:      data,
+		Metadata:  metadata,
 		Timestamp: time.Now(),
 	}
 
@@ -209,13 +291,14 @@ func (bus *EventBus) persistEvent(ctx context.Context, eventType reflect.Type, e
 	}
 
 	if saveErr != nil {
+		saveErr = fmt.Errorf("failed to save event: %w", saveErr)
 		if bus.persistenceErrorHandler != nil {
-			bus.persistenceErrorHandler(event, eventType, fmt.Errorf("failed to save event: %w", saveErr))
+			bus.persistenceErrorHandler(event, eventType, saveErr)
 		}
-		return ctx
+		return ctx, saveErr
 	}
 
-	return context.WithValue(ctx, offsetCtxKey{}, offset)
+	return context.WithValue(ctx, offsetCtxKey{}, offset), nil
 }
 
 // Replay replays events from an offset
@@ -392,6 +475,13 @@ func WithReplayErrorPolicy(policy ReplayErrorPolicy) SubscribeOption {
 //
 // SaveOffset failures do not stop delivery; they are reported to the
 // PersistenceErrorHandler.
+//
+// Async() caveat: with an async subscription, live-phase offset saves run
+// concurrently and may complete out of publish order, so a slower earlier
+// event can overwrite the stored offset with a smaller value. Delivery
+// remains at-least-once — a crash simply redelivers a little more history on
+// restart — but subscriptions that want to minimize redelivery should stay
+// synchronous (the default) or make handlers idempotent on StoredEvent.ID.
 //
 // Validation: all argument and option validation (nil bus/handler/options,
 // interface event types, filter shape) happens before the replay pass, so a
@@ -591,8 +681,11 @@ func (m *MemoryStore) Append(ctx context.Context, event *Event) (Offset, error) 
 
 	stored := &StoredEvent{
 		Offset:    offset,
+		ID:        event.ID,
+		Origin:    event.Origin,
 		Type:      event.Type,
 		Data:      event.Data,
+		Metadata:  event.Metadata,
 		Timestamp: event.Timestamp,
 	}
 	m.events = append(m.events, stored)

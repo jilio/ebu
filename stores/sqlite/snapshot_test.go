@@ -296,8 +296,8 @@ func TestMigrateAutoOnNewStore(t *testing.T) {
 	if err := store.GetDB().QueryRow("SELECT MAX(version) FROM schema_version").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 3 {
-		t.Errorf("fresh store must be at schema version 3, got %d", version)
+	if version != 4 {
+		t.Errorf("fresh store must be at schema version 4, got %d", version)
 	}
 	// snapshots table is usable end to end.
 	if err := store.SaveSnapshot(context.Background(), "k", "1", json.RawMessage(`{}`)); err != nil {
@@ -308,15 +308,20 @@ func TestMigrateAutoOnNewStore(t *testing.T) {
 func TestMigrateV1ToCurrentUpgrade(t *testing.T) {
 	ctx := context.Background()
 	db := openRawDB(t)
-	// Simulate a v1 database: schema_version present at version 1, no snapshots.
-	if _, err := db.Exec("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at DATETIME DEFAULT CURRENT_TIMESTAMP)"); err != nil {
-		t.Fatal(err)
+	// Simulate a v1 database: the v1 tables exist, schema_version says 1,
+	// no snapshots table and no envelope columns yet.
+	v1Statements := []string{
+		"CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+		"CREATE TABLE events (position INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL, data BLOB NOT NULL, timestamp DATETIME NOT NULL)",
+		"INSERT INTO schema_version (version) VALUES (1)",
 	}
-	if _, err := db.Exec("INSERT INTO schema_version (version) VALUES (1)"); err != nil {
-		t.Fatal(err)
+	for _, stmt := range v1Statements {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
 	}
-	// RunMigrate sees version 1 and must skip v1, applying v2 (add snapshots)
-	// then v3 (drop the type index), ending at 3.
+	// RunMigrate sees version 1 and must skip v1, applying v2 (add snapshots),
+	// v3 (drop the type index) and v4 (envelope columns), ending at 4.
 	if err := sqlite.RunMigrate(ctx, db); err != nil {
 		t.Fatal(err)
 	}
@@ -324,11 +329,14 @@ func TestMigrateV1ToCurrentUpgrade(t *testing.T) {
 	if err := db.QueryRow("SELECT MAX(version) FROM schema_version").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 3 {
-		t.Errorf("v1 upgrade must reach 3, got %d", version)
+	if version != 4 {
+		t.Errorf("v1 upgrade must reach 4, got %d", version)
 	}
 	if _, err := db.Exec("INSERT INTO snapshots (snapshot_id, position, data) VALUES ('k', 1, x'00')"); err != nil {
 		t.Errorf("snapshots table missing after upgrade: %v", err)
+	}
+	if _, err := db.Exec("INSERT INTO events (type, data, timestamp, event_id, origin, metadata) VALUES ('t', x'00', CURRENT_TIMESTAMP, 'id', 'o', '{}')"); err != nil {
+		t.Errorf("envelope columns missing after upgrade: %v", err)
 	}
 }
 
@@ -345,8 +353,8 @@ func TestMigrateRunTwiceIdempotent(t *testing.T) {
 	if err := db.QueryRow("SELECT COUNT(*) FROM schema_version").Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if count != 3 { // exactly rows for v1, v2 and v3, no duplicates
-		t.Errorf("idempotent migrate must leave 3 version rows, got %d", count)
+	if count != 4 { // exactly rows for v1..v4, no duplicates
+		t.Errorf("idempotent migrate must leave 4 version rows, got %d", count)
 	}
 }
 

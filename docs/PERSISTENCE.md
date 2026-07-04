@@ -95,14 +95,17 @@ bus := eventbus.New(eventbus.WithStore(store))
 
 ### StoredEvent Structure
 
-Events are stored with metadata:
+Events are stored with an envelope:
 
 ```go
 type StoredEvent struct {
-    Offset    Offset          // Opaque position in the stream
-    Type      string          // Event type name (e.g., "main.UserCreatedEvent")
-    Data      json.RawMessage // JSON-encoded event data
-    Timestamp time.Time       // When the event was stored
+    Offset    Offset            // Opaque position in the stream
+    ID        string            // ULID assigned per publish (dedup/idempotency key)
+    Origin    string            // ID of the bus instance that published it
+    Type      string            // Event type name (e.g., "main.UserCreatedEvent")
+    Data      json.RawMessage   // JSON-encoded event data
+    Metadata  map[string]string // Publisher-supplied metadata (see ContextWithMetadata)
+    Timestamp time.Time         // When the event was stored
 }
 
 // Special offset constants
@@ -111,6 +114,24 @@ const (
     OffsetNewest Offset = "$"  // Current end of stream
 )
 ```
+
+The envelope makes at-least-once delivery workable in practice:
+
+- **`ID`** is a ULID minted once per publish, *before* the first `Append`
+  attempt — a store that retries a failed append writes the same ID, so
+  consumers can deduplicate on it. Handlers of live events can read it with
+  `EventIDFromContext(ctx)`.
+- **`Origin`** is the publishing bus instance's unique ID (`bus.OriginID()`),
+  letting consumers of a shared log tell their own events apart from a
+  peer process's.
+- **`Metadata`** carries correlation/causation IDs or any other tags:
+  attach with `ContextWithMetadata(ctx, map[string]string{...})` at publish,
+  read back via `StoredEvent.Metadata` or `MetadataFromContext(ctx)` in
+  live handlers.
+
+All three fields are optional on the wire (`omitempty`, nullable columns), so
+streams written by earlier ebu versions or external producers read back with
+empty envelope fields.
 
 `OffsetNewest` resolves, at call time, to the concrete current tail in every
 bundled store: reading from it returns no historical events and a concrete
@@ -338,7 +359,12 @@ eventbus.SubscribeWithReplay(ctx, bus, "analytics", analyticsHandler)
 
 ### EventStore Interface
 
-Implement this interface for custom storage backends:
+Implement this interface for custom storage backends. Persist the whole
+envelope — `ID`, `Origin`, and `Metadata` alongside `Type`/`Data`/`Timestamp`
+— and copy it back onto the `StoredEvent`s you return, or consumers lose
+their deduplication and correlation keys (the bundled stores all do this;
+the Postgres example below predates the envelope and stores only the core
+fields):
 
 ```go
 // EventStore is the core interface (2 methods)
