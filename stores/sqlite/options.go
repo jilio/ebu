@@ -22,6 +22,10 @@ type MetricsHook interface {
 // Option configures the SQLiteStore
 type Option func(*config)
 
+// defaultStreamBatchSize is the ReadStream batch size used when
+// WithStreamBatchSize is not given (or given a non-positive size).
+const defaultStreamBatchSize = 1000
+
 // config holds all configuration options
 type config struct {
 	path            string
@@ -35,8 +39,9 @@ type config struct {
 // defaultConfig returns the default configuration
 func defaultConfig() *config {
 	return &config{
-		busyTimeout: 5 * time.Second,
-		autoMigrate: true,
+		busyTimeout:     5 * time.Second,
+		autoMigrate:     true,
+		streamBatchSize: defaultStreamBatchSize,
 	}
 }
 
@@ -70,11 +75,21 @@ func WithMetricsHook(hook MetricsHook) Option {
 	}
 }
 
-// WithStreamBatchSize sets the batch size for LoadStream operations.
-// When > 0, events are fetched in batches of this size using LIMIT.
-// Default is 0 (no batching, fetch all matching rows at once).
+// WithStreamBatchSize sets the batch size for ReadStream operations.
+// Events are fetched in batches of this size using cursor-based pagination,
+// so a stream never pins a pooled connection and its WAL read snapshot for
+// the whole iteration. Default is 1000; a size <= 0 also selects the default.
+//
+// Semantics: batched iteration re-queries the database between batches, so
+// it observes events appended while the iteration is in progress. This
+// differs from an unbatched stream (a single query held open across the
+// iteration), which is a point-in-time snapshot of the log; unbatched mode
+// is not selectable through this option.
 func WithStreamBatchSize(size int) Option {
 	return func(c *config) {
+		if size <= 0 {
+			size = defaultStreamBatchSize
+		}
 		c.streamBatchSize = size
 	}
 }

@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -535,6 +537,102 @@ func TestConcurrentAccess(t *testing.T) {
 	}
 }
 
+// TestConcurrentAppendFileBacked is the file-backed twin of
+// TestConcurrentAccess. File-backed databases take SQLite's file locking
+// path, where a missing busy_timeout on pooled connections surfaces as
+// SQLITE_BUSY under concurrent writers — something the shared-cache
+// :memory: test cannot catch.
+func TestConcurrentAppendFileBacked(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "concurrent.db")
+
+	store, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	const numGoroutines = 10
+	const eventsPerGoroutine = 100
+
+	var successes atomic.Int64
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines)
+
+	for i := 0; i < numGoroutines; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < eventsPerGoroutine; j++ {
+				event := &eventbus.Event{
+					Type:      "ConcurrentEvent",
+					Data:      json.RawMessage(`{"test": true}`),
+					Timestamp: time.Now(),
+				}
+				if _, err := store.Append(ctx, event); err != nil {
+					t.Errorf("concurrent append failed: %v", err)
+					continue
+				}
+				successes.Add(1)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	expectedTotal := int64(numGoroutines * eventsPerGoroutine)
+	if got := successes.Load(); got != expectedTotal {
+		t.Fatalf("expected %d successful appends, got %d", expectedTotal, got)
+	}
+
+	events, _, err := store.Read(ctx, eventbus.OffsetOldest, 0)
+	if err != nil {
+		t.Fatalf("failed to read events: %v", err)
+	}
+	if int64(len(events)) != expectedTotal {
+		t.Fatalf("expected %d events, got %d", expectedTotal, len(events))
+	}
+
+	// Offsets must be strictly increasing.
+	var prev int64
+	for i, e := range events {
+		pos, err := strconv.ParseInt(string(e.Offset), 10, 64)
+		if err != nil {
+			t.Fatalf("failed to parse offset %q: %v", e.Offset, err)
+		}
+		if i > 0 && pos <= prev {
+			t.Fatalf("offsets not strictly increasing: %d after %d", pos, prev)
+		}
+		prev = pos
+	}
+}
+
+// TestConcurrentNewFileBacked opens the same file through several independent
+// pools at once (equivalent to separate processes racing New): every migrate
+// must succeed thanks to INSERT OR IGNORE version seeding and busy_timeout
+// reaching all connections via the DSN.
+func TestConcurrentNewFileBacked(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "concurrent_new.db")
+
+	const numStores = 5
+	var wg sync.WaitGroup
+	wg.Add(numStores)
+
+	for i := 0; i < numStores; i++ {
+		go func() {
+			defer wg.Done()
+			store, err := New(dbPath)
+			if err != nil {
+				t.Errorf("concurrent New failed: %v", err)
+				return
+			}
+			store.Close()
+		}()
+	}
+
+	wg.Wait()
+}
+
 func TestMetricsHook(t *testing.T) {
 	metrics := &testMetricsHook{}
 
@@ -885,6 +983,203 @@ func TestMigrateIdempotent(t *testing.T) {
 	}
 }
 
+// TestMigrationsVersionInsertIdempotent re-runs every migration step: the
+// INSERT OR IGNORE version seeding means a second run (e.g. two processes
+// that both read a stale version) succeeds instead of failing on the
+// schema_version primary key.
+func TestMigrationsVersionInsertIdempotent(t *testing.T) {
+	ctx := context.Background()
+
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "idem_versions.db"))
+	if err != nil {
+		t.Fatalf("failed to open db: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(createSchemaVersionTable); err != nil {
+		t.Fatalf("failed to create schema_version: %v", err)
+	}
+
+	for run := 0; run < 2; run++ {
+		if err := RunMigrateV1(ctx, db); err != nil {
+			t.Fatalf("v1 run %d: %v", run, err)
+		}
+		if err := RunMigrateV2(ctx, db); err != nil {
+			t.Fatalf("v2 run %d: %v", run, err)
+		}
+		if err := RunMigrateV3(ctx, db); err != nil {
+			t.Fatalf("v3 run %d: %v", run, err)
+		}
+	}
+
+	var count int
+	if err := db.QueryRow("SELECT COUNT(*) FROM schema_version").Scan(&count); err != nil {
+		t.Fatalf("failed to count versions: %v", err)
+	}
+	if count != currentSchemaVersion {
+		t.Errorf("expected %d version rows, got %d", currentSchemaVersion, count)
+	}
+}
+
+// TestMigrateV3DropsTypeIndex verifies the v3 migration removes the unused
+// idx_events_type index from a pre-v3 database.
+func TestMigrateV3DropsTypeIndex(t *testing.T) {
+	ctx := context.Background()
+
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "v3_drop.db"))
+	if err != nil {
+		t.Fatalf("failed to open db: %v", err)
+	}
+	defer db.Close()
+
+	// Simulate a v2-era database: v1 creates idx_events_type, v2 adds snapshots.
+	if _, err := db.Exec(createSchemaVersionTable); err != nil {
+		t.Fatalf("failed to create schema_version: %v", err)
+	}
+	if err := RunMigrateV1(ctx, db); err != nil {
+		t.Fatalf("v1: %v", err)
+	}
+	if err := RunMigrateV2(ctx, db); err != nil {
+		t.Fatalf("v2: %v", err)
+	}
+
+	const indexQuery = "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_events_type'"
+	var name string
+	if err := db.QueryRow(indexQuery).Scan(&name); err != nil {
+		t.Fatalf("expected idx_events_type to exist before v3: %v", err)
+	}
+
+	// migrate() sees version 2 and applies only v3.
+	if err := RunMigrate(ctx, db); err != nil {
+		t.Fatalf("migrate to v3: %v", err)
+	}
+
+	if err := db.QueryRow(indexQuery).Scan(&name); !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("expected idx_events_type to be dropped, got err=%v", err)
+	}
+
+	var version int
+	if err := db.QueryRow("SELECT MAX(version) FROM schema_version").Scan(&version); err != nil {
+		t.Fatalf("failed to read version: %v", err)
+	}
+	if version != currentSchemaVersion {
+		t.Errorf("expected schema version %d, got %d", currentSchemaVersion, version)
+	}
+}
+
+func TestMigrateV3Errors(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("begin tx error on closed db", func(t *testing.T) {
+		db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "v3_begin.db"))
+		if err != nil {
+			t.Fatalf("failed to open db: %v", err)
+		}
+		db.Close()
+
+		if err := RunMigrateV3(ctx, db); err == nil {
+			t.Error("expected begin transaction error on a closed db")
+		}
+	})
+
+	t.Run("exec error without schema_version", func(t *testing.T) {
+		db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "v3_exec.db"))
+		if err != nil {
+			t.Fatalf("failed to open db: %v", err)
+		}
+		defer db.Close()
+
+		// No schema_version table: the version insert must fail.
+		err = RunMigrateV3(ctx, db)
+		if err == nil {
+			t.Fatal("expected exec error without schema_version table")
+		}
+		if !strings.Contains(err.Error(), "exec schema") {
+			t.Errorf("expected 'exec schema' in error, got: %v", err)
+		}
+	})
+}
+
+// TestMemoryStorePinnedConnection proves a :memory: store survives the pool
+// dropping every non-pinned connection. Without the dedicated pinned
+// connection, SQLite destroys a shared-cache in-memory database as soon as
+// its last connection closes.
+func TestMemoryStorePinnedConnection(t *testing.T) {
+	store, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	for i := 0; i < 3; i++ {
+		event := &eventbus.Event{
+			Type:      "TestEvent",
+			Data:      json.RawMessage(`{}`),
+			Timestamp: time.Now(),
+		}
+		if _, err := store.Append(ctx, event); err != nil {
+			t.Fatalf("failed to append event: %v", err)
+		}
+	}
+
+	// Zero idle connections: every pooled connection is closed as soon as it
+	// is returned, so only the pinned connection keeps the database alive.
+	store.db.SetMaxIdleConns(0)
+	for i := 0; i < 5; i++ {
+		if _, _, err := store.Read(ctx, eventbus.OffsetOldest, 0); err != nil {
+			t.Fatalf("read %d after pool churn: %v", i, err)
+		}
+	}
+	store.db.SetMaxIdleConns(2)
+
+	events, _, err := store.Read(ctx, eventbus.OffsetOldest, 0)
+	if err != nil {
+		t.Fatalf("failed to read events: %v", err)
+	}
+	if len(events) != 3 {
+		t.Errorf("expected 3 events to survive pool churn, got %d", len(events))
+	}
+
+	// The store must still accept writes.
+	event := &eventbus.Event{
+		Type:      "TestEvent",
+		Data:      json.RawMessage(`{}`),
+		Timestamp: time.Now(),
+	}
+	if _, err := store.Append(ctx, event); err != nil {
+		t.Errorf("append after pool churn failed: %v", err)
+	}
+}
+
+func TestStreamBatchSizeDefaults(t *testing.T) {
+	cases := []struct {
+		name string
+		opts []Option
+		want int
+	}{
+		{"default", nil, defaultStreamBatchSize},
+		{"zero uses default", []Option{WithStreamBatchSize(0)}, defaultStreamBatchSize},
+		{"negative uses default", []Option{WithStreamBatchSize(-1)}, defaultStreamBatchSize},
+		{"positive is kept", []Option{WithStreamBatchSize(7)}, 7},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store, err := New(":memory:", tc.opts...)
+			if err != nil {
+				t.Fatalf("failed to create store: %v", err)
+			}
+			defer store.Close()
+
+			if store.cfg.streamBatchSize != tc.want {
+				t.Errorf("expected streamBatchSize %d, got %d", tc.want, store.cfg.streamBatchSize)
+			}
+		})
+	}
+}
+
 func TestNewFromDB_PrepareStatementsError(t *testing.T) {
 	db, err := sql.Open("sqlite", "file::memory:?mode=memory&cache=shared")
 	if err != nil {
@@ -904,6 +1199,10 @@ func TestReadStream(t *testing.T) {
 		t.Fatalf("failed to create store: %v", err)
 	}
 	defer store.Close()
+
+	// Batched streaming is the default; exercise the unbatched,
+	// point-in-time snapshot path explicitly.
+	store.cfg.streamBatchSize = 0
 
 	ctx := context.Background()
 
@@ -1052,6 +1351,7 @@ func TestReadStreamDBClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create store: %v", err)
 	}
+	store.cfg.streamBatchSize = 0 // exercise the unbatched error path
 
 	ctx := context.Background()
 
@@ -1389,13 +1689,10 @@ func BenchmarkConcurrentAppend(b *testing.B) {
 	})
 }
 
-func TestApplyPragmasError(t *testing.T) {
-	// To test applyPragmas error, we need a database that rejects pragmas
-	// This is typically a read-only database or one with issues
-
-	// Use a mock dbOpener that returns a db that fails on exec
+func TestNewPinMemoryConnError(t *testing.T) {
+	// Use a mock dbOpener that returns a closed db so pinning the dedicated
+	// in-memory connection fails.
 	SetDBOpener(func(driverName, dataSourceName string) (*sql.DB, error) {
-		// Open a real connection but close it immediately so pragmas fail
 		db, err := sql.Open(driverName, dataSourceName)
 		if err != nil {
 			return nil, err
@@ -1407,10 +1704,205 @@ func TestApplyPragmasError(t *testing.T) {
 
 	_, err := New(":memory:")
 	if err == nil {
-		t.Fatal("expected error when applying pragmas")
+		t.Fatal("expected error when pinning the memory connection")
 	}
-	if !strings.Contains(err.Error(), "apply pragmas") {
-		t.Errorf("expected 'apply pragmas' in error, got: %v", err)
+	if !strings.Contains(err.Error(), "pin memory connection") {
+		t.Errorf("expected 'pin memory connection' in error, got: %v", err)
+	}
+}
+
+func TestNewEnableWALError(t *testing.T) {
+	// A closed db makes the journal_mode pragma fail with a non-busy error,
+	// which must be returned immediately (no retry loop).
+	SetDBOpener(func(driverName, dataSourceName string) (*sql.DB, error) {
+		db, err := sql.Open(driverName, dataSourceName)
+		if err != nil {
+			return nil, err
+		}
+		db.Close()
+		return db, nil
+	})
+	defer ResetDBOpener()
+
+	_, err := New(filepath.Join(t.TempDir(), "wal_error.db"))
+	if err == nil {
+		t.Fatal("expected error when enabling WAL")
+	}
+	if !strings.Contains(err.Error(), "enable WAL") {
+		t.Errorf("expected 'enable WAL' in error, got: %v", err)
+	}
+}
+
+// TestNewMemoryMigrateError forces a migrate failure AFTER the in-memory
+// connection was pinned, proving New releases the pin on that path.
+func TestNewMemoryMigrateError(t *testing.T) {
+	// The opener returns a working db pre-poisoned with a bad schema_version
+	// table so migrate's version query fails.
+	SetDBOpener(func(driverName, dataSourceName string) (*sql.DB, error) {
+		db, err := sql.Open(driverName, dataSourceName)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := db.Exec("CREATE TABLE schema_version (bad_column TEXT)"); err != nil {
+			db.Close()
+			return nil, err
+		}
+		return db, nil
+	})
+	defer ResetDBOpener()
+
+	_, err := New(":memory:")
+	if err == nil {
+		t.Fatal("expected error when migration fails on an in-memory store")
+	}
+	if !strings.Contains(err.Error(), "migrate") {
+		t.Errorf("expected 'migrate' in error, got: %v", err)
+	}
+}
+
+// TestNewFromDBClosesPinnedConn verifies newFromDB releases the pinned
+// in-memory connection when preparing statements fails.
+func TestNewFromDBClosesPinnedConn(t *testing.T) {
+	db, err := sql.Open("sqlite", fmt.Sprintf("file:ebu_test_pin_%d?mode=memory&cache=shared", time.Now().UnixNano()))
+	if err != nil {
+		t.Fatalf("failed to open db: %v", err)
+	}
+
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("failed to pin conn: %v", err)
+	}
+	db.Close() // prepareStatements must now fail
+
+	if _, err := newFromDB(db, defaultConfig(), conn); err == nil {
+		t.Fatal("expected error when db is closed")
+	}
+
+	// The pinned connection must have been released.
+	if err := conn.PingContext(context.Background()); !errors.Is(err, sql.ErrConnDone) {
+		t.Errorf("expected pinned conn to be closed (ErrConnDone), got %v", err)
+	}
+}
+
+// TestEnableWALRetriesWhileBusy holds the write lock on a rollback-journal
+// database while enableWAL runs, proving the SQLITE_BUSY retry loop rides out
+// the conversion window and succeeds once the lock is released.
+func TestEnableWALRetriesWhileBusy(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "wal_retry.db")
+
+	db1, err := sql.Open("sqlite", "file:"+dbPath)
+	if err != nil {
+		t.Fatalf("open db1: %v", err)
+	}
+	defer db1.Close()
+	if _, err := db1.Exec("CREATE TABLE t (x INTEGER)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	tx, err := db1.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if _, err := tx.Exec("INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatalf("insert in tx: %v", err)
+	}
+
+	db2, err := sql.Open("sqlite", "file:"+dbPath) // no busy_timeout: fails fast
+	if err != nil {
+		t.Fatalf("open db2: %v", err)
+	}
+	defer db2.Close()
+
+	done := make(chan error, 1)
+	go func() { done <- enableWAL(db2, 10*time.Second) }()
+
+	time.Sleep(50 * time.Millisecond) // let enableWAL hit SQLITE_BUSY and retry
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+
+	if err := <-done; err != nil {
+		t.Fatalf("enableWAL must succeed once the writer releases: %v", err)
+	}
+
+	var mode string
+	if err := db2.QueryRow("PRAGMA journal_mode").Scan(&mode); err != nil {
+		t.Fatalf("query journal_mode: %v", err)
+	}
+	if mode != "wal" {
+		t.Errorf("expected journal_mode wal, got %q", mode)
+	}
+}
+
+// TestMigratePropagatesV2Error drives a migrateV2 failure THROUGH migrate()
+// (a v1 database) so the ordered-migration error return is exercised.
+func TestMigratePropagatesV2Error(t *testing.T) {
+	ctx := context.Background()
+
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "v2_propagate.db"))
+	if err != nil {
+		t.Fatalf("failed to open db: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(createSchemaVersionTable); err != nil {
+		t.Fatalf("failed to create schema_version: %v", err)
+	}
+	if _, err := db.Exec("INSERT INTO schema_version (version) VALUES (1)"); err != nil {
+		t.Fatalf("failed to seed version: %v", err)
+	}
+	// An INDEX named "snapshots" collides with migrateV2's CREATE TABLE.
+	if _, err := db.Exec("CREATE TABLE base (x INTEGER); CREATE INDEX snapshots ON base(x)"); err != nil {
+		t.Fatalf("failed to create colliding index: %v", err)
+	}
+
+	if err := RunMigrate(ctx, db); err == nil {
+		t.Fatal("expected migrate to propagate the v2 failure")
+	}
+}
+
+func TestIsBusy(t *testing.T) {
+	if isBusy(errors.New("not a sqlite error")) {
+		t.Error("plain errors must not be busy")
+	}
+	if isBusy(nil) {
+		t.Error("nil must not be busy")
+	}
+
+	// Produce a genuine SQLITE_BUSY: one connection holds the write lock in
+	// an open transaction while another (with no busy timeout) tries to write.
+	dbPath := filepath.Join(t.TempDir(), "busy.db")
+
+	db1, err := sql.Open("sqlite", "file:"+dbPath)
+	if err != nil {
+		t.Fatalf("open db1: %v", err)
+	}
+	defer db1.Close()
+	if _, err := db1.Exec("CREATE TABLE t (x INTEGER)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	tx, err := db1.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec("INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatalf("insert in tx: %v", err)
+	}
+
+	db2, err := sql.Open("sqlite", "file:"+dbPath)
+	if err != nil {
+		t.Fatalf("open db2: %v", err)
+	}
+	defer db2.Close()
+
+	_, err = db2.Exec("INSERT INTO t VALUES (2)")
+	if err == nil {
+		t.Fatal("expected SQLITE_BUSY from the concurrent write")
+	}
+	if !isBusy(err) {
+		t.Errorf("expected isBusy(true) for %v", err)
 	}
 }
 
@@ -1570,6 +2062,7 @@ func TestReadStreamWithLoggerNonBatched(t *testing.T) {
 		t.Fatalf("failed to create store: %v", err)
 	}
 	defer store.Close()
+	store.cfg.streamBatchSize = 0 // exercise the unbatched logger path
 
 	ctx := context.Background()
 

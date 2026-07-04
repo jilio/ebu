@@ -65,6 +65,32 @@
 //	// Access materialized state
 //	user, ok := users.Get("user:123")
 //
+// Events that are not state protocol messages (they carry no "headers" field)
+// are skipped during materialization, so state messages can share a stream
+// with regular events — even with strict schema validation enabled.
+//
+// # Snapshots and Compaction
+//
+// For high-churn streams, replaying from the beginning on every start gets
+// expensive. When the event store implements eventbus.EventStoreSnapshotter,
+// the materializer can persist its collections and resume from the snapshot:
+//
+//	// On startup: restore the snapshot, then replay only the tail.
+//	offset, err := mat.LoadSnapshotFrom(ctx, snapshotter, "users")
+//	if err != nil { ... }
+//	mat.Replay(ctx, bus, offset)
+//
+//	// Periodically: persist the current state.
+//	if err := mat.SaveSnapshotTo(ctx, snapshotter, "users"); err != nil { ... }
+//
+//	// Optionally, once the snapshot is durably saved, compact the log:
+//	if tr, ok := bus.GetStore().(eventbus.EventStoreTruncator); ok {
+//	    tr.TruncateBefore(ctx, offset) // offset the snapshot was saved at
+//	}
+//
+// Truncation is only safe once the snapshot is durably saved and no other
+// reader or subscription still needs the truncated prefix.
+//
 // # Custom Type Names
 //
 // Entity types can implement TypeNamer for stable, explicit type names:

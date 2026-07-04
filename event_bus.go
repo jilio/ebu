@@ -68,6 +68,10 @@ type EventBus struct {
 	asyncCond  *sync.Cond
 	asyncCount int
 
+	// asyncSem, when non-nil, bounds the number of concurrently running
+	// async handler goroutines (see WithAsyncHandlerLimit).
+	asyncSem chan struct{}
+
 	// Optional persistence fields (nil if not using persistence)
 	store                   EventStore
 	subscriptionStore       SubscriptionStore
@@ -167,13 +171,17 @@ type Observability interface {
 
 	// OnHandlerComplete is called after a handler completes.
 	// The error parameter is non-nil if the handler panicked.
-	OnHandlerComplete(ctx context.Context, duration time.Duration, err error)
+	OnHandlerComplete(ctx context.Context, eventType string, duration time.Duration, err error)
 
-	// OnPersistStart is called before persisting an event.
-	OnPersistStart(ctx context.Context, eventType string, position int64) context.Context
+	// OnPersistStart is called before persisting an event. The assigned
+	// offset is not known yet at this point; it is reported to
+	// OnPersistComplete instead.
+	OnPersistStart(ctx context.Context, eventType string) context.Context
 
-	// OnPersistComplete is called after persisting an event.
-	OnPersistComplete(ctx context.Context, duration time.Duration, err error)
+	// OnPersistComplete is called after persisting an event. On success,
+	// offset is the offset the store assigned; on failure it is empty and
+	// err is non-nil.
+	OnPersistComplete(ctx context.Context, eventType string, duration time.Duration, offset Offset, err error)
 }
 
 // Option is a function that configures the EventBus
@@ -409,9 +417,19 @@ func PublishContext[T any](bus *EventBus, ctx context.Context, event T) {
 		}
 
 		if h.async {
+			// Bounded async concurrency: acquire a slot before spawning.
+			// This intentionally blocks the publisher when the limit is
+			// reached so a publish spike cannot create an unbounded number
+			// of goroutines (see WithAsyncHandlerLimit).
+			if bus.asyncSem != nil {
+				bus.asyncSem <- struct{}{}
+			}
 			bus.asyncStarted()
 			go func(handler *internalHandler) {
 				defer bus.asyncFinished()
+				if bus.asyncSem != nil {
+					defer func() { <-bus.asyncSem }()
+				}
 
 				// Once handlers always run: their execution slot was already
 				// consumed by the CAS above, so skipping here would silently
@@ -547,7 +565,7 @@ func callHandlerWithContext[T any](h *internalHandler, ctx context.Context, even
 		}
 		// Observability: Track handler complete
 		if obs != nil {
-			obs.OnHandlerComplete(ctx, duration, panicErr)
+			obs.OnHandlerComplete(ctx, eventTypeName, duration, panicErr)
 		}
 	}()
 
@@ -670,6 +688,20 @@ func WithObservability(obs Observability) Option {
 	}
 }
 
+// WithAsyncHandlerLimit bounds the number of concurrently running async
+// handler goroutines. When the limit is reached, Publish blocks until a
+// running async handler finishes, providing backpressure instead of
+// unbounded goroutine growth during publish spikes.
+//
+// A limit <= 0 means unlimited (the default).
+func WithAsyncHandlerLimit(n int) Option {
+	return func(bus *EventBus) {
+		if n > 0 {
+			bus.asyncSem = make(chan struct{}, n)
+		}
+	}
+}
+
 // Shutdown gracefully shuts down the event bus, waiting for async handlers to complete.
 // It respects the context timeout/cancellation.
 // If the store implements io.Closer, its Close() method will be called after handlers complete.
@@ -697,8 +729,13 @@ func (bus *EventBus) Shutdown(ctx context.Context) error {
 }
 
 // Backward compatibility methods
+//
+// The Set* methods below write bus fields without synchronization. They are
+// intended for configuration before the bus is shared across goroutines;
+// calling them concurrently with Publish is a data race.
 
 // SetPanicHandler sets the panic handler.
+// Not safe to call concurrently with Publish; configure before use.
 //
 // Deprecated: use the WithPanicHandler option with New instead.
 func (bus *EventBus) SetPanicHandler(handler PanicHandler) {
@@ -706,6 +743,7 @@ func (bus *EventBus) SetPanicHandler(handler PanicHandler) {
 }
 
 // SetBeforePublishHook sets the before publish hook.
+// Not safe to call concurrently with Publish; configure before use.
 //
 // Deprecated: use the WithBeforePublish option with New instead.
 func (bus *EventBus) SetBeforePublishHook(hook PublishHook) {
@@ -713,13 +751,15 @@ func (bus *EventBus) SetBeforePublishHook(hook PublishHook) {
 }
 
 // SetAfterPublishHook sets the after publish hook.
+// Not safe to call concurrently with Publish; configure before use.
 //
 // Deprecated: use the WithAfterPublish option with New instead.
 func (bus *EventBus) SetAfterPublishHook(hook PublishHook) {
 	bus.afterPublish = hook
 }
 
-// SetPersistenceErrorHandler sets the persistence error handler (for runtime configuration)
+// SetPersistenceErrorHandler sets the persistence error handler (for runtime configuration).
+// Not safe to call concurrently with Publish; configure before use.
 func (bus *EventBus) SetPersistenceErrorHandler(handler PersistenceErrorHandler) {
 	bus.persistenceErrorHandler = handler
 }

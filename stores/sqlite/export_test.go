@@ -22,10 +22,21 @@ func RunMigrateV2(ctx context.Context, db *sql.DB) error {
 	return migrateV2(ctx, db)
 }
 
+// RunMigrateV3 runs v3 migration on a database (exported for testing)
+func RunMigrateV3(ctx context.Context, db *sql.DB) error {
+	return migrateV3(ctx, db)
+}
+
+// SetStreamBatchSize overrides the stream batch size (exported for testing).
+// A value <= 0 forces the unbatched, point-in-time snapshot stream path.
+func (s *SQLiteStore) SetStreamBatchSize(size int) {
+	s.cfg.streamBatchSize = size
+}
+
 // NewFromDB creates a store from an existing db connection (exported for testing)
 // This allows testing the error path in newFromDB when prepareStatements fails
 func NewFromDB(db *sql.DB) (*SQLiteStore, error) {
-	return newFromDB(db, defaultConfig())
+	return newFromDB(db, defaultConfig(), nil)
 }
 
 // SetDBOpener sets the database opener function (for testing)

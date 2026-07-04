@@ -2623,15 +2623,21 @@ func TestWithObservability(t *testing.T) {
 			mock.handlerStartCalled = true
 			return ctx
 		},
-		onHandlerComplete: func(ctx context.Context, duration time.Duration, err error) {
+		onHandlerComplete: func(ctx context.Context, eventType string, duration time.Duration, err error) {
 			mock.handlerCompleteCalled = true
 		},
-		onPersistStart: func(ctx context.Context, eventType string, position int64) context.Context {
+		onPersistStart: func(ctx context.Context, eventType string) context.Context {
 			mock.persistStartCalled = true
 			return ctx
 		},
-		onPersistComplete: func(ctx context.Context, duration time.Duration, err error) {
+		onPersistComplete: func(ctx context.Context, eventType string, duration time.Duration, offset Offset, err error) {
 			mock.persistCompleteCalled = true
+			if err == nil && offset == "" {
+				t.Error("OnPersistComplete: expected non-empty offset on success")
+			}
+			if eventType == "" {
+				t.Error("OnPersistComplete: expected non-empty event type")
+			}
 		},
 	}
 
@@ -2686,9 +2692,9 @@ type testObservability struct {
 	onPublishStart    func(ctx context.Context, eventType string, event any) context.Context
 	onPublishComplete func(ctx context.Context, eventType string)
 	onHandlerStart    func(ctx context.Context, eventType string, async bool) context.Context
-	onHandlerComplete func(ctx context.Context, duration time.Duration, err error)
-	onPersistStart    func(ctx context.Context, eventType string, position int64) context.Context
-	onPersistComplete func(ctx context.Context, duration time.Duration, err error)
+	onHandlerComplete func(ctx context.Context, eventType string, duration time.Duration, err error)
+	onPersistStart    func(ctx context.Context, eventType string) context.Context
+	onPersistComplete func(ctx context.Context, eventType string, duration time.Duration, offset Offset, err error)
 }
 
 func (t *testObservability) OnPublishStart(ctx context.Context, eventType string, event any) context.Context {
@@ -2711,22 +2717,22 @@ func (t *testObservability) OnHandlerStart(ctx context.Context, eventType string
 	return ctx
 }
 
-func (t *testObservability) OnHandlerComplete(ctx context.Context, duration time.Duration, err error) {
+func (t *testObservability) OnHandlerComplete(ctx context.Context, eventType string, duration time.Duration, err error) {
 	if t.onHandlerComplete != nil {
-		t.onHandlerComplete(ctx, duration, err)
+		t.onHandlerComplete(ctx, eventType, duration, err)
 	}
 }
 
-func (t *testObservability) OnPersistStart(ctx context.Context, eventType string, position int64) context.Context {
+func (t *testObservability) OnPersistStart(ctx context.Context, eventType string) context.Context {
 	if t.onPersistStart != nil {
-		return t.onPersistStart(ctx, eventType, position)
+		return t.onPersistStart(ctx, eventType)
 	}
 	return ctx
 }
 
-func (t *testObservability) OnPersistComplete(ctx context.Context, duration time.Duration, err error) {
+func (t *testObservability) OnPersistComplete(ctx context.Context, eventType string, duration time.Duration, offset Offset, err error) {
 	if t.onPersistComplete != nil {
-		t.onPersistComplete(ctx, duration, err)
+		t.onPersistComplete(ctx, eventType, duration, offset, err)
 	}
 }
 

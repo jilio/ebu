@@ -90,18 +90,13 @@ func (r *upcastRegistry) hasCycleDFS(current, target string, visited map[string]
 	return false
 }
 
-// apply attempts to apply upcasts to transform data to the latest version
+// apply attempts to apply upcasts to transform data to the latest version.
+//
+// The registry lock is only held for map lookups, never while a user upcast
+// function runs: upcast functions may therefore safely call back into the
+// registry (e.g. RegisterUpcast) without deadlocking. A registration that
+// races with apply may or may not be observed by the in-flight chain.
 func (r *upcastRegistry) apply(data json.RawMessage, eventType string) (json.RawMessage, string, error) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	// Check if there are any upcasters for this type
-	upcasters, exists := r.upcasters[eventType]
-	if !exists || len(upcasters) == 0 {
-		return data, eventType, nil // No upcasting needed
-	}
-
-	// Apply upcasts in chain
 	currentData := data
 	currentType := eventType
 	appliedTypes := make(map[string]bool) // Prevent infinite loops
@@ -110,14 +105,22 @@ func (r *upcastRegistry) apply(data json.RawMessage, eventType string) (json.Raw
 		// Mark this type as processed
 		appliedTypes[currentType] = true
 
-		// Find upcasters for current type
-		upcasters, exists := r.upcasters[currentType]
-		if !exists || len(upcasters) == 0 {
+		// Find the next upcaster and snapshot the error handler under the
+		// read lock; user code runs after the lock is released.
+		r.mu.RLock()
+		var upcaster Upcaster
+		found := false
+		if ups := r.upcasters[currentType]; len(ups) > 0 {
+			// Apply the first available upcaster (could be enhanced to choose best path)
+			upcaster = ups[0]
+			found = true
+		}
+		errorHandler := r.errorHandler
+		r.mu.RUnlock()
+
+		if !found {
 			break // No more upcasts available
 		}
-
-		// Apply the first available upcaster (could be enhanced to choose best path)
-		upcaster := upcasters[0]
 
 		// Check for loops
 		if appliedTypes[upcaster.ToType] {
@@ -127,8 +130,8 @@ func (r *upcastRegistry) apply(data json.RawMessage, eventType string) (json.Raw
 		// Apply the upcast
 		newData, newType, err := upcaster.Upcast(currentData)
 		if err != nil {
-			if r.errorHandler != nil {
-				r.errorHandler(currentType, currentData, err)
+			if errorHandler != nil {
+				errorHandler(currentType, currentData, err)
 			}
 			return data, eventType, fmt.Errorf("eventbus: upcast failed from %s to %s: %w",
 				upcaster.FromType, upcaster.ToType, err)
@@ -208,16 +211,25 @@ func WithUpcast(fromType, toType string, upcast UpcastFunc) Option {
 	}
 }
 
+// setErrorHandler sets the error handler under the registry lock so it is
+// safe to call concurrently with apply.
+func (r *upcastRegistry) setErrorHandler(handler UpcastErrorHandler) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.errorHandler = handler
+}
+
 // WithUpcastErrorHandler sets the error handler for upcast failures
 func WithUpcastErrorHandler(handler UpcastErrorHandler) Option {
 	return func(bus *EventBus) {
-		bus.upcastRegistry.errorHandler = handler
+		bus.upcastRegistry.setErrorHandler(handler)
 	}
 }
 
-// SetUpcastErrorHandler sets the upcast error handler at runtime
+// SetUpcastErrorHandler sets the upcast error handler at runtime.
+// Safe to call concurrently with replay/publish.
 func (bus *EventBus) SetUpcastErrorHandler(handler UpcastErrorHandler) {
-	bus.upcastRegistry.errorHandler = handler
+	bus.upcastRegistry.setErrorHandler(handler)
 }
 
 // ClearUpcasts removes all registered upcasters

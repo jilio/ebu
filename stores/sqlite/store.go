@@ -13,7 +13,8 @@ import (
 	"time"
 
 	eventbus "github.com/jilio/ebu"
-	_ "modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite"
+	sqlite3lib "modernc.org/sqlite/lib"
 )
 
 // SQLiteStore implements eventbus.EventStore using SQLite.
@@ -24,6 +25,12 @@ type SQLiteStore struct {
 	cfg         *config
 	logger      Logger
 	metricsHook MetricsHook
+
+	// memConn pins one dedicated connection for :memory: stores. A
+	// shared-cache in-memory database is destroyed the moment its last
+	// connection closes, so without this pin the store would silently lose
+	// all data if the pool ever drained to zero idle connections.
+	memConn *sql.Conn
 
 	// Prepared statements
 	appendStmt       *sql.Stmt
@@ -70,50 +77,55 @@ func New(path string, opts ...Option) (*SQLiteStore, error) {
 		opt(cfg)
 	}
 
-	// Build connection string with pragmas
-	var dsn string
-	if cfg.path == ":memory:" {
-		// Shared cache mode lets database/sql's pooled connections see the
-		// same in-memory database. Each store gets a unique name so two
-		// independent :memory: stores in the same process don't share data.
-		dsn = fmt.Sprintf("file:ebu_memdb_%d?mode=memory&cache=shared", memDBCounter.Add(1))
-	} else {
-		dsn = fmt.Sprintf("file:%s?_busy_timeout=%d", cfg.path, cfg.busyTimeout.Milliseconds())
-	}
-
-	db, err := dbOpener("sqlite", dsn)
+	db, err := dbOpener("sqlite", buildDSN(cfg))
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: open database: %w", err)
 	}
 
-	// Apply pragmas for performance
-	// Errors here indicate filesystem issues (read-only, permissions)
-	if err := applyPragmas(db, cfg); err != nil {
+	// Pin a dedicated connection for in-memory stores so the shared-cache
+	// database survives even if the pool otherwise drops to zero connections.
+	var memConn *sql.Conn
+	if cfg.path == ":memory:" {
+		memConn, err = db.Conn(context.Background())
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("sqlite: pin memory connection: %w", err)
+		}
+	} else if err := enableWAL(db, cfg.busyTimeout); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("sqlite: apply pragmas: %w", err)
+		return nil, fmt.Errorf("sqlite: enable WAL: %w", err)
 	}
 
 	// Run migrations if enabled
 	if cfg.autoMigrate {
 		if err := migrate(context.Background(), db); err != nil {
+			if memConn != nil {
+				memConn.Close()
+			}
 			db.Close()
 			return nil, fmt.Errorf("sqlite: migrate: %w", err)
 		}
 	}
 
-	return newFromDB(db, cfg)
+	return newFromDB(db, cfg, memConn)
 }
 
-// newFromDB creates a SQLiteStore from an existing database connection
-func newFromDB(db *sql.DB, cfg *config) (*SQLiteStore, error) {
+// newFromDB creates a SQLiteStore from an existing database connection.
+// memConn, if non-nil, is the pinned in-memory connection; on failure it is
+// released along with db.
+func newFromDB(db *sql.DB, cfg *config, memConn *sql.Conn) (*SQLiteStore, error) {
 	store := &SQLiteStore{
 		db:          db,
 		cfg:         cfg,
 		logger:      cfg.logger,
 		metricsHook: cfg.metricsHook,
+		memConn:     memConn,
 	}
 
 	if err := store.prepareStatements(); err != nil {
+		if memConn != nil {
+			memConn.Close()
+		}
 		db.Close()
 		return nil, fmt.Errorf("sqlite: prepare statements: %w", err)
 	}
@@ -121,24 +133,65 @@ func newFromDB(db *sql.DB, cfg *config) (*SQLiteStore, error) {
 	return store, nil
 }
 
-// applyPragmas configures SQLite for optimal performance
-func applyPragmas(db *sql.DB, cfg *config) error {
+// buildDSN constructs the modernc.org/sqlite connection string.
+//
+// Pragmas are connection-scoped in SQLite, and database/sql maintains a pool
+// of connections, so they must travel as modernc `_pragma=` DSN parameters —
+// that way the driver applies them to EVERY pooled connection. Applying them
+// via db.Exec would configure only whichever single connection the pool
+// happened to hand out (leaving the rest without e.g. busy_timeout, which
+// made concurrent appends fail with SQLITE_BUSY).
+func buildDSN(cfg *config) string {
+	if cfg.path == ":memory:" {
+		// Shared cache mode lets database/sql's pooled connections see the
+		// same in-memory database. Each store gets a unique name so two
+		// independent :memory: stores in the same process don't share data.
+		return fmt.Sprintf("file:ebu_memdb_%d?mode=memory&cache=shared", memDBCounter.Add(1))
+	}
+
 	pragmas := []string{
-		"PRAGMA journal_mode = WAL",
-		"PRAGMA synchronous = NORMAL",
-		"PRAGMA cache_size = -64000", // 64MB cache
-		fmt.Sprintf("PRAGMA busy_timeout = %d", cfg.busyTimeout.Milliseconds()),
-		"PRAGMA temp_store = MEMORY",
-		"PRAGMA mmap_size = 268435456", // 256MB mmap
+		fmt.Sprintf("busy_timeout(%d)", cfg.busyTimeout.Milliseconds()),
+		"synchronous(NORMAL)",
+		"cache_size(-64000)", // 64MB cache
+		"temp_store(MEMORY)",
+		"mmap_size(268435456)", // 256MB mmap
 	}
 
-	for _, pragma := range pragmas {
-		if _, err := db.Exec(pragma); err != nil {
-			return fmt.Errorf("exec %q: %w", pragma, err)
+	params := make([]string, 0, len(pragmas)+1)
+	// Immediate transactions take the write lock at BEGIN (honoring
+	// busy_timeout) instead of upgrading mid-transaction, which can return
+	// SQLITE_BUSY immediately. Only migrations use transactions here.
+	params = append(params, "_txlock=immediate")
+	for _, p := range pragmas {
+		params = append(params, "_pragma="+p)
+	}
+
+	return fmt.Sprintf("file:%s?%s", cfg.path, strings.Join(params, "&"))
+}
+
+// enableWAL switches a file-backed database to WAL journaling. Unlike the
+// connection-scoped pragmas in buildDSN, journal_mode is database-scoped and
+// persists in the file, so a one-time db.Exec is the right scope. The initial
+// rollback-to-WAL conversion needs an exclusive lock and — unlike ordinary
+// writes — fails with SQLITE_BUSY without consulting the busy handler when
+// several processes race it, so busy errors are retried until timeout; the
+// losers of the race then see an already-WAL file and no-op.
+func enableWAL(db *sql.DB, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		_, err := db.Exec("PRAGMA journal_mode = WAL")
+		if err == nil || !isBusy(err) || time.Now().After(deadline) {
+			return err
 		}
+		time.Sleep(time.Millisecond)
 	}
+}
 
-	return nil
+// isBusy reports whether err is SQLITE_BUSY (including extended busy codes
+// such as SQLITE_BUSY_RECOVERY, whose low byte is the primary code).
+func isBusy(err error) bool {
+	var serr *sqlite3.Error
+	return errors.As(err, &serr) && serr.Code()&0xff == sqlite3lib.SQLITE_BUSY
 }
 
 // prepareStatements prepares all SQL statements
@@ -347,9 +400,6 @@ func (s *SQLiteStore) LoadOffset(ctx context.Context, subscriptionID string) (ev
 	return formatOffset(position), nil
 }
 
-// Close closes the database connection and releases resources.
-// Prepared statement close errors are ignored as they cannot fail in practice
-// with SQLite (the driver handles cleanup when the connection closes).
 // SaveSnapshot upserts the compaction snapshot for snapshotID, recording that
 // blob reflects the projection as of (and including) atOffset.
 func (s *SQLiteStore) SaveSnapshot(ctx context.Context, snapshotID string, atOffset eventbus.Offset, blob json.RawMessage) error {
@@ -402,6 +452,9 @@ func (s *SQLiteStore) TruncateBefore(ctx context.Context, beforeOffset eventbus.
 	return deleted, nil
 }
 
+// Close closes the database connection and releases resources.
+// Prepared statement close errors are ignored as they cannot fail in practice
+// with SQLite (the driver handles cleanup when the connection closes).
 func (s *SQLiteStore) Close() error {
 	// Close prepared statements - errors ignored as db.Close() handles cleanup
 	stmts := []*sql.Stmt{
@@ -423,11 +476,21 @@ func (s *SQLiteStore) Close() error {
 		s.logger.Info("closing sqlite store")
 	}
 
+	// Release the pinned in-memory connection (if any) so db.Close() can
+	// actually tear the pool down.
+	if s.memConn != nil {
+		s.memConn.Close()
+	}
+
 	return s.db.Close()
 }
 
 // ReadStream implements eventbus.EventStoreStreamer for memory-efficient event streaming.
 // It uses cursor-based iteration, keeping only one row in memory at a time.
+// By default events are fetched in batches (see WithStreamBatchSize), so a
+// stream does not pin a pooled connection and its WAL read snapshot for the
+// whole iteration; as a consequence, batched iteration may observe events
+// appended while the iteration is in progress.
 // The database rows are properly closed when:
 // - The iteration completes naturally
 // - The consumer breaks out of the range loop

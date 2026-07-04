@@ -285,9 +285,9 @@ func TestTruncateBeforeExecError(t *testing.T) {
 	}
 }
 
-func TestMigrateV2AutoOnNewStore(t *testing.T) {
+func TestMigrateAutoOnNewStore(t *testing.T) {
 	dir := t.TempDir()
-	store, err := sqlite.New(filepath.Join(dir, "v2.db"))
+	store, err := sqlite.New(filepath.Join(dir, "fresh.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -296,8 +296,8 @@ func TestMigrateV2AutoOnNewStore(t *testing.T) {
 	if err := store.GetDB().QueryRow("SELECT MAX(version) FROM schema_version").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 2 {
-		t.Errorf("fresh store must be at schema version 2, got %d", version)
+	if version != 3 {
+		t.Errorf("fresh store must be at schema version 3, got %d", version)
 	}
 	// snapshots table is usable end to end.
 	if err := store.SaveSnapshot(context.Background(), "k", "1", json.RawMessage(`{}`)); err != nil {
@@ -305,7 +305,7 @@ func TestMigrateV2AutoOnNewStore(t *testing.T) {
 	}
 }
 
-func TestMigrateV1ToV2Upgrade(t *testing.T) {
+func TestMigrateV1ToCurrentUpgrade(t *testing.T) {
 	ctx := context.Background()
 	db := openRawDB(t)
 	// Simulate a v1 database: schema_version present at version 1, no snapshots.
@@ -315,7 +315,8 @@ func TestMigrateV1ToV2Upgrade(t *testing.T) {
 	if _, err := db.Exec("INSERT INTO schema_version (version) VALUES (1)"); err != nil {
 		t.Fatal(err)
 	}
-	// RunMigrate sees version 1 and must apply only v2 (add snapshots, bump to 2).
+	// RunMigrate sees version 1 and must skip v1, applying v2 (add snapshots)
+	// then v3 (drop the type index), ending at 3.
 	if err := sqlite.RunMigrate(ctx, db); err != nil {
 		t.Fatal(err)
 	}
@@ -323,15 +324,15 @@ func TestMigrateV1ToV2Upgrade(t *testing.T) {
 	if err := db.QueryRow("SELECT MAX(version) FROM schema_version").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 2 {
-		t.Errorf("v1->v2 upgrade must reach 2, got %d", version)
+	if version != 3 {
+		t.Errorf("v1 upgrade must reach 3, got %d", version)
 	}
 	if _, err := db.Exec("INSERT INTO snapshots (snapshot_id, position, data) VALUES ('k', 1, x'00')"); err != nil {
 		t.Errorf("snapshots table missing after upgrade: %v", err)
 	}
 }
 
-func TestMigrateV2Idempotent(t *testing.T) {
+func TestMigrateRunTwiceIdempotent(t *testing.T) {
 	ctx := context.Background()
 	db := openRawDB(t)
 	if err := sqlite.RunMigrate(ctx, db); err != nil {
@@ -344,8 +345,8 @@ func TestMigrateV2Idempotent(t *testing.T) {
 	if err := db.QueryRow("SELECT COUNT(*) FROM schema_version").Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if count != 2 { // exactly rows for v1 and v2, no duplicates
-		t.Errorf("idempotent migrate must leave 2 version rows, got %d", count)
+	if count != 3 { // exactly rows for v1, v2 and v3, no duplicates
+		t.Errorf("idempotent migrate must leave 3 version rows, got %d", count)
 	}
 }
 
@@ -355,13 +356,14 @@ func TestMigrateV2ExecSchemaError(t *testing.T) {
 	if _, err := db.Exec("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at DATETIME)"); err != nil {
 		t.Fatal(err)
 	}
-	// Pre-insert version 2 so migrateV2's own INSERT hits a PK conflict.
-	if _, err := db.Exec("INSERT INTO schema_version (version) VALUES (2)"); err != nil {
+	// An INDEX named "snapshots" collides with migrateV2's CREATE TABLE
+	// snapshots (IF NOT EXISTS only tolerates an existing *table*).
+	if _, err := db.Exec("CREATE TABLE base (x INTEGER); CREATE INDEX snapshots ON base(x)"); err != nil {
 		t.Fatal(err)
 	}
 	err := sqlite.RunMigrateV2(ctx, db)
 	if err == nil {
-		t.Fatal("expected exec error from the duplicate version insert")
+		t.Fatal("expected exec error from the snapshots name collision")
 	}
 }
 

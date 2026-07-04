@@ -13,7 +13,13 @@ import (
 
 // Offset represents an opaque position in an event stream.
 // Implementations define the format (e.g., "123", "abc_456", timestamp-based).
-// Offsets are lexicographically comparable within the same store.
+//
+// Offsets are resumption tokens: the only operations the bus performs on
+// them are equality checks and passing them back to the store that issued
+// them. Ordering semantics are store-defined — the bundled MemoryStore and
+// the sqlite store produce lexicographically ordered offsets, but stores
+// backed by external systems (e.g. durablestream) may not. Treat offsets
+// from one store as meaningless to any other store.
 type Offset string
 
 const (
@@ -182,7 +188,7 @@ func (bus *EventBus) persistEvent(ctx context.Context, eventType reflect.Type, e
 
 	// Observability: Track persistence start
 	if bus.observability != nil {
-		appendCtx = bus.observability.OnPersistStart(appendCtx, typeName, 0)
+		appendCtx = bus.observability.OnPersistStart(appendCtx, typeName)
 	}
 
 	start := time.Now()
@@ -192,7 +198,7 @@ func (bus *EventBus) persistEvent(ctx context.Context, eventType reflect.Type, e
 
 	// Observability: Track persistence complete
 	if bus.observability != nil {
-		bus.observability.OnPersistComplete(appendCtx, time.Since(start), saveErr)
+		bus.observability.OnPersistComplete(appendCtx, typeName, time.Since(start), offset, saveErr)
 	}
 
 	if saveErr != nil {
@@ -327,6 +333,12 @@ func typeNameOf(t reflect.Type) string {
 // crash between handling and offset save, the event is redelivered on the
 // next SubscribeWithReplay.
 //
+// Handoff: after the live subscription registers, one catch-up replay pass
+// runs from the last replayed position, so events published between the end
+// of replay and subscription registration are not missed. Events published
+// in that window may be delivered twice (once by the catch-up pass, once
+// live) — handlers must be idempotent.
+//
 // SaveOffset failures do not stop delivery; they are reported to the
 // PersistenceErrorHandler.
 //
@@ -368,7 +380,14 @@ func SubscribeWithReplay[T any](
 		}
 	}
 
-	err := bus.Replay(ctx, lastOffset, func(stored *StoredEvent) error {
+	// lastSeen tracks the stream position of the last event observed during
+	// replay (regardless of type), so the catch-up pass below can resume
+	// where the first pass left off.
+	lastSeen := lastOffset
+
+	replayFn := func(stored *StoredEvent) error {
+		lastSeen = stored.Offset
+
 		// Apply upcasts if available
 		eventData, eventTypeName := stored.Data, stored.Type
 		if bus.upcastRegistry != nil {
@@ -395,9 +414,9 @@ func SubscribeWithReplay[T any](
 		// Save this event's own offset after successful handling
 		saveOffset(ctx, event, stored.Offset)
 		return nil
-	})
+	}
 
-	if err != nil {
+	if err := bus.Replay(ctx, lastOffset, replayFn); err != nil {
 		return fmt.Errorf("replay events: %w", err)
 	}
 
@@ -412,7 +431,23 @@ func SubscribeWithReplay[T any](
 		}
 	}
 
-	return SubscribeContext(bus, wrappedHandler, opts...)
+	if err := SubscribeContext(bus, wrappedHandler, opts...); err != nil {
+		return err
+	}
+
+	// Catch-up pass: an event persisted after the first replay finished but
+	// before the live subscription registered would otherwise be missed
+	// until the next SubscribeWithReplay. Persistence happens before live
+	// delivery in the publish path, so replaying once more after the
+	// subscription is registered closes the gap: every event is now seen by
+	// this pass and/or the live subscription. An event published in the
+	// overlap window may be delivered twice (at-least-once semantics — make
+	// handlers idempotent).
+	if err := bus.Replay(ctx, lastSeen, replayFn); err != nil {
+		return fmt.Errorf("catch-up replay: %w", err)
+	}
+
+	return nil
 }
 
 // MemoryStore is a simple in-memory implementation of EventStore and SubscriptionStore.

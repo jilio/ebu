@@ -70,7 +70,9 @@ func WithOnSnapshot(fn func(start bool)) MaterializerOption {
 }
 
 // WithOnError sets an error handler for materialization errors.
-// This is called when applying a change message fails.
+// It is invoked exactly once for every failed application: envelope or
+// change-message decode failures, unknown entity types in strict mode,
+// unknown operations, and collection apply errors.
 func WithOnError(fn func(error)) MaterializerOption {
 	return func(c *materializerConfig) {
 		c.onError = fn

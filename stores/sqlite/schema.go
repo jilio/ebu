@@ -7,7 +7,7 @@ import (
 )
 
 // Schema version for migrations
-const currentSchemaVersion = 2
+const currentSchemaVersion = 3
 
 // Schema definitions
 const (
@@ -44,6 +44,11 @@ const (
 			data        BLOB NOT NULL,
 			updated_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`
+
+	// dropEventsTypeIndex (schema v3) removes idx_events_type: no query in
+	// this store ever filters by type, so the index was pure write
+	// amplification on every Append.
+	dropEventsTypeIndex = `DROP INDEX IF EXISTS idx_events_type`
 )
 
 // migrate applies database migrations if needed
@@ -61,15 +66,23 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		return fmt.Errorf("get schema version: %w", err)
 	}
 
-	// Apply migrations in order. migrateV1 seeds version=1, so a v0 database runs
-	// v1 then v2; a v1 database runs only v2; a v2 database applies nothing.
+	// Apply migrations in order. Each step seeds its own version row, so a v0
+	// database runs v1, v2 then v3; a v2 database runs only v3; a v3 database
+	// applies nothing. Version rows are inserted with INSERT OR IGNORE so two
+	// processes racing through migrate() (both reading the same stale version)
+	// both succeed instead of the loser failing on the schema_version PK.
 	if version < 1 {
 		if err := migrateV1(ctx, db); err != nil {
 			return err
 		}
 	}
 	if version < 2 {
-		return migrateV2(ctx, db)
+		if err := migrateV2(ctx, db); err != nil {
+			return err
+		}
+	}
+	if version < 3 {
+		return migrateV3(ctx, db)
 	}
 
 	return nil
@@ -93,7 +106,7 @@ func migrateV1(ctx context.Context, db *sql.DB) (err error) {
 		createEventsTable,
 		createEventsTypeIndex,
 		createSubscriptionPositionsTable,
-		"INSERT INTO schema_version (version) VALUES (1)",
+		"INSERT OR IGNORE INTO schema_version (version) VALUES (1)",
 	}
 
 	for _, stmt := range statements {
@@ -120,7 +133,34 @@ func migrateV2(ctx context.Context, db *sql.DB) (err error) {
 
 	statements := []string{
 		createSnapshotsTable,
-		"INSERT INTO schema_version (version) VALUES (2)",
+		"INSERT OR IGNORE INTO schema_version (version) VALUES (2)",
+	}
+
+	for _, stmt := range statements {
+		if _, err = tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("exec schema: %w", err)
+		}
+	}
+
+	return tx.Commit()
+}
+
+// migrateV3 drops the unused idx_events_type index (see dropEventsTypeIndex).
+func migrateV3(ctx context.Context, db *sql.DB) (err error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+		}
+	}()
+
+	statements := []string{
+		dropEventsTypeIndex,
+		"INSERT OR IGNORE INTO schema_version (version) VALUES (3)",
 	}
 
 	for _, stmt := range statements {

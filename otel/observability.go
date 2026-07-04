@@ -20,10 +20,15 @@ const (
 type contextKey int
 
 const (
-	eventTypeKey contextKey = iota
-	asyncKey
-	positionKey
+	asyncKey contextKey = iota
 )
+
+// millis converts a duration to fractional milliseconds. Using
+// duration.Milliseconds() would truncate: in-process handlers routinely
+// finish in well under 1ms and would all record 0.
+func millis(d time.Duration) float64 {
+	return float64(d) / float64(time.Millisecond)
+}
 
 // SpanAttributer allows events to provide custom span attributes.
 // Events implementing this interface can enrich observability spans
@@ -195,10 +200,16 @@ func (o *Observability) OnPublishComplete(ctx context.Context, eventType string)
 	span.End()
 }
 
-// OnHandlerStart is called when a handler starts executing
+// OnHandlerStart is called when a handler starts executing.
+//
+// Note on async spans: async handler spans are children of the publish
+// span's context, but the publish span may already have ended by the time
+// they start (OnPublishComplete fires when synchronous handlers finish).
+// This is legal in OpenTelemetry — the publish span's duration simply does
+// not include async handler work.
 func (o *Observability) OnHandlerStart(ctx context.Context, eventType string, async bool) context.Context {
-	// Store event metadata in context for later retrieval
-	ctx = context.WithValue(ctx, eventTypeKey, eventType)
+	// The async flag is needed again in OnHandlerComplete, which does not
+	// receive it; carry it via the context.
 	ctx = context.WithValue(ctx, asyncKey, async)
 
 	// Start a span for the handler
@@ -226,21 +237,18 @@ func (o *Observability) OnHandlerStart(ctx context.Context, eventType string, as
 }
 
 // OnHandlerComplete is called when a handler completes (with or without error)
-func (o *Observability) OnHandlerComplete(ctx context.Context, duration time.Duration, err error) {
+func (o *Observability) OnHandlerComplete(ctx context.Context, eventType string, duration time.Duration, err error) {
 	span := trace.SpanFromContext(ctx)
 
-	// Extract event metadata from context
-	var attrs []attribute.KeyValue
-	if eventType, ok := ctx.Value(eventTypeKey).(string); ok {
-		attrs = append(attrs, attribute.String("event.type", eventType))
+	attrs := []attribute.KeyValue{
+		attribute.String("event.type", eventType),
 	}
 	if async, ok := ctx.Value(asyncKey).(bool); ok {
 		attrs = append(attrs, attribute.Bool("async", async))
 	}
 
 	// Record duration
-	durationMs := float64(duration.Milliseconds())
-	o.handlerDuration.Record(ctx, durationMs, metric.WithAttributes(attrs...))
+	o.handlerDuration.Record(ctx, millis(duration), metric.WithAttributes(attrs...))
 
 	// Handle errors
 	if err != nil {
@@ -254,17 +262,13 @@ func (o *Observability) OnHandlerComplete(ctx context.Context, duration time.Dur
 	span.End()
 }
 
-// OnPersistStart is called when event persistence starts
-func (o *Observability) OnPersistStart(ctx context.Context, eventType string, position int64) context.Context {
-	// Store event metadata in context for later retrieval
-	ctx = context.WithValue(ctx, eventTypeKey, eventType)
-	ctx = context.WithValue(ctx, positionKey, position)
-
+// OnPersistStart is called when event persistence starts. The event's
+// offset is not known yet; it is attached to the span in OnPersistComplete.
+func (o *Observability) OnPersistStart(ctx context.Context, eventType string) context.Context {
 	// Start a span for persistence
 	ctx, _ = o.tracer.Start(ctx, "eventbus.persist: "+eventType,
 		trace.WithAttributes(
 			attribute.String("event.type", eventType),
-			attribute.Int64("position", position),
 		),
 	)
 
@@ -278,19 +282,22 @@ func (o *Observability) OnPersistStart(ctx context.Context, eventType string, po
 	return ctx
 }
 
-// OnPersistComplete is called when event persistence completes
-func (o *Observability) OnPersistComplete(ctx context.Context, duration time.Duration, err error) {
+// OnPersistComplete is called when event persistence completes. On success
+// the store-assigned offset is recorded on the persist span (span-only:
+// offsets are high-cardinality and do not belong on metrics).
+func (o *Observability) OnPersistComplete(ctx context.Context, eventType string, duration time.Duration, offset eventbus.Offset, err error) {
 	span := trace.SpanFromContext(ctx)
 
-	// Extract event metadata from context
-	var attrs []attribute.KeyValue
-	if eventType, ok := ctx.Value(eventTypeKey).(string); ok {
-		attrs = append(attrs, attribute.String("event.type", eventType))
+	if offset != "" {
+		span.SetAttributes(attribute.String("event.offset", string(offset)))
+	}
+
+	attrs := []attribute.KeyValue{
+		attribute.String("event.type", eventType),
 	}
 
 	// Record duration
-	durationMs := float64(duration.Milliseconds())
-	o.persistDuration.Record(ctx, durationMs, metric.WithAttributes(attrs...))
+	o.persistDuration.Record(ctx, millis(duration), metric.WithAttributes(attrs...))
 
 	// Handle errors
 	if err != nil {

@@ -7,17 +7,30 @@
 //
 // This implementation wraps the conformance-tested ahimsalabs/durable-streams-go
 // client library for full protocol compatibility.
+//
+// # Offset semantics (at-least-once)
+//
+// Every offset this store emits — Append's return value, each StoredEvent's
+// Offset, and Read's nextOffset — is a real server-issued offset that is safe
+// to persist and resume from. Reading from an offset returns events strictly
+// after it. Because durable-streams reads are chunked and the server only
+// reports the chunk's end offset, per-event offsets within a chunk use
+// chunk-start semantics: resuming from a saved per-event offset may re-deliver
+// events at or before the saved position (duplicates), but never skips a
+// later event. Consumers must be tolerant of duplicate delivery.
 package durablestream
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sync"
 	"time"
 
 	"github.com/ahimsalabs/durable-streams-go/durablestream"
+	"github.com/ahimsalabs/durable-streams-go/durablestream/transport"
 	eventbus "github.com/jilio/ebu"
 )
 
@@ -31,6 +44,12 @@ type Store struct {
 	// store access, and each Append round-trips over HTTP; serializing here
 	// keeps writer offsets consistent.
 	appendMu sync.Mutex
+
+	// writer is a cached StreamWriter, guarded by appendMu. Creating a
+	// writer costs a HEAD request, so it is reused across Append calls and
+	// dropped after any send failure (it may be bound to a stale context or
+	// stale stream metadata).
+	writer *durablestream.StreamWriter
 }
 
 // Ensure Store implements the EventStore interface.
@@ -95,16 +114,18 @@ type storedEventForWrite struct {
 
 // Append stores an event and returns its assigned offset.
 // Safe for concurrent use.
+//
+// Offset semantics: the returned offset is the server-issued next-offset
+// from the append response — the position immediately after the appended
+// event. Resuming a Read from it returns events appended strictly after
+// this one: the event itself is not re-delivered and no later event is
+// skipped. It is safe to persist (e.g., via SaveOffset).
+//
+// Transient failures (network errors, HTTP 5xx, 429) are retried with
+// exponential backoff; see WithRetry. A cached writer is reused across
+// calls to avoid a HEAD round trip per append and is recreated after any
+// send failure.
 func (s *Store) Append(ctx context.Context, event *eventbus.Event) (eventbus.Offset, error) {
-	s.appendMu.Lock()
-	defer s.appendMu.Unlock()
-
-	writer, err := s.client.Writer(ctx, s.path)
-	if err != nil {
-		return "", fmt.Errorf("durablestream: get writer: %w", err)
-	}
-
-	// Prepare event for JSON serialization
 	writeEvent := storedEventForWrite{
 		Type: event.Type,
 		Data: event.Data,
@@ -113,11 +134,52 @@ func (s *Store) Append(ctx context.Context, event *eventbus.Event) (eventbus.Off
 		writeEvent.Timestamp = event.Timestamp.Format(time.RFC3339Nano)
 	}
 
-	if err := writer.SendJSON(writeEvent, nil); err != nil {
-		return "", fmt.Errorf("durablestream: send: %w", err)
+	data, err := json.Marshal(writeEvent)
+	if err != nil {
+		return "", fmt.Errorf("durablestream: marshal event: %w", err)
 	}
 
-	return eventbus.Offset(writer.Offset()), nil
+	s.appendMu.Lock()
+	defer s.appendMu.Unlock()
+
+	var lastErr error
+	for attempt := 1; attempt <= s.cfg.retryAttempts; attempt++ {
+		if attempt > 1 {
+			if err := backoff(ctx, s.cfg.retryBaseDelay, attempt-1); err != nil {
+				return "", fmt.Errorf("durablestream: append: %w", err)
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return "", fmt.Errorf("durablestream: append: %w", err)
+		}
+
+		if s.writer == nil {
+			writer, err := s.client.Writer(ctx, s.path)
+			if err != nil {
+				lastErr = fmt.Errorf("durablestream: get writer: %w", err)
+				if !isRetryable(err) {
+					return "", lastErr
+				}
+				continue
+			}
+			s.writer = writer
+		}
+
+		if err := s.writer.Send(data, nil); err != nil {
+			// The cached writer may be bound to a stale context or stale
+			// stream metadata; drop it so the next attempt starts fresh.
+			s.writer = nil
+			lastErr = fmt.Errorf("durablestream: send: %w", err)
+			if ctx.Err() != nil || !isRetryable(err) {
+				return "", lastErr
+			}
+			continue
+		}
+
+		return eventbus.Offset(s.writer.Offset()), nil
+	}
+
+	return "", fmt.Errorf("durablestream: append: giving up after %d attempts: %w", s.cfg.retryAttempts, lastErr)
 }
 
 // storedEventWithOffset is used to parse events that include their own offset.
@@ -128,22 +190,37 @@ type storedEventWithOffset struct {
 	Timestamp string          `json:"timestamp,omitempty"`
 }
 
-// Read returns events starting after the given offset.
+// Read returns events appended strictly after the given offset.
 //
-// Offset handling:
-//   - If events in the JSON include an "offset" field, those are used directly
-//   - Otherwise, synthetic offsets are generated in format "nextOffset/index"
+// Offset semantics (at-least-once): every offset in the returned
+// StoredEvents is server-issued and safe to persist and resume from.
+// durable-streams reads are chunked and the server only reports the chunk's
+// end offset, so per-event offsets use chunk-start semantics:
 //
-// IMPORTANT: Synthetic offsets (containing "/") are ephemeral and should NOT
-// be stored for resumption. They only ensure uniqueness within a single Read call.
-// For reliable resumption, use the nextOffset returned by Read, or ensure your
-// durable-streams server includes per-event offsets in the response.
+//   - If a stored event embeds its own "offset" field (written by an
+//     external producer), that offset is used directly and resumption from
+//     it is exact.
+//   - Otherwise, every event except the last in a chunk carries the offset
+//     the chunk was read from. Resuming from it re-reads the whole chunk:
+//     events at or before the saved position may be re-delivered
+//     (duplicates), but no later event is ever skipped.
+//   - The last event of a chunk carries the server's next-offset, which is
+//     exactly the resume point after it (no duplicates, no skips).
 //
-// Limit handling: limit is honored only when events carry real embedded
-// offsets, because truncating a chunk requires a resumable per-event offset
-// for the returned nextOffset. When offsets are synthetic, the full chunk is
-// returned (limit is best-effort) — truncating would otherwise skip the
-// dropped events on the next Read.
+// Consumers resuming from a saved per-event offset must therefore tolerate
+// duplicate delivery of already-handled events; events are never skipped.
+//
+// The returned nextOffset is always server-issued and advancing: it is the
+// exact resume point after the last returned event.
+//
+// Limit handling: limit is honored only when every event carries a real
+// embedded offset, because truncating a chunk requires a resumable
+// per-event offset for the returned nextOffset. Otherwise the full chunk is
+// returned (limit is best-effort) — truncating would either skip the
+// dropped events or stall progress on the next Read.
+//
+// Transient failures (network errors, HTTP 5xx, 429) are retried with
+// exponential backoff; see WithRetry.
 func (s *Store) Read(ctx context.Context, from eventbus.Offset, limit int) ([]*eventbus.StoredEvent, eventbus.Offset, error) {
 	// Map OffsetOldest to durable-streams zero offset
 	offset := durablestream.Offset(from)
@@ -151,10 +228,31 @@ func (s *Store) Read(ctx context.Context, from eventbus.Offset, limit int) ([]*e
 		offset = durablestream.ZeroOffset
 	}
 
-	reader := s.client.Reader(s.path, offset)
-	result, err := reader.Read(ctx)
-	if err != nil {
-		return nil, from, fmt.Errorf("durablestream: read: %w", err)
+	var result *durablestream.StreamData
+	var lastErr error
+	for attempt := 1; attempt <= s.cfg.retryAttempts; attempt++ {
+		if attempt > 1 {
+			if err := backoff(ctx, s.cfg.retryBaseDelay, attempt-1); err != nil {
+				return nil, from, fmt.Errorf("durablestream: read: %w", err)
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, from, fmt.Errorf("durablestream: read: %w", err)
+		}
+
+		res, err := s.client.Reader(s.path, offset).Read(ctx)
+		if err != nil {
+			lastErr = fmt.Errorf("durablestream: read: %w", err)
+			if ctx.Err() != nil || !isRetryable(err) {
+				return nil, from, lastErr
+			}
+			continue
+		}
+		result = res
+		break
+	}
+	if result == nil {
+		return nil, from, fmt.Errorf("durablestream: read: giving up after %d attempts: %w", s.cfg.retryAttempts, lastErr)
 	}
 
 	// Empty response means we're at the tail
@@ -171,25 +269,32 @@ func (s *Store) Read(ctx context.Context, from eventbus.Offset, limit int) ([]*e
 	// Convert to StoredEvents
 	events := make([]*eventbus.StoredEvent, 0, len(rawEvents))
 	allEmbedded := true
+	lastRaw := len(rawEvents) - 1
 	for i, raw := range rawEvents {
 		// Try to parse as event with embedded offset first
 		var eventWithOffset storedEventWithOffset
 		if err := json.Unmarshal(raw, &eventWithOffset); err != nil {
-			// Log and skip malformed events
-			if s.cfg.logger != nil {
-				s.cfg.logger.Printf("durablestream: skipping malformed event at index %d: %v", i, err)
-			}
+			s.handleDecodeError(i, raw, err)
 			continue
 		}
 
-		// Determine offset: use embedded offset if present, otherwise synthesize
+		// Determine the event's resume offset. Every emitted offset is
+		// server-issued and safe to store: resuming from it may re-deliver
+		// earlier events (at-least-once) but never skips a later one.
 		var eventOffset eventbus.Offset
-		if eventWithOffset.Offset != "" {
+		switch {
+		case eventWithOffset.Offset != "":
+			// Embedded per-event offset: exact resumption.
 			eventOffset = eventbus.Offset(eventWithOffset.Offset)
-		} else {
-			// Synthesize unique offset: "nextOffset/index"
-			// These are ephemeral - use nextOffset for reliable resumption
-			eventOffset = eventbus.Offset(fmt.Sprintf("%s/%d", result.NextOffset, i))
+		case i == lastRaw:
+			// The server's next-offset is exactly the resume point after
+			// the chunk's last event.
+			eventOffset = eventbus.Offset(result.NextOffset)
+			allEmbedded = false
+		default:
+			// Chunk-start: resuming re-reads this chunk from the start,
+			// re-delivering earlier events but never skipping later ones.
+			eventOffset = from
 			allEmbedded = false
 		}
 
@@ -210,6 +315,53 @@ func (s *Store) Read(ctx context.Context, from eventbus.Offset, limit int) ([]*e
 	}
 
 	return events, eventbus.Offset(result.NextOffset), nil
+}
+
+// handleDecodeError reports a malformed stored event that is being skipped.
+// The decode error handler takes precedence; the logger is the fallback.
+// When neither is configured the event is skipped silently.
+func (s *Store) handleDecodeError(index int, raw []byte, err error) {
+	if s.cfg.decodeErrorHandler != nil {
+		s.cfg.decodeErrorHandler(err, raw)
+		return
+	}
+	if s.cfg.logger != nil {
+		s.cfg.logger.Printf("durablestream: skipping malformed event at index %d: %v", index, err)
+	}
+}
+
+// isRetryable reports whether an error is worth retrying: network errors
+// and server-side failures (HTTP 5xx, 429) are transient; protocol errors
+// (not found, conflict, bad request, gone) are permanent.
+func isRetryable(err error) bool {
+	if errors.Is(err, durablestream.ErrNotFound) ||
+		errors.Is(err, durablestream.ErrConflict) ||
+		errors.Is(err, durablestream.ErrBadRequest) ||
+		errors.Is(err, durablestream.ErrGone) {
+		return false
+	}
+	var tErr *transport.Error
+	if errors.As(err, &tErr) {
+		return tErr.StatusCode >= 500 ||
+			tErr.StatusCode == http.StatusTooManyRequests ||
+			tErr.StatusCode == 0
+	}
+	// Network errors, stale-writer context errors, etc.
+	return true
+}
+
+// backoff waits for the exponential backoff delay before the given retry
+// (retry is 1-based: the first retry waits base, the second 2*base, ...).
+// It returns early with the context's error if ctx is done.
+func backoff(ctx context.Context, base time.Duration, retry int) error {
+	timer := time.NewTimer(base << (retry - 1))
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // Close is a no-op for HTTP-based stores.

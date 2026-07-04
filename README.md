@@ -12,7 +12,7 @@ A lightweight, type-safe event bus for Go with generics support. Build decoupled
 ## Features
 
 - 🔒 **Type-safe** - Full compile-time type safety with generics
-- ⚡ **Fast** - Zero allocations in hot paths, optimized for performance
+- ⚡ **Fast** - ~200ns and 2 small allocations per publish; throughput stays flat under heavy concurrency
 - 🔄 **Async support** - Built-in async handlers with optional sequential processing
 - 🎯 **Simple API** - Clean, intuitive API with options pattern
 - 🧵 **Thread-safe** - Safe for concurrent use across goroutines
@@ -458,9 +458,9 @@ Features:
 ## Performance
 
 - Type-based routing with zero reflection for direct handlers
-- Zero allocations in hot paths
-- Efficient sharding reduces lock contention
-- Async handlers run in separate goroutines
+- ~200ns and 2 small allocations per publish (handler-slice copy + type hash)
+- Efficient sharding reduces lock contention; throughput stays flat from 1 to 1000 concurrent publishers
+- Async handlers run in separate goroutines (bound them with `WithAsyncHandlerLimit`)
 
 ## Contributing
 

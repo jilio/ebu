@@ -324,7 +324,7 @@ func TestHandlerTracing(t *testing.T) {
 
 		ctx := context.Background()
 		ctx = obs.OnHandlerStart(ctx, "TestEvent", false)
-		obs.OnHandlerComplete(ctx, 100*time.Millisecond, nil)
+		obs.OnHandlerComplete(ctx, "TestEvent", 100*time.Millisecond, nil)
 
 		tp.ForceFlush(ctx)
 
@@ -356,7 +356,7 @@ func TestHandlerTracing(t *testing.T) {
 
 		ctx := context.Background()
 		ctx = obs.OnHandlerStart(ctx, "TestEvent", true)
-		obs.OnHandlerComplete(ctx, 100*time.Millisecond, nil)
+		obs.OnHandlerComplete(ctx, "TestEvent", 100*time.Millisecond, nil)
 
 		tp.ForceFlush(ctx)
 
@@ -377,7 +377,7 @@ func TestHandlerTracing(t *testing.T) {
 		ctx := context.Background()
 		ctx = obs.OnHandlerStart(ctx, "TestEvent", false)
 		testErr := errors.New("test error")
-		obs.OnHandlerComplete(ctx, 100*time.Millisecond, testErr)
+		obs.OnHandlerComplete(ctx, "TestEvent", 100*time.Millisecond, testErr)
 
 		tp.ForceFlush(ctx)
 
@@ -413,8 +413,8 @@ func TestPersistTracing(t *testing.T) {
 		exporter.Reset()
 
 		ctx := context.Background()
-		ctx = obs.OnPersistStart(ctx, "TestEvent", 123)
-		obs.OnPersistComplete(ctx, 50*time.Millisecond, nil)
+		ctx = obs.OnPersistStart(ctx, "TestEvent")
+		obs.OnPersistComplete(ctx, "TestEvent", 50*time.Millisecond, eventbus.Offset("00000000000000000123"), nil)
 
 		tp.ForceFlush(ctx)
 
@@ -428,16 +428,16 @@ func TestPersistTracing(t *testing.T) {
 			t.Errorf("expected span name 'eventbus.persist: TestEvent', got %q", span.Name)
 		}
 
-		// Check position attribute
-		foundPosition := false
+		// Check the store-assigned offset is recorded on the span
+		foundOffset := false
 		for _, attr := range span.Attributes {
-			if string(attr.Key) == "position" && attr.Value.AsInt64() == 123 {
-				foundPosition = true
+			if string(attr.Key) == "event.offset" && attr.Value.AsString() == "00000000000000000123" {
+				foundOffset = true
 				break
 			}
 		}
-		if !foundPosition {
-			t.Error("span missing or incorrect position attribute")
+		if !foundOffset {
+			t.Error("span missing or incorrect event.offset attribute")
 		}
 	})
 
@@ -445,9 +445,9 @@ func TestPersistTracing(t *testing.T) {
 		exporter.Reset()
 
 		ctx := context.Background()
-		ctx = obs.OnPersistStart(ctx, "TestEvent", 456)
+		ctx = obs.OnPersistStart(ctx, "TestEvent")
 		testErr := errors.New("persistence error")
-		obs.OnPersistComplete(ctx, 50*time.Millisecond, testErr)
+		obs.OnPersistComplete(ctx, "TestEvent", 50*time.Millisecond, eventbus.Offset(""), testErr)
 
 		tp.ForceFlush(ctx)
 
@@ -483,11 +483,11 @@ func TestMetrics(t *testing.T) {
 
 	// Simulate handler execution
 	ctx = obs.OnHandlerStart(ctx, "TestEvent", false)
-	obs.OnHandlerComplete(ctx, 100*time.Millisecond, nil)
+	obs.OnHandlerComplete(ctx, "TestEvent", 100*time.Millisecond, nil)
 
 	// Simulate persistence
-	ctx = obs.OnPersistStart(ctx, "TestEvent", 1)
-	obs.OnPersistComplete(ctx, 50*time.Millisecond, nil)
+	ctx = obs.OnPersistStart(ctx, "TestEvent")
+	obs.OnPersistComplete(ctx, "TestEvent", 50*time.Millisecond, eventbus.Offset("00000000000000000123"), nil)
 
 	// Collect metrics
 	var rm metricdata.ResourceMetrics
@@ -576,7 +576,7 @@ func TestAttributePropagation(t *testing.T) {
 		// Test sync handler
 		ctx = obs.OnHandlerStart(ctx, "TestEvent", false)
 		time.Sleep(10 * time.Millisecond)
-		obs.OnHandlerComplete(ctx, 10*time.Millisecond, nil)
+		obs.OnHandlerComplete(ctx, "TestEvent", 10*time.Millisecond, nil)
 
 		// Collect metrics
 		var rm metricdata.ResourceMetrics
@@ -633,7 +633,7 @@ func TestAttributePropagation(t *testing.T) {
 		// Test async handler
 		ctx = obs.OnHandlerStart(ctx, "AsyncEvent", true)
 		time.Sleep(10 * time.Millisecond)
-		obs.OnHandlerComplete(ctx, 10*time.Millisecond, nil)
+		obs.OnHandlerComplete(ctx, "TestEvent", 10*time.Millisecond, nil)
 
 		// Collect metrics
 		var rm metricdata.ResourceMetrics
@@ -681,7 +681,7 @@ func TestAttributePropagation(t *testing.T) {
 		// Test handler with error
 		ctx = obs.OnHandlerStart(ctx, "ErrorEvent", false)
 		testErr := errors.New("test error")
-		obs.OnHandlerComplete(ctx, 10*time.Millisecond, testErr)
+		obs.OnHandlerComplete(ctx, "ErrorEvent", 10*time.Millisecond, testErr)
 
 		// Collect metrics
 		var rm metricdata.ResourceMetrics
@@ -727,9 +727,9 @@ func TestAttributePropagation(t *testing.T) {
 		ctx := context.Background()
 
 		// Test persistence
-		ctx = obs.OnPersistStart(ctx, "PersistEvent", 123)
+		ctx = obs.OnPersistStart(ctx, "PersistEvent")
 		time.Sleep(5 * time.Millisecond)
-		obs.OnPersistComplete(ctx, 5*time.Millisecond, nil)
+		obs.OnPersistComplete(ctx, "PersistEvent", 5*time.Millisecond, eventbus.Offset("00000000000000000007"), nil)
 
 		// Collect metrics
 		var rm metricdata.ResourceMetrics
@@ -770,10 +770,6 @@ func TestAttributePropagation(t *testing.T) {
 
 		// Verify context values are set
 		ctx = obs.OnHandlerStart(ctx, "ContextTest", true)
-
-		if eventType := ctx.Value(eventTypeKey); eventType != "ContextTest" {
-			t.Errorf("expected eventTypeKey='ContextTest', got %v", eventType)
-		}
 
 		if async := ctx.Value(asyncKey); async != true {
 			t.Errorf("expected asyncKey=true, got %v", async)

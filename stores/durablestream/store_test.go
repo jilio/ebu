@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -525,7 +528,13 @@ func TestRead_LimitWithEmbeddedOffsets(t *testing.T) {
 	}
 }
 
-func TestRead_SyntheticOffsets(t *testing.T) {
+// TestRead_ChunkStartOffsets verifies the chunk-start offset semantics for
+// events that carry no embedded offset: every event except the last carries
+// the offset the chunk was read FROM (resume-safe: re-delivers the chunk,
+// never skips), and the last event carries the server's next-offset (the
+// exact resume point after it). All emitted offsets are server-issued and
+// safe to store.
+func TestRead_ChunkStartOffsets(t *testing.T) {
 	// Server that returns events without offsets
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/stream/", func(w http.ResponseWriter, r *http.Request) {
@@ -538,7 +547,8 @@ func TestRead_SyntheticOffsets(t *testing.T) {
 			// Events without offset field
 			w.Write([]byte(`[
 				{"type":"event1","data":{}},
-				{"type":"event2","data":{}}
+				{"type":"event2","data":{}},
+				{"type":"event3","data":{}}
 			]`))
 		default:
 			w.WriteHeader(http.StatusOK)
@@ -547,28 +557,55 @@ func TestRead_SyntheticOffsets(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	store, err := ds.New(srv.URL+"/v1/stream", "synthetic-offsets")
+	store, err := ds.New(srv.URL+"/v1/stream", "chunk-start-offsets")
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
 
 	ctx := context.Background()
-	events, _, err := store.Read(ctx, eventbus.OffsetOldest, 0)
-	if err != nil {
-		t.Fatalf("Read() error = %v", err)
-	}
 
-	if len(events) != 2 {
-		t.Fatalf("expected 2 events, got %d", len(events))
-	}
+	t.Run("from explicit offset", func(t *testing.T) {
+		events, nextOffset, err := store.Read(ctx, "10", 0)
+		if err != nil {
+			t.Fatalf("Read() error = %v", err)
+		}
+		if len(events) != 3 {
+			t.Fatalf("expected 3 events, got %d", len(events))
+		}
+		// Non-last events carry the chunk-start offset (read-from position).
+		if events[0].Offset != "10" {
+			t.Errorf("expected chunk-start offset '10', got '%s'", events[0].Offset)
+		}
+		if events[1].Offset != "10" {
+			t.Errorf("expected chunk-start offset '10', got '%s'", events[1].Offset)
+		}
+		// The last event carries the server's next-offset.
+		if events[2].Offset != "50" {
+			t.Errorf("expected next-offset '50' on last event, got '%s'", events[2].Offset)
+		}
+		if nextOffset != "50" {
+			t.Errorf("expected nextOffset '50', got '%s'", nextOffset)
+		}
+	})
 
-	// Check that synthetic offsets are unique (nextOffset/index format)
-	if events[0].Offset != "50/0" {
-		t.Errorf("expected synthetic offset '50/0', got '%s'", events[0].Offset)
-	}
-	if events[1].Offset != "50/1" {
-		t.Errorf("expected synthetic offset '50/1', got '%s'", events[1].Offset)
-	}
+	t.Run("from oldest", func(t *testing.T) {
+		events, _, err := store.Read(ctx, eventbus.OffsetOldest, 0)
+		if err != nil {
+			t.Fatalf("Read() error = %v", err)
+		}
+		if len(events) != 3 {
+			t.Fatalf("expected 3 events, got %d", len(events))
+		}
+		// Chunk-start for a read from the beginning is OffsetOldest itself:
+		// resuming from it replays the stream from the start (duplicates OK,
+		// skips impossible).
+		if events[0].Offset != eventbus.OffsetOldest {
+			t.Errorf("expected OffsetOldest chunk-start, got '%s'", events[0].Offset)
+		}
+		if events[2].Offset != "50" {
+			t.Errorf("expected next-offset '50' on last event, got '%s'", events[2].Offset)
+		}
+	})
 }
 
 func TestRead_InvalidJSON(t *testing.T) {
@@ -805,5 +842,722 @@ func TestParseTimestamp_InvalidFormat(t *testing.T) {
 	// Invalid timestamp should result in zero time
 	if !events[0].Timestamp.IsZero() {
 		t.Error("expected zero timestamp for invalid format")
+	}
+}
+
+// readAllFrom reads all events from the given offset, following nextOffset
+// until the store reports no more data.
+func readAllFrom(t *testing.T, store *ds.Store, from eventbus.Offset) []*eventbus.StoredEvent {
+	t.Helper()
+	ctx := context.Background()
+	var all []*eventbus.StoredEvent
+	offset := from
+	for {
+		events, next, err := store.Read(ctx, offset, 0)
+		if err != nil {
+			t.Fatalf("Read(%q) error = %v", offset, err)
+		}
+		if len(events) == 0 {
+			return all
+		}
+		all = append(all, events...)
+		if next == offset {
+			t.Fatalf("nextOffset did not advance from %q", offset)
+		}
+		offset = next
+	}
+}
+
+// newChunkedServer creates a mock durable-streams server that serves the
+// given JSON payloads (one message each, no embedded offsets) in chunks of
+// at most chunkSize messages per read. Offsets follow the protocol
+// semantics: reading from offset k returns messages strictly after the
+// k-th message, and Stream-Next-Offset is the resume point after the last
+// returned message.
+func newChunkedServer(payloads []string, chunkSize int) *httptest.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/stream/", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			w.WriteHeader(http.StatusCreated)
+		case http.MethodGet:
+			off := 0
+			if q := r.URL.Query().Get("offset"); q != "" {
+				n, err := strconv.Atoi(q)
+				if err != nil {
+					http.Error(w, "bad offset", http.StatusBadRequest)
+					return
+				}
+				off = n
+			}
+			w.Header().Set("Content-Type", "application/json")
+			if off >= len(payloads) {
+				w.Header().Set("Stream-Next-Offset", strconv.Itoa(off))
+				w.Header().Set("Stream-Up-To-Date", "true")
+				return
+			}
+			end := off + chunkSize
+			if end > len(payloads) {
+				end = len(payloads)
+			}
+			w.Header().Set("Stream-Next-Offset", strconv.Itoa(end))
+			if end == len(payloads) {
+				w.Header().Set("Stream-Up-To-Date", "true")
+			}
+			w.Write([]byte("[" + strings.Join(payloads[off:end], ",") + "]"))
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+	return httptest.NewServer(mux)
+}
+
+// TestRead_ResumeFromSavedOffsetNeverSkips is the key regression test for
+// per-event offset semantics: resuming a Read from any event's saved
+// StoredEvent.Offset must never skip a later event. Re-delivery of the
+// saved event or earlier ones (duplicates) is acceptable at-least-once
+// behavior.
+func TestRead_ResumeFromSavedOffsetNeverSkips(t *testing.T) {
+	verifyResume := func(t *testing.T, store *ds.Store, total int) {
+		t.Helper()
+		all := readAllFrom(t, store, eventbus.OffsetOldest)
+		if len(all) != total {
+			t.Fatalf("expected %d events, got %d", total, len(all))
+		}
+		for i := 0; i < total; i++ {
+			want := fmt.Sprintf("event.%d", i)
+			if all[i].Type != want {
+				t.Fatalf("expected event %d to be %q, got %q", i, want, all[i].Type)
+			}
+		}
+
+		for i, saved := range all {
+			resumed := readAllFrom(t, store, saved.Offset)
+			seen := make(map[string]bool, len(resumed))
+			for _, e := range resumed {
+				seen[e.Type] = true
+			}
+			// No event after i may be missing (skips are NOT allowed;
+			// duplicates of events <= i are).
+			for j := i + 1; j < total; j++ {
+				if !seen[fmt.Sprintf("event.%d", j)] {
+					t.Errorf("resuming from event %d offset %q skipped event %d", i, saved.Offset, j)
+				}
+			}
+		}
+	}
+
+	t.Run("chunked reads without embedded offsets", func(t *testing.T) {
+		payloads := make([]string, 6)
+		for i := range payloads {
+			payloads[i] = fmt.Sprintf(`{"type":"event.%d","data":{"id":%d}}`, i, i)
+		}
+		srv := newChunkedServer(payloads, 2)
+		defer srv.Close()
+
+		store, err := ds.New(srv.URL+"/v1/stream", "resume-chunked")
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		verifyResume(t, store, 6)
+	})
+
+	t.Run("real server round trip", func(t *testing.T) {
+		srv := newTestServer()
+		defer srv.Close()
+
+		store, err := ds.New(srv.URL+"/v1/stream", "resume-real")
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+
+		ctx := context.Background()
+		for i := 0; i < 5; i++ {
+			event := &eventbus.Event{
+				Type: fmt.Sprintf("event.%d", i),
+				Data: json.RawMessage(fmt.Sprintf(`{"id":%d}`, i)),
+			}
+			if _, err := store.Append(ctx, event); err != nil {
+				t.Fatalf("Append() error = %v", err)
+			}
+		}
+		verifyResume(t, store, 5)
+	})
+}
+
+// TestAppend_OffsetIsResumeSafe verifies Append's returned offset semantics:
+// reading from the offset returned for event i must yield events i+1..N-1
+// without re-delivering event i and without skipping any later event.
+func TestAppend_OffsetIsResumeSafe(t *testing.T) {
+	srv := newTestServer()
+	defer srv.Close()
+
+	store, err := ds.New(srv.URL+"/v1/stream", "append-resume-safe")
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	ctx := context.Background()
+	const total = 5
+	offsets := make([]eventbus.Offset, total)
+	for i := 0; i < total; i++ {
+		event := &eventbus.Event{
+			Type: fmt.Sprintf("event.%d", i),
+			Data: json.RawMessage(`{}`),
+		}
+		offset, err := store.Append(ctx, event)
+		if err != nil {
+			t.Fatalf("Append() error = %v", err)
+		}
+		offsets[i] = offset
+	}
+
+	for i, offset := range offsets {
+		resumed := readAllFrom(t, store, offset)
+		if len(resumed) != total-i-1 {
+			t.Fatalf("resuming from Append offset of event %d: expected %d events, got %d", i, total-i-1, len(resumed))
+		}
+		for j, e := range resumed {
+			want := fmt.Sprintf("event.%d", i+1+j)
+			if e.Type != want {
+				t.Errorf("resuming from event %d: expected %q at position %d, got %q", i, want, j, e.Type)
+			}
+		}
+	}
+}
+
+func TestStore_ConcurrentAppends(t *testing.T) {
+	srv := newTestServer()
+	defer srv.Close()
+
+	store, err := ds.New(srv.URL+"/v1/stream", "concurrent-appends")
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	const goroutines = 10
+	const perGoroutine = 20
+
+	ctx := context.Background()
+	errCh := make(chan error, goroutines*perGoroutine)
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < perGoroutine; i++ {
+				event := &eventbus.Event{
+					Type: fmt.Sprintf("concurrent.%d.%d", g, i),
+					Data: json.RawMessage(`{}`),
+				}
+				if _, err := store.Append(ctx, event); err != nil {
+					errCh <- fmt.Errorf("goroutine %d append %d: %w", g, i, err)
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
+	}
+	if t.Failed() {
+		t.Fatalf("concurrent appends failed")
+	}
+
+	all := readAllFrom(t, store, eventbus.OffsetOldest)
+	if len(all) != goroutines*perGoroutine {
+		t.Fatalf("expected %d events, got %d", goroutines*perGoroutine, len(all))
+	}
+
+	seen := make(map[string]bool, len(all))
+	for _, e := range all {
+		seen[e.Type] = true
+	}
+	for g := 0; g < goroutines; g++ {
+		for i := 0; i < perGoroutine; i++ {
+			key := fmt.Sprintf("concurrent.%d.%d", g, i)
+			if !seen[key] {
+				t.Errorf("event %s missing after concurrent appends", key)
+			}
+		}
+	}
+}
+
+// newFlakyServer wraps a real durable-streams handler and fails requests on
+// demand: failHead/failPost/failGet hold the number of upcoming
+// HEAD/POST/GET requests to reject with failStatus (503 unless set).
+type flakyServer struct {
+	*httptest.Server
+	heads      atomic.Int32
+	posts      atomic.Int32
+	gets       atomic.Int32
+	failHead   atomic.Int32
+	failPost   atomic.Int32
+	failGet    atomic.Int32
+	failStatus atomic.Int32
+}
+
+func (fs *flakyServer) fail(w http.ResponseWriter) {
+	status := int(fs.failStatus.Load())
+	if status == 0 {
+		status = http.StatusServiceUnavailable
+	}
+	http.Error(w, http.StatusText(status), status)
+}
+
+func newFlakyServer() *flakyServer {
+	storage := memorystorage.New()
+	handler := durablestream.NewHandler(storage, nil)
+
+	fs := &flakyServer{}
+	mux := http.NewServeMux()
+	mux.Handle("/v1/stream/", http.StripPrefix("/v1/stream/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			fs.heads.Add(1)
+			if fs.failHead.Load() > 0 {
+				fs.failHead.Add(-1)
+				fs.fail(w)
+				return
+			}
+		case http.MethodPost:
+			fs.posts.Add(1)
+			if fs.failPost.Load() > 0 {
+				fs.failPost.Add(-1)
+				fs.fail(w)
+				return
+			}
+		case http.MethodGet:
+			fs.gets.Add(1)
+			if fs.failGet.Load() > 0 {
+				fs.failGet.Add(-1)
+				fs.fail(w)
+				return
+			}
+		}
+		handler.ServeHTTP(w, r)
+	})))
+	fs.Server = httptest.NewServer(mux)
+	return fs
+}
+
+func TestAppend_RetryOn503ThenSuccess(t *testing.T) {
+	srv := newFlakyServer()
+	defer srv.Close()
+
+	store, err := ds.New(srv.URL+"/v1/stream", "retry-append", ds.WithRetry(3, 5*time.Millisecond))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	srv.failPost.Store(1)
+
+	ctx := context.Background()
+	offset, err := store.Append(ctx, &eventbus.Event{
+		Type: "retry.event",
+		Data: json.RawMessage(`{"ok":true}`),
+	})
+	if err != nil {
+		t.Fatalf("Append() should succeed after retry, got error = %v", err)
+	}
+	if offset == "" {
+		t.Error("expected non-empty offset")
+	}
+	if got := srv.posts.Load(); got != 2 {
+		t.Errorf("expected 2 POST requests (1 failed + 1 retried), got %d", got)
+	}
+
+	events := readAllFrom(t, store, eventbus.OffsetOldest)
+	if len(events) != 1 || events[0].Type != "retry.event" {
+		t.Fatalf("expected the retried event to be stored exactly once, got %v", events)
+	}
+}
+
+func TestRead_RetryOn503ThenSuccess(t *testing.T) {
+	srv := newFlakyServer()
+	defer srv.Close()
+
+	store, err := ds.New(srv.URL+"/v1/stream", "retry-read", ds.WithRetry(3, 5*time.Millisecond))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	ctx := context.Background()
+	if _, err := store.Append(ctx, &eventbus.Event{
+		Type: "retry.read.event",
+		Data: json.RawMessage(`{}`),
+	}); err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+
+	srv.failGet.Store(1)
+
+	events, _, err := store.Read(ctx, eventbus.OffsetOldest, 0)
+	if err != nil {
+		t.Fatalf("Read() should succeed after retry, got error = %v", err)
+	}
+	if len(events) != 1 || events[0].Type != "retry.read.event" {
+		t.Fatalf("expected 1 event after retried read, got %v", events)
+	}
+	if got := srv.gets.Load(); got != 2 {
+		t.Errorf("expected 2 GET requests (1 failed + 1 retried), got %d", got)
+	}
+}
+
+func TestAppend_RetryExhausted(t *testing.T) {
+	srv := newFlakyServer()
+	defer srv.Close()
+
+	store, err := ds.New(srv.URL+"/v1/stream", "retry-exhausted", ds.WithRetry(2, time.Millisecond))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	srv.failPost.Store(10)
+
+	ctx := context.Background()
+	_, err = store.Append(ctx, &eventbus.Event{
+		Type: "never.stored",
+		Data: json.RawMessage(`{}`),
+	})
+	if err == nil {
+		t.Fatal("expected error after exhausting retries")
+	}
+	if !strings.Contains(err.Error(), "giving up after 2 attempts") {
+		t.Errorf("expected 'giving up after 2 attempts' error, got: %v", err)
+	}
+	if got := srv.posts.Load(); got != 2 {
+		t.Errorf("expected exactly 2 POST attempts, got %d", got)
+	}
+}
+
+func TestAppend_WriterCacheReuse(t *testing.T) {
+	srv := newFlakyServer()
+	defer srv.Close()
+
+	store, err := ds.New(srv.URL+"/v1/stream", "writer-cache", ds.WithRetry(3, 5*time.Millisecond))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	ctx := context.Background()
+	for i := 0; i < 5; i++ {
+		event := &eventbus.Event{
+			Type: fmt.Sprintf("cached.%d", i),
+			Data: json.RawMessage(`{}`),
+		}
+		if _, err := store.Append(ctx, event); err != nil {
+			t.Fatalf("Append() error = %v", err)
+		}
+	}
+
+	// The writer is created once (one HEAD) and reused for all appends.
+	if got := srv.heads.Load(); got != 1 {
+		t.Errorf("expected exactly 1 HEAD request for 5 appends (writer cached), got %d", got)
+	}
+
+	// A send failure invalidates the cached writer; the retry recreates it
+	// with a second HEAD.
+	srv.failPost.Store(1)
+	if _, err := store.Append(ctx, &eventbus.Event{
+		Type: "cached.recreated",
+		Data: json.RawMessage(`{}`),
+	}); err != nil {
+		t.Fatalf("Append() after transient failure error = %v", err)
+	}
+	if got := srv.heads.Load(); got != 2 {
+		t.Errorf("expected writer to be recreated after send failure (2 HEADs total), got %d", got)
+	}
+
+	events := readAllFrom(t, store, eventbus.OffsetOldest)
+	if len(events) != 6 {
+		t.Fatalf("expected 6 events, got %d", len(events))
+	}
+}
+
+func TestWithDecodeErrorHandler(t *testing.T) {
+	newMalformedServer := func() *httptest.Server {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/v1/stream/", func(w http.ResponseWriter, r *http.Request) {
+			switch r.Method {
+			case http.MethodPut:
+				w.WriteHeader(http.StatusCreated)
+			case http.MethodGet:
+				w.Header().Set("Stream-Next-Offset", "1")
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(`[{"type":"valid","data":{}}, "not an object"]`))
+			default:
+				w.WriteHeader(http.StatusOK)
+			}
+		})
+		return httptest.NewServer(mux)
+	}
+
+	t.Run("handler is invoked with error and raw bytes", func(t *testing.T) {
+		srv := newMalformedServer()
+		defer srv.Close()
+
+		var mu sync.Mutex
+		var errs []error
+		var raws [][]byte
+		store, err := ds.New(srv.URL+"/v1/stream", "decode-handler",
+			ds.WithDecodeErrorHandler(func(err error, raw []byte) {
+				mu.Lock()
+				defer mu.Unlock()
+				errs = append(errs, err)
+				raws = append(raws, raw)
+			}))
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+
+		events, _, err := store.Read(context.Background(), eventbus.OffsetOldest, 0)
+		if err != nil {
+			t.Fatalf("Read() error = %v", err)
+		}
+		if len(events) != 1 {
+			t.Errorf("expected 1 valid event, got %d", len(events))
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if len(errs) != 1 {
+			t.Fatalf("expected handler to be invoked once, got %d", len(errs))
+		}
+		if errs[0] == nil {
+			t.Error("expected non-nil decode error")
+		}
+		if !strings.Contains(string(raws[0]), "not an object") {
+			t.Errorf("expected raw bytes of the malformed event, got %s", raws[0])
+		}
+	})
+
+	t.Run("handler takes precedence over logger", func(t *testing.T) {
+		srv := newMalformedServer()
+		defer srv.Close()
+
+		var calls int
+		logger := &testLogger{}
+		store, err := ds.New(srv.URL+"/v1/stream", "decode-handler-precedence",
+			ds.WithLogger(logger),
+			ds.WithDecodeErrorHandler(func(err error, raw []byte) {
+				calls++
+			}))
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+
+		if _, _, err := store.Read(context.Background(), eventbus.OffsetOldest, 0); err != nil {
+			t.Fatalf("Read() error = %v", err)
+		}
+		if calls != 1 {
+			t.Errorf("expected handler to be invoked once, got %d", calls)
+		}
+		if len(logger.messages) != 0 {
+			t.Errorf("expected logger not to be invoked when handler is set, got %v", logger.messages)
+		}
+	})
+}
+
+func TestAppend_MarshalError(t *testing.T) {
+	srv := newTestServer()
+	defer srv.Close()
+
+	store, err := ds.New(srv.URL+"/v1/stream", "marshal-error")
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	_, err = store.Append(context.Background(), &eventbus.Event{
+		Type: "bad.data",
+		Data: json.RawMessage(`{invalid`),
+	})
+	if err == nil {
+		t.Fatal("expected error for invalid event data")
+	}
+	if !strings.Contains(err.Error(), "marshal event") {
+		t.Errorf("expected 'marshal event' error, got: %v", err)
+	}
+}
+
+func TestAppend_NonRetryableError(t *testing.T) {
+	srv := newFlakyServer()
+	defer srv.Close()
+
+	store, err := ds.New(srv.URL+"/v1/stream", "append-non-retryable", ds.WithRetry(3, time.Millisecond))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	srv.failStatus.Store(http.StatusBadRequest)
+	srv.failPost.Store(1)
+
+	_, err = store.Append(context.Background(), &eventbus.Event{
+		Type: "rejected",
+		Data: json.RawMessage(`{}`),
+	})
+	if err == nil {
+		t.Fatal("expected error for 400 response")
+	}
+	if got := srv.posts.Load(); got != 1 {
+		t.Errorf("expected no retry on 4xx (1 POST), got %d", got)
+	}
+}
+
+func TestAppend_WriterErrorNonRetryable(t *testing.T) {
+	srv := newFlakyServer()
+	defer srv.Close()
+
+	store, err := ds.New(srv.URL+"/v1/stream", "writer-not-found", ds.WithRetry(3, time.Millisecond))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	srv.failStatus.Store(http.StatusNotFound)
+	srv.failHead.Store(1)
+
+	_, err = store.Append(context.Background(), &eventbus.Event{
+		Type: "no.stream",
+		Data: json.RawMessage(`{}`),
+	})
+	if err == nil {
+		t.Fatal("expected error when writer creation fails with 404")
+	}
+	if !strings.Contains(err.Error(), "get writer") {
+		t.Errorf("expected 'get writer' error, got: %v", err)
+	}
+	if got := srv.posts.Load(); got != 0 {
+		t.Errorf("expected no POST after writer creation failure, got %d", got)
+	}
+	if got := srv.heads.Load(); got != 1 {
+		t.Errorf("expected no retry of non-retryable HEAD failure (1 HEAD), got %d", got)
+	}
+}
+
+func TestAppend_WriterErrorRetryable(t *testing.T) {
+	srv := newFlakyServer()
+	defer srv.Close()
+
+	store, err := ds.New(srv.URL+"/v1/stream", "writer-retry", ds.WithRetry(3, time.Millisecond))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	srv.failHead.Store(1) // 503 on first HEAD, then recover
+
+	if _, err := store.Append(context.Background(), &eventbus.Event{
+		Type: "writer.retried",
+		Data: json.RawMessage(`{}`),
+	}); err != nil {
+		t.Fatalf("Append() should succeed after writer creation retry, got %v", err)
+	}
+	if got := srv.heads.Load(); got != 2 {
+		t.Errorf("expected 2 HEAD requests (1 failed + 1 retried), got %d", got)
+	}
+}
+
+// TestAppend_StaleWriterContextRecovers verifies that a cached writer bound
+// to a context that has since been cancelled is transparently recreated on
+// the next Append with a live context.
+func TestAppend_StaleWriterContextRecovers(t *testing.T) {
+	srv := newTestServer()
+	defer srv.Close()
+
+	store, err := ds.New(srv.URL+"/v1/stream", "stale-writer-ctx", ds.WithRetry(3, time.Millisecond))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	if _, err := store.Append(ctx1, &eventbus.Event{
+		Type: "event.0",
+		Data: json.RawMessage(`{}`),
+	}); err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+	cancel1() // The cached writer is now bound to a dead context.
+
+	if _, err := store.Append(context.Background(), &eventbus.Event{
+		Type: "event.1",
+		Data: json.RawMessage(`{}`),
+	}); err != nil {
+		t.Fatalf("Append() with live context should recover from stale cached writer, got %v", err)
+	}
+
+	events := readAllFrom(t, store, eventbus.OffsetOldest)
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+}
+
+func TestAppend_BackoffRespectsContext(t *testing.T) {
+	srv := newFlakyServer()
+	defer srv.Close()
+
+	store, err := ds.New(srv.URL+"/v1/stream", "append-backoff-ctx", ds.WithRetry(3, time.Second))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	srv.failPost.Store(10)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err = store.Append(ctx, &eventbus.Event{
+		Type: "never",
+		Data: json.RawMessage(`{}`),
+	})
+	if err == nil {
+		t.Fatal("expected error when context expires during backoff")
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Errorf("backoff did not respect context cancellation, took %v", elapsed)
+	}
+}
+
+func TestRead_BackoffRespectsContext(t *testing.T) {
+	srv := newFlakyServer()
+	defer srv.Close()
+
+	store, err := ds.New(srv.URL+"/v1/stream", "read-backoff-ctx", ds.WithRetry(3, time.Second))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	srv.failGet.Store(10)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, _, err = store.Read(ctx, eventbus.OffsetOldest, 0)
+	if err == nil {
+		t.Fatal("expected error when context expires during backoff")
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Errorf("backoff did not respect context cancellation, took %v", elapsed)
+	}
+}
+
+func TestRead_NonRetryableError(t *testing.T) {
+	srv := newFlakyServer()
+	defer srv.Close()
+
+	store, err := ds.New(srv.URL+"/v1/stream", "read-non-retryable", ds.WithRetry(3, time.Millisecond))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	srv.failStatus.Store(http.StatusBadRequest)
+	srv.failGet.Store(1)
+
+	_, _, err = store.Read(context.Background(), eventbus.OffsetOldest, 0)
+	if err == nil {
+		t.Fatal("expected error for 400 response")
+	}
+	if got := srv.gets.Load(); got != 1 {
+		t.Errorf("expected no retry on 4xx (1 GET), got %d", got)
 	}
 }

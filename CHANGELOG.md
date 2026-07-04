@@ -7,6 +7,110 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **sqlite: concurrent appends to file-backed databases no longer fail with
+  SQLITE_BUSY.** Pragmas were applied via `db.Exec`, reaching only one
+  pooled connection, and the `_busy_timeout=` DSN parameter is mattn syntax
+  that modernc.org/sqlite silently ignores — so under concurrent publishing
+  ~84% of appends failed and, because persistence is best-effort, silently
+  vanished from the log. All connection-scoped pragmas now travel in the DSN
+  as `_pragma=` parameters (plus `_txlock=immediate`), so every pooled
+  connection gets them. A file-backed concurrency test (10×100 appends, zero
+  tolerated failures) guards the fix; the old test used `:memory:`, which
+  takes a different lock path and could not catch it.
+- **sqlite: concurrent `New()` across processes no longer races.** Schema
+  version seeding uses `INSERT OR IGNORE`, and the one-time WAL conversion —
+  which SQLite reports as SQLITE_BUSY without consulting the busy handler —
+  is retried with backoff.
+- **sqlite: `:memory:` stores pin a dedicated connection** so pool churn can
+  no longer silently destroy the shared-cache in-memory database.
+- **durablestream: every offset the store emits is now server-issued and
+  safe to store for resumption.** Previously events read without embedded
+  offsets got synthetic `"nextOffset/i"` offsets that the bus saved as
+  resume positions and the server would not recognize, structurally breaking
+  `SubscribeWithReplay` with this store. Events within a chunk now carry the
+  chunk-start offset (resume re-reads the chunk: duplicates possible, skips
+  impossible), the last event of a chunk carries the server's next-offset,
+  and `Append`'s return value is documented as the exact resume point after
+  the appended event.
+- **state: message application is serialized.** A concurrent `Reset` control
+  message could be overwritten by a logically-earlier change that was applied
+  after the reset cleared collections; `LastOffset` could also advance past a
+  concurrently failed event, permanently skipping it on resume. Apply,
+  ApplyChangeMessage, and ApplyControlMessage now run one at a time, and
+  `LastOffset` only advances past successfully applied events.
+- **state: unknown operations are errors.** A change message with a missing
+  or misspelled `operation` (e.g. `"Insert"`) was silently ignored while the
+  offset still advanced — a producer bug produced zero signal. It now
+  returns an error, fires `WithOnError`, and does not advance the offset.
+- **state: `WithOnError` fires on every error path** (envelope unmarshal,
+  change unmarshal, strict-mode unknown type, collection apply), not just
+  collection apply failures.
+- **state: non-state events on mixed streams are skipped cleanly** in both
+  strict and non-strict mode (previously strict mode aborted replay with
+  `unknown entity type: ` on the first foreign event).
+- **state: `Materializer.Replay` applies upcasts** (it used `bus.Replay`
+  instead of `bus.ReplayWithUpcast`, bypassing schema migration).
+- **SubscribeWithReplay no longer has a replay→live gap.** An event persisted
+  after the replay pass drained but before the live subscription registered
+  was previously missed until the next restart. A catch-up replay pass now
+  runs after subscription registration; events in the overlap window may be
+  delivered twice (at-least-once — keep handlers idempotent).
+- **Upcast functions no longer run under the registry lock.** An upcast
+  function that called back into the registry (e.g. `RegisterUpcast`)
+  deadlocked; registration during an in-flight chain is now safe.
+- **`SetUpcastErrorHandler` is now synchronized** with concurrent
+  replay/publish (previously a data race).
+- **otel: durations are recorded with sub-millisecond precision.**
+  `duration.Milliseconds()` truncated, so typical in-process handlers all
+  recorded 0ms and the histograms were useless.
+- **otel: the persist span no longer carries an always-0 `position`
+  attribute.** The store-assigned offset is recorded on the span at
+  completion instead (`event.offset`).
+
+### Changed
+
+- **`Observability` interface (breaking).** `OnHandlerComplete` and
+  `OnPersistComplete` now receive the event type, and `OnPersistComplete`
+  receives the store-assigned `Offset`; `OnPersistStart` loses its
+  meaningless `position` parameter. This removes per-handler context-value
+  allocations in the otel implementation and gives error metrics correct
+  attributes.
+- **`Offset` ordering contract relaxed.** Offsets are documented as opaque
+  resumption tokens; ordering is store-defined. The bundled MemoryStore and
+  sqlite store still produce lexicographically ordered offsets.
+- Deprecated `Set*` configuration methods are documented as not safe to call
+  concurrently with `Publish`.
+- **sqlite: streaming reads are batched by default** (batch size 1000).
+  Unbatched `ReadStream` pinned a connection and WAL read snapshot for the
+  entire iteration — a slow consumer meant unbounded WAL growth. Batched
+  iteration observes concurrently appended events; the previous point-in-time
+  snapshot behavior remains available via `WithStreamBatchSize` (documented
+  there).
+- **sqlite: dropped the unused `idx_events_type` index** (schema v3) — no
+  query filters by type; it was pure write amplification on every append.
+
+### Added
+
+- `WithAsyncHandlerLimit(n)` bounds concurrently running async handler
+  goroutines; `Publish` blocks when the limit is reached (backpressure
+  instead of unbounded goroutine growth).
+- **state: snapshot orchestration.** `Materializer.SaveSnapshotTo` and
+  `LoadSnapshotFrom` bridge the materializer to `EventStoreSnapshotter`, so
+  compacting a projection is now: load snapshot → replay tail → periodically
+  save snapshot → optionally `TruncateBefore` the snapshot offset.
+- **durablestream: `WithRetry(attempts, baseDelay)`** — bounded
+  exponential-backoff retry for transient failures (network errors, 5xx,
+  429) on Append and Read; defaults to 3 attempts / 100ms. A transient blip
+  is no longer a permanent gap in the event log.
+- **durablestream: `WithDecodeErrorHandler`** — malformed stored events were
+  skipped silently unless a logger was configured; now a dedicated callback
+  can observe them.
+- **durablestream: cached stream writer.** Append no longer performs a HEAD
+  request per call (2 HTTP round trips → 1 after the first append); the
+  cached writer is invalidated and recreated on failure.
+
 ## [0.12.0] - 2026-07-04
 
 ### Fixed
