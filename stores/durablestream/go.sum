@@ -2,5 +2,5 @@ github.com/ahimsalabs/durable-streams-go v0.0.0-20251220072926-9430608b4163 h1:A
 github.com/ahimsalabs/durable-streams-go v0.0.0-20251220072926-9430608b4163/go.mod h1:CRY4a4F3s64YLkAADqKNnEg3Nm4wUYe50QP8KLxpGpE=
 github.com/go4org/hashtriemap v0.0.0-20251130024219-545ba229f689 h1:0psnKZ+N2IP43/SZC8SKx6OpFJwLmQb9m9QyV9BC2f8=
 github.com/go4org/hashtriemap v0.0.0-20251130024219-545ba229f689/go.mod h1:OGmRfY/9QEK2P5zCRtmqfbCF283xPkU2dvVA4MvbvpI=
-github.com/jilio/ebu v0.13.0 h1:8byLvGoK4Lgt2whB9vIj5X3Y0GjP4Ak9HlUsvLryvDY=
-github.com/jilio/ebu v0.13.0/go.mod h1:HudFk9G56WhAmSpucnJFC7nf6/uSpCcEZYS2sItng74=
+github.com/jilio/ebu v0.14.0 h1:Bv5nhUf9Dyybl1GjdW/KSgL7LLBLi8F1uCGna899xY8=
+github.com/jilio/ebu v0.14.0/go.mod h1:HudFk9G56WhAmSpucnJFC7nf6/uSpCcEZYS2sItng74=
