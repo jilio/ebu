@@ -46,11 +46,31 @@ func WithEntityType(typeName string) ChangeOption {
 // MaterializerOption configures a Materializer.
 type MaterializerOption func(*materializerConfig)
 
+// ApplyErrorPolicy determines how the Materializer handles a state message
+// that cannot be decoded (see ErrUndecodable). It mirrors ebu's
+// ReplayErrorPolicy for durable subscriptions.
+type ApplyErrorPolicy int
+
+const (
+	// ApplyAbort makes Apply return the decode error without advancing
+	// LastOffset (default). The next replay hits the same event again. Use
+	// this when an undecodable message means a bug that must be fixed
+	// before proceeding.
+	ApplyAbort ApplyErrorPolicy = iota
+
+	// ApplySkip reports the decode error to WithOnError and advances
+	// LastOffset past the poison message, so one bad payload cannot wedge
+	// every future replay. Store failures are never skipped: they are
+	// transient, and the event must be retried.
+	ApplySkip
+)
+
 type materializerConfig struct {
-	onReset      func()
-	onSnapshot   func(start bool)
-	onError      func(error)
-	strictSchema bool
+	onReset          func()
+	onSnapshot       func(start bool)
+	onError          func(error)
+	strictSchema     bool
+	applyErrorPolicy ApplyErrorPolicy
 }
 
 // WithOnReset sets a callback invoked when a reset control message is received.
@@ -76,6 +96,14 @@ func WithOnSnapshot(fn func(start bool)) MaterializerOption {
 func WithOnError(fn func(error)) MaterializerOption {
 	return func(c *materializerConfig) {
 		c.onError = fn
+	}
+}
+
+// WithApplyErrorPolicy sets how the materializer treats undecodable state
+// messages during Apply. The default is ApplyAbort.
+func WithApplyErrorPolicy(policy ApplyErrorPolicy) MaterializerOption {
+	return func(c *materializerConfig) {
+		c.applyErrorPolicy = policy
 	}
 }
 

@@ -228,11 +228,23 @@ func (s *SQLiteStore) prepareStatements() error {
 
 // parseOffset converts an Offset to an int64 position.
 // OffsetOldest maps to 0, otherwise parses the numeric string.
+// OffsetNewest is not parseable; callers that accept it must resolve it
+// to a concrete position first (see resolveNewest).
 func parseOffset(offset eventbus.Offset) (int64, error) {
 	if offset == eventbus.OffsetOldest {
 		return 0, nil
 	}
 	return strconv.ParseInt(string(offset), 10, 64)
+}
+
+// resolveNewest resolves OffsetNewest to the current tail of the log:
+// MAX(position) at call time, or 0 when the events table is empty.
+func (s *SQLiteStore) resolveNewest(ctx context.Context) (int64, error) {
+	var position sql.NullInt64
+	if err := s.db.QueryRowContext(ctx, "SELECT MAX(position) FROM events").Scan(&position); err != nil {
+		return 0, fmt.Errorf("sqlite: resolve newest offset: %w", err)
+	}
+	return position.Int64, nil
 }
 
 // formatOffset converts an int64 position to an Offset.
@@ -279,6 +291,9 @@ type rowScanner interface {
 }
 
 // Read returns events starting after the given offset.
+// OffsetNewest resolves at call time to the current tail of the log: no
+// events, nil error, and a concrete resumable offset (the last position,
+// or OffsetOldest when the store is empty) as nextOffset.
 func (s *SQLiteStore) Read(ctx context.Context, from eventbus.Offset, limit int) ([]*eventbus.StoredEvent, eventbus.Offset, error) {
 	start := time.Now()
 	var events []*eventbus.StoredEvent
@@ -289,6 +304,18 @@ func (s *SQLiteStore) Read(ctx context.Context, from eventbus.Offset, limit int)
 			s.metricsHook.OnRead(time.Since(start), len(events), err)
 		}
 	}()
+
+	if from == eventbus.OffsetNewest {
+		var position int64
+		position, err = s.resolveNewest(ctx)
+		if err != nil {
+			return nil, from, err
+		}
+		if position == 0 {
+			return nil, eventbus.OffsetOldest, nil
+		}
+		return nil, formatOffset(position), nil
+	}
 
 	position, err := parseOffset(from)
 	if err != nil {
@@ -346,9 +373,20 @@ func (s *SQLiteStore) scanEvents(rows rowScanner) ([]*eventbus.StoredEvent, erro
 	return events, nil
 }
 
-// SaveOffset implements eventbus.SubscriptionStore
+// SaveOffset implements eventbus.SubscriptionStore.
+// OffsetNewest is resolved at call time to the current tail of the log and
+// that concrete position is persisted, so LoadOffset always returns an
+// offset the store can resume from.
 func (s *SQLiteStore) SaveOffset(ctx context.Context, subscriptionID string, offset eventbus.Offset) error {
 	start := time.Now()
+
+	if offset == eventbus.OffsetNewest {
+		position, err := s.resolveNewest(ctx)
+		if err != nil {
+			return err
+		}
+		offset = formatOffset(position)
+	}
 
 	position, err := parseOffset(offset)
 	if err != nil {
@@ -495,6 +533,9 @@ func (s *SQLiteStore) Close() error {
 // - The iteration completes naturally
 // - The consumer breaks out of the range loop
 // - The context is cancelled
+//
+// OffsetNewest is the tail of the log at call time, so streaming from it
+// yields nothing.
 func (s *SQLiteStore) ReadStream(ctx context.Context, from eventbus.Offset) iter.Seq2[*eventbus.StoredEvent, error] {
 	return func(yield func(*eventbus.StoredEvent, error) bool) {
 		start := time.Now()
@@ -506,6 +547,10 @@ func (s *SQLiteStore) ReadStream(ctx context.Context, from eventbus.Offset) iter
 				s.metricsHook.OnRead(time.Since(start), eventCount, iterErr)
 			}
 		}()
+
+		if from == eventbus.OffsetNewest {
+			return
+		}
 
 		position, err := parseOffset(from)
 		if err != nil {
@@ -596,15 +641,14 @@ func (s *SQLiteStore) streamBatched(
 		default:
 		}
 
-		query := "SELECT position, type, data, timestamp FROM events WHERE position > ? ORDER BY position LIMIT ?"
-		rows, err := s.db.QueryContext(ctx, query, currentPos, batchSize)
+		rows, err := s.readStmt.QueryContext(ctx, currentPos, batchSize)
 		if err != nil {
 			*iterErr = fmt.Errorf("sqlite: read stream batch: %w", err)
 			yield(nil, *iterErr)
 			return
 		}
 
-		batchCount, lastPos, cont := s.streamBatch(rows, eventCount, iterErr, yield)
+		batchCount, lastPos, cont := s.streamBatch(ctx, rows, eventCount, iterErr, yield)
 		if !cont {
 			return
 		}
@@ -626,12 +670,24 @@ func (s *SQLiteStore) streamBatched(
 // streamBatch processes a single batch of rows. Returns (batchCount, lastPos, shouldContinue).
 // shouldContinue is false if iteration should stop (error or early termination).
 func (s *SQLiteStore) streamBatch(
+	ctx context.Context,
 	rows rowScanner,
 	eventCount *int,
 	iterErr *error,
 	yield func(*eventbus.StoredEvent, error) bool,
 ) (batchCount int, lastPos int64, cont bool) {
 	for rows.Next() {
+		// Checked per row, not just per batch, so a large batch still
+		// responds promptly to cancellation.
+		select {
+		case <-ctx.Done():
+			rows.Close() // Best effort close, cancellation takes precedence
+			*iterErr = ctx.Err()
+			yield(nil, *iterErr)
+			return batchCount, lastPos, false
+		default:
+		}
+
 		var position int64
 		event := &eventbus.StoredEvent{}
 		if err := rows.Scan(&position, &event.Type, &event.Data, &event.Timestamp); err != nil {
@@ -650,6 +706,17 @@ func (s *SQLiteStore) streamBatch(
 			rows.Close() // Best effort close on early termination
 			return batchCount, lastPos, false
 		}
+	}
+
+	// rows.Err() is the only place database/sql surfaces mid-iteration
+	// failures (including context cancellation); without this check a failed
+	// batch is indistinguishable from the end of the log and the stream would
+	// silently end after a partial replay.
+	if err := rows.Err(); err != nil {
+		rows.Close() // Best effort close, iteration error takes precedence
+		*iterErr = fmt.Errorf("sqlite: iterate events: %w", err)
+		yield(nil, *iterErr)
+		return batchCount, lastPos, false
 	}
 
 	if err := rows.Close(); err != nil {

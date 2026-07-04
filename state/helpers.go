@@ -67,9 +67,10 @@ func newChangeMessage[T any](op Operation, key string, value, oldValue *T, opts 
 		opt(cfg)
 	}
 
-	// Determine entity type
-	var zero T
-	entityType := EntityType(zero)
+	// Determine entity type. entityTypeFor derives the name from the type
+	// itself, so pointer entity types with a value-receiver StateTypeName
+	// don't panic on a nil zero value.
+	entityType := entityTypeFor[T]()
 	if cfg.entityType != "" {
 		entityType = cfg.entityType
 	}

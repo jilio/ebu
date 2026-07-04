@@ -371,6 +371,27 @@ func TestHandlerTracing(t *testing.T) {
 		}
 	})
 
+	t.Run("sync_handler_success_status_unset", func(t *testing.T) {
+		exporter.Reset()
+
+		ctx := context.Background()
+		ctx = obs.OnHandlerStart(ctx, "TestEvent", false)
+		obs.OnHandlerComplete(ctx, "TestEvent", 100*time.Millisecond, nil)
+
+		tp.ForceFlush(ctx)
+
+		spans := exporter.GetSpans()
+		if len(spans) != 1 {
+			t.Fatalf("expected 1 span, got %d", len(spans))
+		}
+
+		// The OTel spec reserves Ok for explicit operator affirmation;
+		// success must leave the status Unset.
+		if spans[0].Status.Code != codes.Unset {
+			t.Errorf("expected unset status on success, got %v", spans[0].Status.Code)
+		}
+	})
+
 	t.Run("handler_with_error", func(t *testing.T) {
 		exporter.Reset()
 
@@ -438,6 +459,12 @@ func TestPersistTracing(t *testing.T) {
 		}
 		if !foundOffset {
 			t.Error("span missing or incorrect event.offset attribute")
+		}
+
+		// The OTel spec reserves Ok for explicit operator affirmation;
+		// success must leave the status Unset.
+		if span.Status.Code != codes.Unset {
+			t.Errorf("expected unset status on success, got %v", span.Status.Code)
 		}
 	})
 
@@ -919,3 +946,222 @@ func (emptyAttributedEvent) SpanAttributes() []attribute.KeyValue {
 // Verify SpanAttributer interface is exported properly
 var _ SpanAttributer = (*attributedEvent)(nil)
 var _ SpanAttributer = (*emptyAttributedEvent)(nil)
+
+// TestCompleteEndsStoredSpan verifies that the Complete hooks end the exact
+// span started by the matching Start hook, even when the context's active
+// span has been replaced in between (e.g. by a chained Observability
+// implementation starting its own span).
+func TestCompleteEndsStoredSpan(t *testing.T) {
+	newTracing := func(t *testing.T) (*tracetest.InMemoryExporter, *sdktrace.TracerProvider, *Observability) {
+		exporter := tracetest.NewInMemoryExporter()
+		tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+		obs, err := New(WithTracerProvider(tp))
+		if err != nil {
+			t.Fatalf("New() failed: %v", err)
+		}
+		return exporter, tp, obs
+	}
+
+	t.Run("publish", func(t *testing.T) {
+		exporter, tp, obs := newTracing(t)
+
+		ctx := obs.OnPublishStart(context.Background(), "TestEvent", struct{}{})
+		// Simulate a chained implementation replacing the active span.
+		ctx, interloper := tp.Tracer("chained").Start(ctx, "interloper")
+
+		obs.OnPublishComplete(ctx, "TestEvent")
+		tp.ForceFlush(ctx)
+
+		spans := exporter.GetSpans()
+		if len(spans) != 1 || spans[0].Name != "eventbus.publish: TestEvent" {
+			t.Fatalf("expected only the publish span to end, got %v", spans)
+		}
+		interloper.End()
+	})
+
+	t.Run("handler", func(t *testing.T) {
+		exporter, tp, obs := newTracing(t)
+
+		ctx := obs.OnHandlerStart(context.Background(), "TestEvent", false)
+		ctx, interloper := tp.Tracer("chained").Start(ctx, "interloper")
+
+		obs.OnHandlerComplete(ctx, "TestEvent", time.Millisecond, nil)
+		tp.ForceFlush(ctx)
+
+		spans := exporter.GetSpans()
+		if len(spans) != 1 || spans[0].Name != "eventbus.handler: TestEvent" {
+			t.Fatalf("expected only the handler span to end, got %v", spans)
+		}
+		interloper.End()
+	})
+
+	t.Run("persist", func(t *testing.T) {
+		exporter, tp, obs := newTracing(t)
+
+		ctx := obs.OnPersistStart(context.Background(), "TestEvent")
+		ctx, interloper := tp.Tracer("chained").Start(ctx, "interloper")
+
+		obs.OnPersistComplete(ctx, "TestEvent", time.Millisecond, eventbus.Offset(""), nil)
+		tp.ForceFlush(ctx)
+
+		spans := exporter.GetSpans()
+		if len(spans) != 1 || spans[0].Name != "eventbus.persist: TestEvent" {
+			t.Fatalf("expected only the persist span to end, got %v", spans)
+		}
+		interloper.End()
+	})
+
+	t.Run("fallback_to_context_span", func(t *testing.T) {
+		exporter, tp, obs := newTracing(t)
+
+		// No matching Start hook: the Complete hook falls back to the
+		// context's active span.
+		ctx, _ := tp.Tracer("external").Start(context.Background(), "external")
+		obs.OnPublishComplete(ctx, "TestEvent")
+		tp.ForceFlush(ctx)
+
+		spans := exporter.GetSpans()
+		if len(spans) != 1 || spans[0].Name != "external" {
+			t.Fatalf("expected fallback to end the context span, got %v", spans)
+		}
+	})
+}
+
+// TestDurationErrorAttribute verifies that duration histograms are tagged
+// with an error attribute so error latencies are separable from successes.
+func TestDurationErrorAttribute(t *testing.T) {
+	// errorValues returns the set of error attribute values recorded on the
+	// named histogram's data points.
+	errorValues := func(rm metricdata.ResourceMetrics, name string) map[bool]bool {
+		values := make(map[bool]bool)
+		for _, scopeMetric := range rm.ScopeMetrics {
+			for _, m := range scopeMetric.Metrics {
+				if m.Name != name {
+					continue
+				}
+				if histo, ok := m.Data.(metricdata.Histogram[float64]); ok {
+					for _, dp := range histo.DataPoints {
+						for _, attr := range dp.Attributes.ToSlice() {
+							if attr.Key == "error" {
+								values[attr.Value.AsBool()] = true
+							}
+						}
+					}
+				}
+			}
+		}
+		return values
+	}
+
+	t.Run("handler_duration", func(t *testing.T) {
+		reader := sdkmetric.NewManualReader()
+		mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+
+		obs, err := New(WithMeterProvider(mp))
+		if err != nil {
+			t.Fatalf("New() failed: %v", err)
+		}
+
+		ctx := obs.OnHandlerStart(context.Background(), "TestEvent", false)
+		obs.OnHandlerComplete(ctx, "TestEvent", time.Millisecond, nil)
+
+		ctx = obs.OnHandlerStart(context.Background(), "TestEvent", false)
+		obs.OnHandlerComplete(ctx, "TestEvent", time.Millisecond, errors.New("boom"))
+
+		var rm metricdata.ResourceMetrics
+		if err := reader.Collect(context.Background(), &rm); err != nil {
+			t.Fatalf("Collect failed: %v", err)
+		}
+
+		values := errorValues(rm, "eventbus.handler.duration")
+		if !values[false] {
+			t.Error("handler duration missing error=false data point")
+		}
+		if !values[true] {
+			t.Error("handler duration missing error=true data point")
+		}
+	})
+
+	t.Run("persist_duration", func(t *testing.T) {
+		reader := sdkmetric.NewManualReader()
+		mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+
+		obs, err := New(WithMeterProvider(mp))
+		if err != nil {
+			t.Fatalf("New() failed: %v", err)
+		}
+
+		ctx := obs.OnPersistStart(context.Background(), "TestEvent")
+		obs.OnPersistComplete(ctx, "TestEvent", time.Millisecond, eventbus.Offset("00000000000000000001"), nil)
+
+		ctx = obs.OnPersistStart(context.Background(), "TestEvent")
+		obs.OnPersistComplete(ctx, "TestEvent", time.Millisecond, eventbus.Offset(""), errors.New("boom"))
+
+		var rm metricdata.ResourceMetrics
+		if err := reader.Collect(context.Background(), &rm); err != nil {
+			t.Fatalf("Collect failed: %v", err)
+		}
+
+		values := errorValues(rm, "eventbus.persist.duration")
+		if !values[false] {
+			t.Error("persist duration missing error=false data point")
+		}
+		if !values[true] {
+			t.Error("persist duration missing error=true data point")
+		}
+	})
+}
+
+// TestDurationBucketBoundaries verifies that the duration histograms use the
+// explicit sub-millisecond bucket boundaries rather than the SDK defaults
+// (which start at 5ms and would collapse in-process handler latencies into
+// the first bucket).
+func TestDurationBucketBoundaries(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+
+	obs, err := New(WithMeterProvider(mp))
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	ctx := obs.OnHandlerStart(context.Background(), "TestEvent", false)
+	obs.OnHandlerComplete(ctx, "TestEvent", 100*time.Microsecond, nil)
+
+	ctx = obs.OnPersistStart(context.Background(), "TestEvent")
+	obs.OnPersistComplete(ctx, "TestEvent", 100*time.Microsecond, eventbus.Offset("00000000000000000001"), nil)
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("Collect failed: %v", err)
+	}
+
+	for _, name := range []string{"eventbus.handler.duration", "eventbus.persist.duration"} {
+		found := false
+		for _, scopeMetric := range rm.ScopeMetrics {
+			for _, m := range scopeMetric.Metrics {
+				if m.Name != name {
+					continue
+				}
+				histo, ok := m.Data.(metricdata.Histogram[float64])
+				if !ok {
+					t.Fatalf("%s: expected float64 histogram, got %T", name, m.Data)
+				}
+				for _, dp := range histo.DataPoints {
+					found = true
+					if len(dp.Bounds) != len(durationBucketBoundaries) {
+						t.Fatalf("%s: expected %d bucket boundaries, got %d", name, len(durationBucketBoundaries), len(dp.Bounds))
+					}
+					for i, bound := range dp.Bounds {
+						if bound != durationBucketBoundaries[i] {
+							t.Errorf("%s: bound[%d] = %v, want %v", name, i, bound, durationBucketBoundaries[i])
+						}
+					}
+				}
+			}
+		}
+		if !found {
+			t.Errorf("%s: no data points collected", name)
+		}
+	}
+}

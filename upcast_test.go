@@ -528,11 +528,12 @@ func TestUpcastMarshalError(t *testing.T) {
 	}
 }
 
-// TestMultipleUpcastsForSameType tests handling multiple upcasts from same source
+// TestMultipleUpcastsForSameType verifies that a second upcaster for the same
+// source type is rejected: apply follows a single chain, so the duplicate
+// could never run — silently accepting it was a dead registration.
 func TestMultipleUpcastsForSameType(t *testing.T) {
 	bus := New()
 
-	// Register first upcast from Type1
 	err := RegisterUpcastFunc(bus, "Type1", "Type2A", func(data json.RawMessage) (json.RawMessage, string, error) {
 		return append(data, []byte(`"A"`)...), "Type2A", nil
 	})
@@ -540,26 +541,23 @@ func TestMultipleUpcastsForSameType(t *testing.T) {
 		t.Fatalf("Failed to register first upcast: %v", err)
 	}
 
-	// Register second upcast from Type1 (different target)
+	// A second upcast from the same source type must be rejected.
 	err = RegisterUpcastFunc(bus, "Type1", "Type2B", func(data json.RawMessage) (json.RawMessage, string, error) {
 		return append(data, []byte(`"B"`)...), "Type2B", nil
 	})
-	if err != nil {
-		t.Fatalf("Failed to register second upcast: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "already registered") {
+		t.Fatalf("Expected duplicate-registration rejection, got: %v", err)
 	}
 
-	// Apply upcast - should use the first one registered
+	// The first registration keeps working.
 	testData := json.RawMessage(`{"test":`)
 	resultData, resultType, err := bus.upcastRegistry.apply(testData, "Type1")
 	if err != nil {
 		t.Fatalf("Failed to apply upcast: %v", err)
 	}
-
-	// Should apply the first upcast registered
 	if resultType != "Type2A" {
 		t.Errorf("Expected Type2A, got %s", resultType)
 	}
-
 	if !strings.Contains(string(resultData), "A") {
 		t.Error("Expected data to contain 'A'")
 	}
@@ -783,36 +781,22 @@ func TestApplyUpcastWithoutErrorHandler(t *testing.T) {
 func TestHasCycleDFSWithVisitedNode(t *testing.T) {
 	bus := New()
 
-	// Create a complex graph with multiple paths to the same node
-	// A has two upcasters: A->B and A->C
+	// Build a chain A -> B -> D and close the cycle with D -> A
 	bus.upcastRegistry.mu.Lock()
-	bus.upcastRegistry.upcasters["A"] = []Upcaster{
-		{FromType: "A", ToType: "B", Upcast: func(data json.RawMessage) (json.RawMessage, string, error) {
+	bus.upcastRegistry.upcasters["A"] = Upcaster{
+		FromType: "A", ToType: "B", Upcast: func(data json.RawMessage) (json.RawMessage, string, error) {
 			return data, "B", nil
-		}},
-		{FromType: "A", ToType: "C", Upcast: func(data json.RawMessage) (json.RawMessage, string, error) {
-			return data, "C", nil
-		}},
+		},
 	}
-	// Both B and C lead to D
-	bus.upcastRegistry.upcasters["B"] = []Upcaster{
-		{FromType: "B", ToType: "D", Upcast: func(data json.RawMessage) (json.RawMessage, string, error) {
+	bus.upcastRegistry.upcasters["B"] = Upcaster{
+		FromType: "B", ToType: "D", Upcast: func(data json.RawMessage) (json.RawMessage, string, error) {
 			return data, "D", nil
-		}},
+		},
 	}
-	bus.upcastRegistry.upcasters["C"] = []Upcaster{
-		{FromType: "C", ToType: "D", Upcast: func(data json.RawMessage) (json.RawMessage, string, error) {
-			return data, "D", nil
-		}},
-	}
-	bus.upcastRegistry.mu.Unlock()
-
-	// Add D -> A to create a cycle
-	bus.upcastRegistry.mu.Lock()
-	bus.upcastRegistry.upcasters["D"] = []Upcaster{
-		{FromType: "D", ToType: "A", Upcast: func(data json.RawMessage) (json.RawMessage, string, error) {
+	bus.upcastRegistry.upcasters["D"] = Upcaster{
+		FromType: "D", ToType: "A", Upcast: func(data json.RawMessage) (json.RawMessage, string, error) {
 			return data, "A", nil
-		}},
+		},
 	}
 	bus.upcastRegistry.mu.Unlock()
 
@@ -856,13 +840,11 @@ func TestUpcastLoopDetectionInApply(t *testing.T) {
 	// Note: This shouldn't be registered due to cycle detection, but we'll simulate it
 	// by manually adding it to test the runtime loop detection
 	bus.upcastRegistry.mu.Lock()
-	bus.upcastRegistry.upcasters["Type3"] = []Upcaster{
-		{
-			FromType: "Type3",
-			ToType:   "Type1", // Loop back to Type1
-			Upcast: func(data json.RawMessage) (json.RawMessage, string, error) {
-				return data, "Type1", nil
-			},
+	bus.upcastRegistry.upcasters["Type3"] = Upcaster{
+		FromType: "Type3",
+		ToType:   "Type1", // Loop back to Type1
+		Upcast: func(data json.RawMessage) (json.RawMessage, string, error) {
+			return data, "Type1", nil
 		},
 	}
 	bus.upcastRegistry.mu.Unlock()

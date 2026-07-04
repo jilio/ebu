@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1795,5 +1796,188 @@ func TestSubscribeWithReplayNilBusAndHandler(t *testing.T) {
 	err = SubscribeWithReplay[TestEvent](context.Background(), bus, "nil-handler", nil)
 	if err == nil || !strings.Contains(err.Error(), "handler cannot be nil") {
 		t.Errorf("Expected nil handler error, got: %v", err)
+	}
+}
+
+// gapReadStore is a non-streaming store whose Read returns a scripted
+// sequence of batches, including zero-event batches that still advance the
+// offset — the shape a remote store produces when a whole chunk is skipped.
+type gapReadStore struct {
+	batches []struct {
+		events []*StoredEvent
+		next   Offset
+	}
+	calls int
+}
+
+func (s *gapReadStore) Append(ctx context.Context, event *Event) (Offset, error) {
+	return "", errors.New("not used")
+}
+
+func (s *gapReadStore) Read(ctx context.Context, from Offset, limit int) ([]*StoredEvent, Offset, error) {
+	if s.calls >= len(s.batches) {
+		return nil, from, nil // tail: no events, non-advancing offset
+	}
+	b := s.batches[s.calls]
+	s.calls++
+	return b.events, b.next, nil
+}
+
+// TestReplayContinuesPastEmptyAdvancingBatch verifies that a zero-event
+// batch with an advancing offset does not terminate Replay: only a
+// non-advancing offset marks the tail. Regression test for silent event
+// loss when a store skips an entire chunk (e.g. undecodable events).
+func TestReplayContinuesPastEmptyAdvancingBatch(t *testing.T) {
+	ev := func(n int) *StoredEvent {
+		return &StoredEvent{Offset: Offset(fmt.Sprintf("%020d", n)), Type: "t", Data: []byte(`{}`)}
+	}
+	store := &gapReadStore{}
+	store.batches = []struct {
+		events []*StoredEvent
+		next   Offset
+	}{
+		{[]*StoredEvent{ev(1), ev(2)}, ev(2).Offset},
+		{nil, ev(5).Offset}, // skipped chunk: advances with no events
+		{[]*StoredEvent{ev(6)}, ev(6).Offset},
+	}
+
+	bus := New(WithStore(store))
+	var got []Offset
+	err := bus.Replay(context.Background(), OffsetOldest, func(e *StoredEvent) error {
+		got = append(got, e.Offset)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Replay failed: %v", err)
+	}
+	want := []Offset{ev(1).Offset, ev(2).Offset, ev(6).Offset}
+	if len(got) != len(want) {
+		t.Fatalf("Expected %d events, got %d (%v)", len(want), len(got), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("Event %d: expected offset %s, got %s", i, want[i], got[i])
+		}
+	}
+}
+
+// TestMemoryStoreOffsetNewest verifies that OffsetNewest resolves to the
+// current tail: reads return no historical events and a concrete resumable
+// offset, and SaveOffset persists the concrete tail rather than "$".
+func TestMemoryStoreOffsetNewest(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("empty store", func(t *testing.T) {
+		store := NewMemoryStore()
+		events, next, err := store.Read(ctx, OffsetNewest, 0)
+		if err != nil || len(events) != 0 {
+			t.Fatalf("Expected no events, nil error; got %d events, err=%v", len(events), err)
+		}
+		if next != OffsetOldest {
+			t.Errorf("Expected OffsetOldest tail for empty store, got %q", next)
+		}
+	})
+
+	t.Run("read resolves to tail", func(t *testing.T) {
+		store := NewMemoryStore()
+		bus := New(WithStore(store))
+		for i := 1; i <= 3; i++ {
+			Publish(bus, TestEvent{ID: i})
+		}
+
+		events, next, err := store.Read(ctx, OffsetNewest, 0)
+		if err != nil || len(events) != 0 {
+			t.Fatalf("Expected no events, nil error; got %d events, err=%v", len(events), err)
+		}
+		if next != Offset("00000000000000000003") {
+			t.Errorf("Expected concrete tail offset, got %q", next)
+		}
+
+		// The returned offset must be resumable: a later event is readable from it.
+		Publish(bus, TestEvent{ID: 4})
+		events, _, err = store.Read(ctx, next, 0)
+		if err != nil || len(events) != 1 {
+			t.Fatalf("Expected exactly the post-tail event, got %d events, err=%v", len(events), err)
+		}
+	})
+
+	t.Run("stream yields nothing from tail", func(t *testing.T) {
+		store := NewMemoryStore()
+		bus := New(WithStore(store))
+		Publish(bus, TestEvent{ID: 1})
+
+		for range store.ReadStream(ctx, OffsetNewest) {
+			t.Fatal("Expected no events streaming from OffsetNewest")
+		}
+	})
+
+	t.Run("save offset resolves to concrete tail", func(t *testing.T) {
+		store := NewMemoryStore()
+		bus := New(WithStore(store))
+		Publish(bus, TestEvent{ID: 1})
+
+		if err := store.SaveOffset(ctx, "sub", OffsetNewest); err != nil {
+			t.Fatalf("SaveOffset failed: %v", err)
+		}
+		got, err := store.LoadOffset(ctx, "sub")
+		if err != nil {
+			t.Fatalf("LoadOffset failed: %v", err)
+		}
+		if got != Offset("00000000000000000001") {
+			t.Errorf("Expected concrete tail offset, got %q", got)
+		}
+	})
+}
+
+// TestSubscribeWithReplaySequentialNoOverlap verifies that Sequential()
+// mutual exclusion holds during the replay passes: once the live
+// subscription registers (before the catch-up pass), a concurrent Publish
+// must not enter the handler while the replay path is inside it.
+// Regression test — the replay path used to call the handler without
+// taking the handler mutex.
+func TestSubscribeWithReplaySequentialNoOverlap(t *testing.T) {
+	store := NewMemoryStore()
+	bus := New(WithStore(store))
+
+	for i := 0; i < 20; i++ {
+		Publish(bus, TestEvent{ID: i})
+	}
+
+	var inside atomic.Int32
+	var overlapped atomic.Bool
+	handler := func(e TestEvent) {
+		if inside.Add(1) > 1 {
+			overlapped.Store(true)
+		}
+		time.Sleep(200 * time.Microsecond)
+		inside.Add(-1)
+	}
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		id := 1000
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				Publish(bus, TestEvent{ID: id})
+				id++
+			}
+		}
+	}()
+
+	err := SubscribeWithReplay(context.Background(), bus, "seq-overlap", handler, Sequential())
+	close(stop)
+	wg.Wait()
+
+	if err != nil {
+		t.Fatalf("SubscribeWithReplay failed: %v", err)
+	}
+	if overlapped.Load() {
+		t.Error("Sequential handler was entered concurrently during replay")
 	}
 }

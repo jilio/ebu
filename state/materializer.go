@@ -3,7 +3,9 @@ package state
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	eventbus "github.com/jilio/ebu"
@@ -11,17 +13,22 @@ import (
 
 // Store is a generic interface for state storage.
 // Implementations can use any backing store (memory, database, etc.).
+//
+// Every method can report failure: a durable backend that swallowed errors
+// would let the materializer advance LastOffset past updates that were never
+// applied, silently corrupting snapshots and any log compaction based on
+// them. The materializer never advances the offset when a store call fails.
 type Store[T any] interface {
 	// Get retrieves an entity by its composite key.
-	Get(compositeKey string) (T, bool)
+	Get(compositeKey string) (T, bool, error)
 	// Set stores an entity with the given composite key.
-	Set(compositeKey string, value T)
+	Set(compositeKey string, value T) error
 	// Delete removes an entity by its composite key.
-	Delete(compositeKey string)
+	Delete(compositeKey string) error
 	// Clear removes all entities from the store.
-	Clear()
+	Clear() error
 	// All returns a copy of all entities in the store.
-	All() map[string]T
+	All() (map[string]T, error)
 }
 
 // MemoryStore is an in-memory implementation of Store.
@@ -39,43 +46,46 @@ func NewMemoryStore[T any]() *MemoryStore[T] {
 }
 
 // Get retrieves an entity by its composite key.
-func (s *MemoryStore[T]) Get(key string) (T, bool) {
+func (s *MemoryStore[T]) Get(key string) (T, bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	v, ok := s.data[key]
-	return v, ok
+	return v, ok, nil
 }
 
 // Set stores an entity with the given composite key.
-func (s *MemoryStore[T]) Set(key string, value T) {
+func (s *MemoryStore[T]) Set(key string, value T) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.data[key] = value
+	return nil
 }
 
 // Delete removes an entity by its composite key.
-func (s *MemoryStore[T]) Delete(key string) {
+func (s *MemoryStore[T]) Delete(key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.data, key)
+	return nil
 }
 
 // Clear removes all entities from the store.
-func (s *MemoryStore[T]) Clear() {
+func (s *MemoryStore[T]) Clear() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.data = make(map[string]T)
+	return nil
 }
 
 // All returns a copy of all entities in the store.
-func (s *MemoryStore[T]) All() map[string]T {
+func (s *MemoryStore[T]) All() (map[string]T, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	result := make(map[string]T, len(s.data))
 	for k, v := range s.data {
 		result[k] = v
 	}
-	return result
+	return result, nil
 }
 
 // TypedCollection provides type-safe access to a collection of entities.
@@ -88,10 +98,9 @@ type TypedCollection[T any] struct {
 // NewTypedCollection creates a collection for a specific entity type.
 // The entity type name is determined from the type parameter T.
 func NewTypedCollection[T any](store Store[T]) *TypedCollection[T] {
-	var zero T
 	return &TypedCollection[T]{
 		store:      store,
-		entityType: EntityType(zero),
+		entityType: entityTypeFor[T](),
 	}
 }
 
@@ -110,20 +119,48 @@ func (c *TypedCollection[T]) EntityType() string {
 }
 
 // Get retrieves an entity by its key (without the type prefix).
-func (c *TypedCollection[T]) Get(key string) (T, bool) {
+func (c *TypedCollection[T]) Get(key string) (T, bool, error) {
 	return c.store.Get(CompositeKey(c.entityType, key))
+}
+
+// keyPrefix returns the composite-key prefix that scopes this collection's
+// entities within its Store.
+func (c *TypedCollection[T]) keyPrefix() string {
+	return c.entityType + "/"
 }
 
 // All returns all entities in this collection.
 // The keys in the returned map are composite keys (type/key).
-func (c *TypedCollection[T]) All() map[string]T {
-	return c.store.All()
+//
+// Only entities under this collection's type prefix are returned: several
+// collections may share one Store, and each must see (and mutate — see
+// clear/restore) only its own slice of it.
+func (c *TypedCollection[T]) All() (map[string]T, error) {
+	all, err := c.store.All()
+	if err != nil {
+		return nil, err
+	}
+	prefix := c.keyPrefix()
+	result := make(map[string]T, len(all))
+	for key, value := range all {
+		if strings.HasPrefix(key, prefix) {
+			result[key] = value
+		}
+	}
+	return result, nil
 }
+
+// ErrUndecodable marks materialization failures caused by a message payload
+// that cannot be decoded (malformed JSON, an incompatible schema, or an
+// unknown operation). It never marks store failures. WithApplyErrorPolicy
+// consults this: only decode failures are safely skippable — a store failure
+// is transient and must abort so the event is retried.
+var ErrUndecodable = errors.New("state: undecodable message")
 
 // collectionApplier is an internal interface for applying changes to collections.
 type collectionApplier interface {
 	applyChange(msg *ChangeMessage) error
-	clear()
+	clear() error
 	// snapshot serializes every entity in the collection, keyed by composite key.
 	snapshot() (map[string]json.RawMessage, error)
 	// restore clears the collection and repopulates it from serialized entities.
@@ -142,26 +179,44 @@ func (a *typedCollectionApplier[T]) applyChange(msg *ChangeMessage) error {
 	case OperationInsert, OperationUpdate:
 		var value T
 		if err := json.Unmarshal(msg.Value, &value); err != nil {
-			return fmt.Errorf("state: unmarshal value for %s/%s: %w", msg.Type, msg.Key, err)
+			return fmt.Errorf("%w: unmarshal value for %s/%s: %w", ErrUndecodable, msg.Type, msg.Key, err)
 		}
-		a.collection.store.Set(key, value)
+		if err := a.collection.store.Set(key, value); err != nil {
+			return fmt.Errorf("state: set %s: %w", key, err)
+		}
 
 	case OperationDelete:
-		a.collection.store.Delete(key)
+		if err := a.collection.store.Delete(key); err != nil {
+			return fmt.Errorf("state: delete %s: %w", key, err)
+		}
 
 	default:
-		return fmt.Errorf("state: unknown operation %q for %s/%s", msg.Headers.Operation, msg.Type, msg.Key)
+		return fmt.Errorf("%w: unknown operation %q for %s/%s", ErrUndecodable, msg.Headers.Operation, msg.Type, msg.Key)
 	}
 
 	return nil
 }
 
-func (a *typedCollectionApplier[T]) clear() {
-	a.collection.store.Clear()
+// clear removes only this collection's entities (its type-prefixed keys):
+// a shared Store may hold other collections' data, which must survive.
+func (a *typedCollectionApplier[T]) clear() error {
+	all, err := a.collection.All()
+	if err != nil {
+		return fmt.Errorf("state: clear %s: %w", a.collection.entityType, err)
+	}
+	for key := range all {
+		if err := a.collection.store.Delete(key); err != nil {
+			return fmt.Errorf("state: clear %s: %w", key, err)
+		}
+	}
+	return nil
 }
 
 func (a *typedCollectionApplier[T]) snapshot() (map[string]json.RawMessage, error) {
-	all := a.collection.store.All()
+	all, err := a.collection.All()
+	if err != nil {
+		return nil, fmt.Errorf("state: snapshot %s: %w", a.collection.entityType, err)
+	}
 	entities := make(map[string]json.RawMessage, len(all))
 	for key, value := range all {
 		data, err := json.Marshal(value)
@@ -174,13 +229,17 @@ func (a *typedCollectionApplier[T]) snapshot() (map[string]json.RawMessage, erro
 }
 
 func (a *typedCollectionApplier[T]) restore(entities map[string]json.RawMessage) error {
-	a.collection.store.Clear()
+	if err := a.clear(); err != nil {
+		return err
+	}
 	for key, raw := range entities {
 		var value T
 		if err := json.Unmarshal(raw, &value); err != nil {
 			return fmt.Errorf("state: unmarshal snapshot entity %s: %w", key, err)
 		}
-		a.collection.store.Set(key, value)
+		if err := a.collection.store.Set(key, value); err != nil {
+			return fmt.Errorf("state: restore %s: %w", key, err)
+		}
 	}
 	return nil
 }
@@ -201,8 +260,15 @@ type Materializer struct {
 	// applyMu serializes message application. It is held for the entirety of
 	// Apply/ApplyChangeMessage/ApplyControlMessage — application plus the
 	// lastOffset update happen as one atomic step — and for snapshot
-	// save/restore, which need a consistent view across collections.
+	// restore, which needs a consistent view across collections.
 	applyMu sync.Mutex
+
+	// snapshotMu serializes SaveSnapshotTo calls end to end, including the
+	// SaveSnapshot I/O that runs after applyMu is released: two racing
+	// savers could otherwise overwrite a newer snapshot with an older one,
+	// and a truncation based on the newer offset would then lose events.
+	// Lock order: snapshotMu before applyMu, never the reverse.
+	snapshotMu sync.Mutex
 
 	// mu guards the collections map and lastOffset.
 	mu         sync.RWMutex
@@ -230,58 +296,122 @@ func RegisterCollection[T any](m *Materializer, collection *TypedCollection[T]) 
 	m.collections[collection.EntityType()] = &typedCollectionApplier[T]{collection: collection}
 }
 
+// changeMessageEventType and controlMessageEventType are the names state
+// protocol messages are persisted under when published through ebu (see the
+// EventTypeName methods in message.go).
+const (
+	changeMessageEventType  = "state.ChangeMessage"
+	controlMessageEventType = "state.ControlMessage"
+)
+
 // Apply processes a single StoredEvent containing a state protocol message.
 // This is the primary integration point with ebu's Replay functionality.
 //
-// The event's Data field should contain a JSON-encoded ChangeMessage or
-// ControlMessage. Events that are not state protocol messages — both message
-// kinds always carry a "headers" field on the wire, so an event without one
-// (e.g. a regular event on a mixed stream) — are skipped silently in both
-// strict and non-strict mode.
+// Routing is by the event's Type first: events published through ebu are
+// stored as "state.ChangeMessage" / "state.ControlMessage" and are decoded
+// strictly — a decode failure on a typed event is a real error. Events with
+// any other Type fall back to structural detection for interoperability with
+// streams written by other State Protocol implementations: an event whose
+// data carries a "headers" object is applied if it decodes as a control or
+// change message, and skipped as a foreign event otherwise. Events without a
+// "headers" field are always skipped, so state messages can share a stream
+// with regular events.
 //
 // The offset reported by LastOffset advances only when the event was applied
 // (or skipped) successfully; failed events never advance it, so a resumed
-// replay picks them up again. All failures are reported to the WithOnError
-// callback before being returned.
+// replay picks them up again — unless WithApplyErrorPolicy(ApplySkip) is
+// configured, in which case undecodable typed messages are reported and
+// skipped with the offset advancing. All failures are reported to the
+// WithOnError callback before being returned.
 func (m *Materializer) Apply(event *eventbus.StoredEvent) error {
 	m.applyMu.Lock()
 	defer m.applyMu.Unlock()
 
-	// Determine message type by checking for control header
-	var raw struct {
-		Headers json.RawMessage `json:"headers"`
-	}
-	if err := json.Unmarshal(event.Data, &raw); err != nil {
-		return m.reportError(fmt.Errorf("state: unmarshal event: %w", err))
-	}
-
-	// Not a state protocol message: skip it so materializers work on streams
-	// that mix state messages with regular events.
-	if raw.Headers == nil {
+	err := m.applyEvent(event)
+	if err != nil && m.cfg.applyErrorPolicy == ApplySkip && errors.Is(err, ErrUndecodable) {
+		// Poison message: it was reported to WithOnError by applyEvent;
+		// advancing past it keeps one bad payload from wedging every
+		// future replay on the same event. Store failures never take this
+		// path — they are transient and the event must be retried.
 		m.setLastOffset(event.Offset)
 		return nil
 	}
-
-	// Try to parse as control message first
-	var ctrlHeaders ControlHeaders
-	if json.Unmarshal(raw.Headers, &ctrlHeaders) == nil && ctrlHeaders.Control != "" {
-		m.applyControl(&ControlMessage{Headers: ctrlHeaders})
-		m.setLastOffset(event.Offset)
-		return nil
-	}
-
-	// Parse as change message
-	var changeMsg ChangeMessage
-	if err := json.Unmarshal(event.Data, &changeMsg); err != nil {
-		return m.reportError(fmt.Errorf("state: unmarshal change message: %w", err))
-	}
-
-	if err := m.applyChange(&changeMsg); err != nil {
+	if err != nil {
 		return err
 	}
 
 	m.setLastOffset(event.Offset)
 	return nil
+}
+
+// applyEvent routes and applies one event. Caller must hold applyMu.
+// Every returned error has been reported to WithOnError exactly once.
+func (m *Materializer) applyEvent(event *eventbus.StoredEvent) error {
+	switch event.Type {
+	case changeMessageEventType:
+		var changeMsg ChangeMessage
+		if err := json.Unmarshal(event.Data, &changeMsg); err != nil {
+			return m.reportError(fmt.Errorf("%w: unmarshal change message: %w", ErrUndecodable, err))
+		}
+		return m.applyChange(&changeMsg)
+
+	case controlMessageEventType:
+		var ctrlMsg ControlMessage
+		if err := json.Unmarshal(event.Data, &ctrlMsg); err != nil {
+			return m.reportError(fmt.Errorf("%w: unmarshal control message: %w", ErrUndecodable, err))
+		}
+		return m.applyControl(&ctrlMsg)
+
+	default:
+		return m.applyUntyped(event)
+	}
+}
+
+// applyUntyped structurally detects state messages persisted under other
+// type names (streams written by non-ebu State Protocol implementations).
+// Anything that does not positively identify as a state message is skipped
+// as a foreign event — never an error: on a mixed stream a payload that
+// merely resembles a state message (e.g. any event with a "headers" field)
+// must not wedge or corrupt the materializer.
+func (m *Materializer) applyUntyped(event *eventbus.StoredEvent) error {
+	var raw struct {
+		Headers json.RawMessage `json:"headers"`
+	}
+	if err := json.Unmarshal(event.Data, &raw); err != nil {
+		// Not JSON at all: a foreign event.
+		return nil
+	}
+	if raw.Headers == nil {
+		return nil
+	}
+
+	// A headers object with a known control value is a control message.
+	// Unknown control values are NOT applied here (unlike the typed route):
+	// a foreign event with an unrelated "control" field must not be consumed.
+	var ctrlHeaders ControlHeaders
+	if json.Unmarshal(raw.Headers, &ctrlHeaders) == nil && knownControl(ctrlHeaders.Control) {
+		return m.applyControl(&ControlMessage{Headers: ctrlHeaders})
+	}
+
+	// A payload that decodes as a change message with a complete
+	// type/key/operation triple is applied; anything else is foreign.
+	var changeMsg ChangeMessage
+	if err := json.Unmarshal(event.Data, &changeMsg); err != nil {
+		return nil
+	}
+	if changeMsg.Type == "" || changeMsg.Key == "" || changeMsg.Headers.Operation == "" {
+		return nil
+	}
+	return m.applyChange(&changeMsg)
+}
+
+// knownControl reports whether c is a control value this package understands.
+func knownControl(c Control) bool {
+	switch c {
+	case ControlReset, ControlSnapshotStart, ControlSnapshotEnd:
+		return true
+	}
+	return false
 }
 
 // ApplyChangeMessage processes a ChangeMessage directly.
@@ -294,10 +424,12 @@ func (m *Materializer) ApplyChangeMessage(msg *ChangeMessage) error {
 
 // ApplyControlMessage processes a ControlMessage directly.
 // Use this when you have a ControlMessage that's not wrapped in a StoredEvent.
-func (m *Materializer) ApplyControlMessage(msg *ControlMessage) {
+// It returns an error when clearing a collection fails on a reset, or — in
+// strict mode — when the control value is unknown.
+func (m *Materializer) ApplyControlMessage(msg *ControlMessage) error {
 	m.applyMu.Lock()
 	defer m.applyMu.Unlock()
-	m.applyControl(msg)
+	return m.applyControl(msg)
 }
 
 // applyChange applies a change message to the appropriate collection.
@@ -338,12 +470,15 @@ func (m *Materializer) setLastOffset(offset eventbus.Offset) {
 }
 
 // applyControl applies a control message.
-func (m *Materializer) applyControl(msg *ControlMessage) {
+func (m *Materializer) applyControl(msg *ControlMessage) error {
 	switch msg.Headers.Control {
 	case ControlReset:
 		m.mu.Lock()
 		for _, c := range m.collections {
-			c.clear()
+			if err := c.clear(); err != nil {
+				m.mu.Unlock()
+				return m.reportError(fmt.Errorf("state: reset: %w", err))
+			}
 		}
 		m.mu.Unlock()
 		if m.cfg.onReset != nil {
@@ -359,7 +494,16 @@ func (m *Materializer) applyControl(msg *ControlMessage) {
 		if m.cfg.onSnapshot != nil {
 			m.cfg.onSnapshot(false)
 		}
+
+	default:
+		// A control this package does not understand: silently dropping it
+		// in strict mode could mean missing a reset the stream demanded.
+		// Mirrors unknown-entity-type handling: strict errors, lax ignores.
+		if m.cfg.strictSchema {
+			return m.reportError(fmt.Errorf("%w: unknown control %q", ErrUndecodable, msg.Headers.Control))
+		}
 	}
+	return nil
 }
 
 // LastOffset returns the offset of the last applied event.
@@ -399,9 +543,28 @@ func (m *Materializer) Replay(ctx context.Context, bus *eventbus.EventBus, from 
 // LoadSnapshot, or LastOffset when no events are applied concurrently) —
 // never a later one, or events not covered by the snapshot would be lost.
 //
-// Message application is paused while the snapshot is taken, so the blob is a
-// consistent view of all collections at a single offset.
+// Message application is paused only while the collections are captured and
+// serialized; the SaveSnapshot I/O itself runs without blocking Apply.
+// Concurrent SaveSnapshotTo calls are serialized with each other so a slower
+// older snapshot can never overwrite a newer one.
 func (m *Materializer) SaveSnapshotTo(ctx context.Context, s eventbus.EventStoreSnapshotter, snapshotID string) error {
+	m.snapshotMu.Lock()
+	defer m.snapshotMu.Unlock()
+
+	offset, encoded, err := m.captureSnapshot(snapshotID)
+	if err != nil {
+		return err
+	}
+
+	if err := s.SaveSnapshot(ctx, snapshotID, offset, encoded); err != nil {
+		return fmt.Errorf("state: save snapshot %q: %w", snapshotID, err)
+	}
+	return nil
+}
+
+// captureSnapshot serializes all collections as one consistent view at the
+// current LastOffset, holding applyMu so no application runs mid-capture.
+func (m *Materializer) captureSnapshot(snapshotID string) (eventbus.Offset, json.RawMessage, error) {
 	m.applyMu.Lock()
 	defer m.applyMu.Unlock()
 
@@ -414,14 +577,14 @@ func (m *Materializer) SaveSnapshotTo(ctx context.Context, s eventbus.EventStore
 	m.mu.RUnlock()
 
 	if offset == eventbus.OffsetOldest {
-		return fmt.Errorf("state: refusing to save snapshot %q: no events applied yet (snapshot would claim OffsetOldest)", snapshotID)
+		return "", nil, fmt.Errorf("state: refusing to save snapshot %q: no events applied yet (snapshot would claim OffsetOldest)", snapshotID)
 	}
 
 	blob := make(map[string]map[string]json.RawMessage, len(collections))
 	for entityType, c := range collections {
 		entities, err := c.snapshot()
 		if err != nil {
-			return err
+			return "", nil, err
 		}
 		blob[entityType] = entities
 	}
@@ -429,11 +592,7 @@ func (m *Materializer) SaveSnapshotTo(ctx context.Context, s eventbus.EventStore
 	// blob contains only string keys and json.RawMessage values produced by
 	// json.Marshal, so encoding cannot fail.
 	encoded, _ := json.Marshal(blob)
-
-	if err := s.SaveSnapshot(ctx, snapshotID, offset, encoded); err != nil {
-		return fmt.Errorf("state: save snapshot %q: %w", snapshotID, err)
-	}
-	return nil
+	return offset, encoded, nil
 }
 
 // LoadSnapshotFrom restores the materializer from the snapshot saved under
@@ -472,8 +631,28 @@ func (m *Materializer) LoadSnapshotFrom(ctx context.Context, s eventbus.EventSto
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	for _, c := range m.collections {
-		c.clear()
+	// clearAll empties every registered collection; on restore failure it
+	// leaves the materializer empty rather than partially restored, so a
+	// full replay from OffsetOldest rebuilds the state.
+	clearAll := func() error {
+		for _, c := range m.collections {
+			if err := c.clear(); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	resetToEmpty := func(cause error) (eventbus.Offset, error) {
+		if clearErr := clearAll(); clearErr != nil {
+			cause = errors.Join(cause, clearErr)
+		}
+		m.lastOffset = eventbus.OffsetOldest
+		return eventbus.OffsetOldest, cause
+	}
+
+	if err := clearAll(); err != nil {
+		return resetToEmpty(err)
 	}
 	for entityType, entities := range decoded {
 		c, ok := m.collections[entityType]
@@ -481,13 +660,7 @@ func (m *Materializer) LoadSnapshotFrom(ctx context.Context, s eventbus.EventSto
 			continue // Entity type no longer registered: drop its snapshot data.
 		}
 		if err := c.restore(entities); err != nil {
-			// Leave the materializer empty rather than partially restored: a
-			// full replay from OffsetOldest rebuilds the state.
-			for _, c := range m.collections {
-				c.clear()
-			}
-			m.lastOffset = eventbus.OffsetOldest
-			return eventbus.OffsetOldest, err
+			return resetToEmpty(err)
 		}
 	}
 

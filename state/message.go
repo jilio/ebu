@@ -72,12 +72,42 @@ type ControlMessage struct {
 // TypeNamer is an optional interface that entity types can implement to provide
 // their own type name. This mirrors ebu's TypeNamer pattern.
 //
+// StateTypeName must be a pure function of the type (never of instance
+// state): the package derives names from zero values and fresh instances.
+//
 // Example:
 //
 //	type User struct { ... }
 //	func (u User) StateTypeName() string { return "user" }
 type TypeNamer interface {
 	StateTypeName() string
+}
+
+// typeNamerType is the reflect.Type of the TypeNamer interface.
+var typeNamerType = reflect.TypeOf((*TypeNamer)(nil)).Elem()
+
+// entityTypeOf returns the entity type name for a reflect.Type, honoring
+// TypeNamer without ever invoking it on a nil pointer: for pointer types a
+// fresh instance is allocated, since a value-receiver method promoted to the
+// pointer type would dereference nil (mirrors typeNameOf in the parent
+// package).
+func entityTypeOf(t reflect.Type) string {
+	if t.Implements(typeNamerType) {
+		if t.Kind() == reflect.Pointer {
+			return reflect.New(t.Elem()).Interface().(TypeNamer).StateTypeName()
+		}
+		return reflect.Zero(t).Interface().(TypeNamer).StateTypeName()
+	}
+	if reflect.PointerTo(t).Implements(typeNamerType) {
+		return reflect.New(t).Interface().(TypeNamer).StateTypeName()
+	}
+	return t.String()
+}
+
+// entityTypeFor returns the entity type name for a type parameter without
+// needing an instance, so pointer entity types are safe.
+func entityTypeFor[T any]() string {
+	return entityTypeOf(reflect.TypeOf((*T)(nil)).Elem())
 }
 
 // EntityType returns the type name for an entity.
@@ -89,6 +119,12 @@ func EntityType(entity any) string {
 		return "nil"
 	}
 	if namer, ok := entity.(TypeNamer); ok {
+		if v := reflect.ValueOf(entity); v.Kind() == reflect.Pointer && v.IsNil() {
+			// A typed nil pointer: calling a value-receiver StateTypeName
+			// through it would dereference nil. Derive the name from the
+			// type instead.
+			return entityTypeOf(v.Type())
+		}
 		return namer.StateTypeName()
 	}
 	return reflect.TypeOf(entity).String()

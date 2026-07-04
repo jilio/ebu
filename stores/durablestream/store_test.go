@@ -1541,6 +1541,422 @@ func TestRead_BackoffRespectsContext(t *testing.T) {
 	}
 }
 
+// newHangingServer returns a server that creates streams normally (PUT) but
+// blocks every other request until the client gives up, plus a counter of
+// requests that hung. hangPut additionally hangs stream creation.
+func newHangingServer(hangPut bool) (*httptest.Server, *atomic.Int32) {
+	var hung atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/stream/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut && !hangPut {
+			w.WriteHeader(http.StatusCreated)
+			return
+		}
+		hung.Add(1)
+		<-r.Context().Done()
+	})
+	return httptest.NewServer(mux), &hung
+}
+
+// TestAppend_TimeoutOnHangingServer verifies that a remote that accepts the
+// connection but never responds cannot block Append (and with it appendMu)
+// forever: the default HTTP client carries the configured timeout, so each
+// attempt fails within it.
+func TestAppend_TimeoutOnHangingServer(t *testing.T) {
+	srv, hung := newHangingServer(false)
+	defer srv.Close()
+
+	store, err := ds.New(srv.URL+"/v1/stream", "hang-append",
+		ds.WithTimeout(200*time.Millisecond),
+		ds.WithRetry(2, time.Millisecond))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	start := time.Now()
+	_, err = store.Append(context.Background(), &eventbus.Event{
+		Type: "never",
+		Data: json.RawMessage(`{}`),
+	})
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected error when server hangs")
+	}
+	if elapsed > 3*time.Second {
+		t.Errorf("Append did not respect the configured timeout, took %v", elapsed)
+	}
+	if hung.Load() == 0 {
+		t.Error("expected the server to have received a hanging request")
+	}
+}
+
+// TestRead_TimeoutOnHangingServer verifies each Read attempt gets its own
+// timeout window instead of blocking on a hung server.
+func TestRead_TimeoutOnHangingServer(t *testing.T) {
+	srv, _ := newHangingServer(false)
+	defer srv.Close()
+
+	store, err := ds.New(srv.URL+"/v1/stream", "hang-read",
+		ds.WithTimeout(200*time.Millisecond),
+		ds.WithRetry(2, time.Millisecond))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	start := time.Now()
+	_, _, err = store.Read(context.Background(), eventbus.OffsetOldest, 0)
+	if err == nil {
+		t.Fatal("expected error when server hangs")
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("Read did not respect the configured timeout, took %v", elapsed)
+	}
+}
+
+// TestNew_TimeoutOnHangingServer verifies stream creation is bounded too.
+func TestNew_TimeoutOnHangingServer(t *testing.T) {
+	srv, _ := newHangingServer(true)
+	defer srv.Close()
+
+	start := time.Now()
+	_, err := ds.New(srv.URL+"/v1/stream", "hang-create",
+		ds.WithTimeout(200*time.Millisecond))
+	if err == nil {
+		t.Fatal("expected error when stream creation hangs")
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("New did not respect the configured timeout, took %v", elapsed)
+	}
+}
+
+// newSequencedServer serves a fixed response per requested offset, so tests
+// can shape multi-chunk reads precisely. Each response carries its body,
+// next offset, and up-to-date flag.
+type chunkResponse struct {
+	body       string
+	nextOffset string
+	upToDate   bool
+}
+
+func newSequencedServer(t *testing.T, chunks map[string]chunkResponse) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/stream/", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			w.WriteHeader(http.StatusCreated)
+		case http.MethodGet:
+			resp, ok := chunks[r.URL.Query().Get("offset")]
+			if !ok {
+				t.Errorf("unexpected read offset %q", r.URL.Query().Get("offset"))
+				http.Error(w, "unexpected offset", http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Stream-Next-Offset", resp.nextOffset)
+			if resp.upToDate {
+				w.Header().Set("Stream-Up-To-Date", "true")
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(resp.body))
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+	return httptest.NewServer(mux)
+}
+
+// TestRead_AdvancesPastUndecodableChunk verifies that a mid-stream chunk
+// whose events are all skipped as malformed does not surface as an empty
+// result with an advanced offset (which callers would misread as
+// end-of-log): Read keeps advancing until an event decodes or the tail is
+// reached.
+func TestRead_AdvancesPastUndecodableChunk(t *testing.T) {
+	srv := newSequencedServer(t, map[string]chunkResponse{
+		"":  {body: `["garbage", 42]`, nextOffset: "2", upToDate: false},
+		"2": {body: `[{"type":"good","data":{}}]`, nextOffset: "3", upToDate: true},
+	})
+	defer srv.Close()
+
+	logger := &testLogger{}
+	store, err := ds.New(srv.URL+"/v1/stream", "skip-chunk", ds.WithLogger(logger))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	events, nextOffset, err := store.Read(context.Background(), eventbus.OffsetOldest, 0)
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	if len(events) != 1 || events[0].Type != "good" {
+		t.Fatalf("expected the decodable event from the next chunk, got %v", events)
+	}
+	if nextOffset != "3" {
+		t.Errorf("expected nextOffset '3', got '%s'", nextOffset)
+	}
+	if len(logger.messages) != 2 {
+		t.Errorf("expected 2 skipped-event log messages, got %d", len(logger.messages))
+	}
+}
+
+// TestRead_AdvancesPastEmptyMidStreamChunk covers the empty-chunk variant:
+// a mid-stream read that returns no data but is not up to date.
+func TestRead_AdvancesPastEmptyMidStreamChunk(t *testing.T) {
+	srv := newSequencedServer(t, map[string]chunkResponse{
+		"":  {body: `[]`, nextOffset: "5", upToDate: false},
+		"5": {body: `[{"type":"after.gap","data":{}}]`, nextOffset: "6", upToDate: true},
+	})
+	defer srv.Close()
+
+	store, err := ds.New(srv.URL+"/v1/stream", "empty-chunk")
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	events, nextOffset, err := store.Read(context.Background(), eventbus.OffsetOldest, 0)
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	if len(events) != 1 || events[0].Type != "after.gap" {
+		t.Fatalf("expected the event after the empty chunk, got %v", events)
+	}
+	if nextOffset != "6" {
+		t.Errorf("expected nextOffset '6', got '%s'", nextOffset)
+	}
+}
+
+// TestRead_UndecodableTailChunkReturnsAdvancedOffset verifies the loop stops
+// at the tail: an up-to-date chunk with only malformed events yields an
+// empty result with the advanced offset and no error.
+func TestRead_UndecodableTailChunkReturnsAdvancedOffset(t *testing.T) {
+	srv := newSequencedServer(t, map[string]chunkResponse{
+		"": {body: `["garbage"]`, nextOffset: "1", upToDate: true},
+	})
+	defer srv.Close()
+
+	store, err := ds.New(srv.URL+"/v1/stream", "bad-tail")
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	events, nextOffset, err := store.Read(context.Background(), eventbus.OffsetOldest, 0)
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("expected 0 events, got %d", len(events))
+	}
+	if nextOffset != "1" {
+		t.Errorf("expected advanced nextOffset '1', got '%s'", nextOffset)
+	}
+}
+
+// TestRead_OffsetNewest verifies OffsetNewest resolves at call time to the
+// concrete current tail: no events are returned, and resuming from the
+// returned offset yields exactly the events appended afterwards.
+func TestRead_OffsetNewest(t *testing.T) {
+	srv := newTestServer()
+	defer srv.Close()
+
+	store, err := ds.New(srv.URL+"/v1/stream", "offset-newest")
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	ctx := context.Background()
+
+	t.Run("empty stream", func(t *testing.T) {
+		events, nextOffset, err := store.Read(ctx, eventbus.OffsetNewest, 0)
+		if err != nil {
+			t.Fatalf("Read(OffsetNewest) error = %v", err)
+		}
+		if len(events) != 0 {
+			t.Errorf("expected 0 events, got %d", len(events))
+		}
+		if nextOffset == eventbus.OffsetNewest {
+			t.Error("nextOffset must be a concrete offset, not OffsetNewest")
+		}
+	})
+
+	t.Run("resolves to tail", func(t *testing.T) {
+		for i := 0; i < 2; i++ {
+			if _, err := store.Append(ctx, &eventbus.Event{
+				Type: fmt.Sprintf("before.%d", i),
+				Data: json.RawMessage(`{}`),
+			}); err != nil {
+				t.Fatalf("Append() error = %v", err)
+			}
+		}
+
+		events, tail, err := store.Read(ctx, eventbus.OffsetNewest, 0)
+		if err != nil {
+			t.Fatalf("Read(OffsetNewest) error = %v", err)
+		}
+		if len(events) != 0 {
+			t.Fatalf("expected 0 events at tail, got %d", len(events))
+		}
+		if tail == eventbus.OffsetNewest || tail == "" {
+			t.Fatalf("expected concrete tail offset, got %q", tail)
+		}
+
+		if _, err := store.Append(ctx, &eventbus.Event{
+			Type: "after.tail",
+			Data: json.RawMessage(`{}`),
+		}); err != nil {
+			t.Fatalf("Append() error = %v", err)
+		}
+
+		resumed := readAllFrom(t, store, tail)
+		if len(resumed) != 1 || resumed[0].Type != "after.tail" {
+			t.Fatalf("expected only the event appended after the tail, got %v", resumed)
+		}
+	})
+}
+
+// TestRead_OffsetNewestRetryAndNotFound exercises resolveTail's retry and
+// permanent-error paths.
+func TestRead_OffsetNewestRetryAndNotFound(t *testing.T) {
+	t.Run("retries transient HEAD failure", func(t *testing.T) {
+		srv := newFlakyServer()
+		defer srv.Close()
+
+		store, err := ds.New(srv.URL+"/v1/stream", "newest-retry", ds.WithRetry(3, time.Millisecond))
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+
+		srv.failHead.Store(1)
+		_, nextOffset, err := store.Read(context.Background(), eventbus.OffsetNewest, 0)
+		if err != nil {
+			t.Fatalf("Read(OffsetNewest) should succeed after retry, got %v", err)
+		}
+		if nextOffset == eventbus.OffsetNewest {
+			t.Error("expected concrete tail offset")
+		}
+		if got := srv.heads.Load(); got != 2 {
+			t.Errorf("expected 2 HEAD requests (1 failed + 1 retried), got %d", got)
+		}
+	})
+
+	t.Run("gives up after exhausting retries", func(t *testing.T) {
+		srv := newFlakyServer()
+		defer srv.Close()
+
+		store, err := ds.New(srv.URL+"/v1/stream", "newest-exhausted", ds.WithRetry(2, time.Millisecond))
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+
+		srv.failHead.Store(10)
+		_, _, err = store.Read(context.Background(), eventbus.OffsetNewest, 0)
+		if err == nil {
+			t.Fatal("expected error after exhausting retries")
+		}
+		if !strings.Contains(err.Error(), "giving up after 2 attempts") {
+			t.Errorf("expected 'giving up after 2 attempts' error, got: %v", err)
+		}
+	})
+
+	t.Run("respects cancelled context", func(t *testing.T) {
+		srv := newFlakyServer()
+		defer srv.Close()
+
+		store, err := ds.New(srv.URL+"/v1/stream", "newest-cancelled")
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, _, err := store.Read(ctx, eventbus.OffsetNewest, 0); err == nil {
+			t.Fatal("expected error for cancelled context")
+		}
+	})
+
+	t.Run("backoff respects context", func(t *testing.T) {
+		srv := newFlakyServer()
+		defer srv.Close()
+
+		store, err := ds.New(srv.URL+"/v1/stream", "newest-backoff-ctx", ds.WithRetry(3, time.Second))
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+
+		srv.failHead.Store(10)
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+
+		start := time.Now()
+		if _, _, err := store.Read(ctx, eventbus.OffsetNewest, 0); err == nil {
+			t.Fatal("expected error when context expires during backoff")
+		}
+		if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+			t.Errorf("backoff did not respect context cancellation, took %v", elapsed)
+		}
+	})
+
+	t.Run("stream not found is permanent", func(t *testing.T) {
+		srv := newFlakyServer()
+		defer srv.Close()
+
+		store, err := ds.New(srv.URL+"/v1/stream", "newest-gone", ds.WithRetry(3, time.Millisecond))
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+
+		srv.failStatus.Store(http.StatusNotFound)
+		srv.failHead.Store(1)
+		_, _, err = store.Read(context.Background(), eventbus.OffsetNewest, 0)
+		if err == nil {
+			t.Fatal("expected error when stream does not exist")
+		}
+		if !strings.Contains(err.Error(), "resolve tail") {
+			t.Errorf("expected 'resolve tail' error, got: %v", err)
+		}
+		if got := srv.heads.Load(); got != 1 {
+			t.Errorf("expected no retry of a 404 HEAD (1 HEAD), got %d", got)
+		}
+	})
+}
+
+// TestAppend_FirstCallerCancelDoesNotAbortLaterAppends verifies the cached
+// writer is detached from its creator's context: cancelling the first
+// Append's context must not poison — or force recreation of — the writer
+// used by later Appends.
+func TestAppend_FirstCallerCancelDoesNotAbortLaterAppends(t *testing.T) {
+	srv := newFlakyServer()
+	defer srv.Close()
+
+	store, err := ds.New(srv.URL+"/v1/stream", "detached-writer")
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	if _, err := store.Append(ctx1, &eventbus.Event{
+		Type: "event.0",
+		Data: json.RawMessage(`{}`),
+	}); err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+	cancel1()
+
+	if _, err := store.Append(context.Background(), &eventbus.Event{
+		Type: "event.1",
+		Data: json.RawMessage(`{}`),
+	}); err != nil {
+		t.Fatalf("Append() after first caller's cancel error = %v", err)
+	}
+
+	// The writer must have been reused, not dropped and recreated because
+	// its context died with the first caller.
+	if got := srv.heads.Load(); got != 1 {
+		t.Errorf("expected the cached writer to survive the first caller's cancel (1 HEAD), got %d", got)
+	}
+	if got := srv.posts.Load(); got != 2 {
+		t.Errorf("expected 2 POSTs with no retries, got %d", got)
+	}
+}
+
 func TestRead_NonRetryableError(t *testing.T) {
 	srv := newFlakyServer()
 	defer srv.Close()

@@ -112,6 +112,11 @@ const (
 )
 ```
 
+`OffsetNewest` resolves, at call time, to the concrete current tail in every
+bundled store: reading from it returns no historical events and a concrete
+resumable offset, and `SaveOffset` persists the concrete tail rather than
+the symbolic `"$"`.
+
 ## Available Storage Backends
 
 ebu provides several storage backends:

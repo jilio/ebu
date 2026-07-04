@@ -63,11 +63,27 @@
 //	mat.Replay(ctx, bus, eventbus.OffsetOldest)
 //
 //	// Access materialized state
-//	user, ok := users.Get("user:123")
+//	user, ok, err := users.Get("user:123")
 //
-// Events that are not state protocol messages (they carry no "headers" field)
-// are skipped during materialization, so state messages can share a stream
-// with regular events — even with strict schema validation enabled.
+// Store methods return errors so durable backends can surface failures; the
+// materializer never advances its offset past an event whose store write
+// failed. Several collections may share one Store: entities are keyed by
+// "entityType/key" and every collection operation is scoped to its own
+// prefix.
+//
+// # Mixed Streams and Routing
+//
+// Events are routed by their stored Type: messages published through ebu are
+// typed "state.ChangeMessage" / "state.ControlMessage" and decoded strictly.
+// Events with other type names are detected structurally for interop with
+// other State Protocol writers, and anything that does not positively
+// identify as a state message — including arbitrary JSON that happens to
+// carry a "headers" field — is skipped, so state messages can share a stream
+// with regular events, even with strict schema validation enabled.
+//
+// An undecodable typed message aborts materialization by default so the
+// error is never lost; configure WithApplyErrorPolicy(ApplySkip) to report
+// such poison messages to WithOnError and continue past them.
 //
 // # Snapshots and Compaction
 //

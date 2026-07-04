@@ -311,7 +311,7 @@ func TestMemoryStore(t *testing.T) {
 	user := User{Name: "Alice", Email: "alice@example.com"}
 	store.Set("user/1", user)
 
-	got, ok := store.Get("user/1")
+	got, ok, _ := store.Get("user/1")
 	if !ok {
 		t.Error("Get() should find user")
 	}
@@ -320,14 +320,14 @@ func TestMemoryStore(t *testing.T) {
 	}
 
 	// Test Get non-existent
-	_, ok = store.Get("user/999")
+	_, ok, _ = store.Get("user/999")
 	if ok {
 		t.Error("Get() should not find non-existent user")
 	}
 
 	// Test Delete
 	store.Delete("user/1")
-	_, ok = store.Get("user/1")
+	_, ok, _ = store.Get("user/1")
 	if ok {
 		t.Error("Get() should not find deleted user")
 	}
@@ -335,14 +335,14 @@ func TestMemoryStore(t *testing.T) {
 	// Test All
 	store.Set("user/1", User{Name: "Alice"})
 	store.Set("user/2", User{Name: "Bob"})
-	all := store.All()
+	all, _ := store.All()
 	if len(all) != 2 {
 		t.Errorf("All() returned %d items, want 2", len(all))
 	}
 
 	// Test Clear
 	store.Clear()
-	all = store.All()
+	all, _ = store.All()
 	if len(all) != 0 {
 		t.Errorf("All() returned %d items after Clear, want 0", len(all))
 	}
@@ -362,7 +362,7 @@ func TestTypedCollection(t *testing.T) {
 	store.Set(CompositeKey("state.User", "1"), User{Name: "Alice"})
 
 	// Collection uses simple keys
-	user, ok := users.Get("1")
+	user, ok, _ := users.Get("1")
 	if !ok {
 		t.Error("Get() should find user")
 	}
@@ -406,7 +406,7 @@ func TestMaterializerApplyInsert(t *testing.T) {
 		t.Fatalf("Apply() error = %v", err)
 	}
 
-	user, ok := users.Get("1")
+	user, ok, _ := users.Get("1")
 	if !ok {
 		t.Error("User not found after insert")
 	}
@@ -441,7 +441,7 @@ func TestMaterializerApplyUpdate(t *testing.T) {
 		t.Fatalf("Apply() error = %v", err)
 	}
 
-	user, ok := users.Get("1")
+	user, ok, _ := users.Get("1")
 	if !ok {
 		t.Error("User not found after update")
 	}
@@ -475,7 +475,7 @@ func TestMaterializerApplyDelete(t *testing.T) {
 		t.Fatalf("Apply() error = %v", err)
 	}
 
-	_, ok := users.Get("1")
+	_, ok, _ := users.Get("1")
 	if ok {
 		t.Error("User should not exist after delete")
 	}
@@ -513,7 +513,7 @@ func TestMaterializerApplyReset(t *testing.T) {
 		t.Error("OnReset callback was not called")
 	}
 
-	all := users.All()
+	all, _ := users.All()
 	if len(all) != 0 {
 		t.Errorf("Store should be empty after reset, got %d items", len(all))
 	}
@@ -650,7 +650,7 @@ func TestMaterializerApplyChangeMessageDirectly(t *testing.T) {
 		t.Fatalf("ApplyChangeMessage() error = %v", err)
 	}
 
-	user, ok := users.Get("1")
+	user, ok, _ := users.Get("1")
 	if !ok {
 		t.Error("User not found after insert")
 	}
@@ -678,7 +678,7 @@ func TestMaterializerApplyControlMessageDirectly(t *testing.T) {
 		t.Error("OnReset callback was not called")
 	}
 
-	all := users.All()
+	all, _ := users.All()
 	if len(all) != 0 {
 		t.Errorf("Store should be empty after reset, got %d items", len(all))
 	}
@@ -717,7 +717,7 @@ func TestIntegrationWithEventBus(t *testing.T) {
 	}
 
 	// Verify final state
-	user1, ok := users.Get("1")
+	user1, ok, _ := users.Get("1")
 	if !ok {
 		t.Error("User 1 should exist")
 	}
@@ -725,7 +725,7 @@ func TestIntegrationWithEventBus(t *testing.T) {
 		t.Errorf("User 1 name = %q, want %q", user1.Name, "Alice Smith")
 	}
 
-	_, ok = users.Get("2")
+	_, ok, _ = users.Get("2")
 	if ok {
 		t.Error("User 2 should not exist (was deleted)")
 	}
@@ -761,7 +761,7 @@ func TestIntegrationMultipleCollections(t *testing.T) {
 	}
 
 	// Verify both collections
-	user, ok := users.Get("1")
+	user, ok, _ := users.Get("1")
 	if !ok {
 		t.Error("User should exist")
 	}
@@ -769,7 +769,7 @@ func TestIntegrationMultipleCollections(t *testing.T) {
 		t.Errorf("User name = %q, want %q", user.Name, "Alice")
 	}
 
-	product, ok := products.Get("p1")
+	product, ok, _ := products.Get("p1")
 	if !ok {
 		t.Error("Product should exist")
 	}
@@ -968,24 +968,26 @@ func TestMaterializerErrorPropagation(t *testing.T) {
 	users := NewTypedCollection[User](store)
 	RegisterCollection(mat, users)
 
-	// Invalid JSON in value
-	insertData, _ := json.Marshal(&ChangeMessage{
-		Type:    "state.User",
-		Key:     "1",
-		Value:   json.RawMessage(`{invalid`),
-		Headers: Headers{Operation: OperationInsert},
-	})
-
-	event := &eventbus.StoredEvent{Offset: "1", Data: insertData}
+	// A typed change message whose value cannot decode into the registered
+	// entity type must surface the error (and mark it undecodable).
+	event := &eventbus.StoredEvent{
+		Offset: "1",
+		Type:   "state.ChangeMessage",
+		Data:   []byte(`{"type":"state.User","key":"1","value":"not-an-object","headers":{"operation":"insert"}}`),
+	}
 	err := mat.Apply(event)
 	if err == nil {
-		t.Error("Apply() should return error for invalid JSON")
+		t.Fatal("Apply() should return error for undecodable value")
 	}
-
-	// Verify it's wrapped correctly
-	var syntaxErr *json.SyntaxError
-	if !errors.As(err, &syntaxErr) {
-		t.Errorf("Error should wrap json.SyntaxError, got %T", err)
+	if !errors.Is(err, ErrUndecodable) {
+		t.Errorf("Error should wrap ErrUndecodable, got %v", err)
+	}
+	var typeErr *json.UnmarshalTypeError
+	if !errors.As(err, &typeErr) {
+		t.Errorf("Error should wrap json.UnmarshalTypeError, got %T", err)
+	}
+	if mat.LastOffset() == "1" {
+		t.Error("LastOffset must not advance past a failed typed event")
 	}
 }
 
@@ -997,14 +999,28 @@ func TestDeleteWithOldValueMarshalError(t *testing.T) {
 }
 
 func TestApplyInvalidRootJSON(t *testing.T) {
-	mat := NewMaterializer()
+	t.Run("typed event errors", func(t *testing.T) {
+		mat := NewMaterializer()
+		event := &eventbus.StoredEvent{Offset: "1", Type: "state.ChangeMessage", Data: []byte(`{invalid`)}
+		err := mat.Apply(event)
+		if err == nil {
+			t.Error("Apply() should error on invalid JSON in a typed state event")
+		}
+		if !errors.Is(err, ErrUndecodable) {
+			t.Errorf("Error should wrap ErrUndecodable, got %v", err)
+		}
+	})
 
-	// Completely invalid JSON at root level
-	event := &eventbus.StoredEvent{Offset: "1", Data: []byte(`{invalid`)}
-	err := mat.Apply(event)
-	if err == nil {
-		t.Error("Apply() should error on invalid root JSON")
-	}
+	t.Run("untyped event skips as foreign", func(t *testing.T) {
+		mat := NewMaterializer()
+		event := &eventbus.StoredEvent{Offset: "1", Data: []byte(`{invalid`)}
+		if err := mat.Apply(event); err != nil {
+			t.Errorf("Apply() should skip a non-JSON foreign event, got %v", err)
+		}
+		if mat.LastOffset() != "1" {
+			t.Errorf("LastOffset() = %q, want %q (skipped events advance)", mat.LastOffset(), "1")
+		}
+	})
 }
 
 // ================== Serialized Application Tests ==================
@@ -1017,10 +1033,10 @@ type blockingUserStore struct {
 	release    chan struct{}
 }
 
-func (s *blockingUserStore) Set(key string, value User) {
+func (s *blockingUserStore) Set(key string, value User) error {
 	close(s.setStarted)
 	<-s.release
-	s.MemoryStore.Set(key, value)
+	return s.MemoryStore.Set(key, value)
 }
 
 func TestMaterializerResetApplyRace(t *testing.T) {
@@ -1062,8 +1078,8 @@ func TestMaterializerResetApplyRace(t *testing.T) {
 	}
 	<-resetDone
 
-	if got := len(users.All()); got != 0 {
-		t.Errorf("store has %d entities after reset, want 0", got)
+	if all, _ := users.All(); len(all) != 0 {
+		t.Errorf("store has %d entities after reset, want 0", len(all))
 	}
 }
 
@@ -1113,25 +1129,26 @@ func TestMaterializerOnErrorAllPaths(t *testing.T) {
 		return NewMaterializer(opts...), &count
 	}
 
-	t.Run("envelope unmarshal failure", func(t *testing.T) {
+	t.Run("typed envelope unmarshal failure", func(t *testing.T) {
 		mat, count := newCounting()
-		err := mat.Apply(&eventbus.StoredEvent{Offset: "1", Data: []byte(`{invalid`)})
+		err := mat.Apply(&eventbus.StoredEvent{Offset: "1", Type: "state.ChangeMessage", Data: []byte(`{invalid`)})
 		if err == nil {
-			t.Fatal("Apply() should error on invalid root JSON")
+			t.Fatal("Apply() should error on invalid JSON in a typed state event")
 		}
 		if *count != 1 {
 			t.Errorf("onError called %d times, want 1", *count)
 		}
 	})
 
-	t.Run("change message unmarshal failure", func(t *testing.T) {
+	t.Run("typed change message unmarshal failure", func(t *testing.T) {
 		mat, count := newCounting()
 		event := &eventbus.StoredEvent{
 			Offset: "1",
+			Type:   "state.ChangeMessage",
 			Data:   []byte(`{"headers":{"operation":"insert"},"type":123,"key":"1"}`),
 		}
 		if err := mat.Apply(event); err == nil {
-			t.Fatal("Apply() should error on malformed change message")
+			t.Fatal("Apply() should error on malformed typed change message")
 		}
 		if *count != 1 {
 			t.Errorf("onError called %d times, want 1", *count)
@@ -1171,8 +1188,8 @@ func TestMaterializerMixedStreamSkip(t *testing.T) {
 		if err := mat.Apply(event); err != nil {
 			t.Fatalf("Apply() should skip non-state events, got %v", err)
 		}
-		if got := len(users.All()); got != 0 {
-			t.Errorf("store has %d entities after skipped event, want 0", got)
+		if all, _ := users.All(); len(all) != 0 {
+			t.Errorf("store has %d entities after skipped event, want 0", len(all))
 		}
 		if mat.LastOffset() != "7" {
 			t.Errorf("LastOffset() = %q, want %q (skipped events still advance)", mat.LastOffset(), "7")
@@ -1202,7 +1219,7 @@ func TestIntegrationMixedStreamStrict(t *testing.T) {
 		t.Fatalf("Replay() error = %v", err)
 	}
 
-	user, ok := users.Get("1")
+	user, ok, _ := users.Get("1")
 	if !ok {
 		t.Fatal("User 1 should be materialized")
 	}
@@ -1259,7 +1276,7 @@ func TestMaterializerReplayAppliesUpcasts(t *testing.T) {
 		t.Fatalf("Replay() error = %v", err)
 	}
 
-	user, ok := users.Get("1")
+	user, ok, _ := users.Get("1")
 	if !ok {
 		t.Fatal("user should be materialized from upcasted legacy event")
 	}
@@ -1355,17 +1372,17 @@ func TestMaterializerSnapshotRoundTrip(t *testing.T) {
 	if mat2.LastOffset() != offset {
 		t.Errorf("LastOffset() = %q, want %q", mat2.LastOffset(), offset)
 	}
-	if _, ok := users2.Get("stale"); ok {
+	if _, ok, _ := users2.Get("stale"); ok {
 		t.Error("restore should clear pre-existing state")
 	}
-	if u, ok := users2.Get("2"); !ok || u.Name != "Bob" {
+	if u, ok, _ := users2.Get("2"); !ok || u.Name != "Bob" {
 		t.Errorf("users2.Get(2) = %+v, %v; want Bob", u, ok)
 	}
 
 	if err := mat2.Replay(ctx, bus, offset); err != nil {
 		t.Fatalf("Replay() from snapshot offset error = %v", err)
 	}
-	u1, ok := users2.Get("1")
+	u1, ok, _ := users2.Get("1")
 	if !ok {
 		t.Fatal("User 1 should exist after tail replay")
 	}
@@ -1416,7 +1433,7 @@ func TestMaterializerSnapshotUnregisteredType(t *testing.T) {
 	if offset != "2" {
 		t.Errorf("offset = %q, want %q", offset, "2")
 	}
-	if _, ok := users2.Get("1"); !ok {
+	if _, ok, _ := users2.Get("1"); !ok {
 		t.Error("user collection should be restored")
 	}
 }
@@ -1547,8 +1564,8 @@ func TestMaterializerLoadSnapshotErrors(t *testing.T) {
 		if mat.LastOffset() != eventbus.OffsetOldest {
 			t.Errorf("LastOffset() = %q, want OffsetOldest", mat.LastOffset())
 		}
-		if got := len(users.All()); got != 0 {
-			t.Errorf("store has %d entities after failed restore, want 0", got)
+		if all, _ := users.All(); len(all) != 0 {
+			t.Errorf("store has %d entities after failed restore, want 0", len(all))
 		}
 	})
 }
@@ -1569,25 +1586,491 @@ func TestMaterializerLoadSnapshotMissing(t *testing.T) {
 	if offset != eventbus.OffsetOldest {
 		t.Errorf("offset = %q, want OffsetOldest", offset)
 	}
-	if _, ok := users.Get("1"); !ok {
+	if _, ok, _ := users.Get("1"); !ok {
 		t.Error("collections should be untouched when no snapshot exists")
 	}
 }
 
 func TestApplyInvalidChangeMessageJSON(t *testing.T) {
-	mat := NewMaterializer()
+	newMat := func() *Materializer {
+		mat := NewMaterializer()
+		users := NewTypedCollection[User](NewMemoryStore[User]())
+		RegisterCollection(mat, users)
+		return mat
+	}
+	// Valid headers structure but malformed change message body.
+	data := []byte(`{"headers":{"operation":"insert"},"type":123,"key":"1"}`)
+
+	t.Run("typed event errors", func(t *testing.T) {
+		mat := newMat()
+		event := &eventbus.StoredEvent{Offset: "1", Type: "state.ChangeMessage", Data: data}
+		if err := mat.Apply(event); err == nil {
+			t.Error("Apply() should error when a typed change message is malformed")
+		}
+	})
+
+	t.Run("untyped event skips as foreign", func(t *testing.T) {
+		mat := newMat()
+		event := &eventbus.StoredEvent{Offset: "1", Data: data}
+		if err := mat.Apply(event); err != nil {
+			t.Errorf("Apply() should skip a foreign event that merely resembles a change message, got %v", err)
+		}
+		if mat.LastOffset() != "1" {
+			t.Errorf("LastOffset() = %q, want %q", mat.LastOffset(), "1")
+		}
+	})
+}
+
+// ================== Review-Fix Regression Tests ==================
+
+// PtrNamedUser has a value-receiver TypeNamer; used with pointer type
+// parameters it used to panic on the nil zero value.
+type PtrNamedUser struct {
+	Name string `json:"name"`
+}
+
+func (u PtrNamedUser) StateTypeName() string { return "ptruser" }
+
+// ptrRecvUser has a pointer-receiver TypeNamer.
+type ptrRecvUser struct {
+	Name string `json:"name"`
+}
+
+func (u *ptrRecvUser) StateTypeName() string { return "ptrrecv" }
+
+func TestPointerEntityTypeNamer(t *testing.T) {
+	t.Run("Insert with pointer type parameter", func(t *testing.T) {
+		msg, err := Insert("1", &PtrNamedUser{Name: "Alice"})
+		if err != nil {
+			t.Fatalf("Insert() error = %v", err)
+		}
+		if msg.Type != "ptruser" {
+			t.Errorf("Type = %q, want %q", msg.Type, "ptruser")
+		}
+	})
+
+	t.Run("NewTypedCollection with pointer type parameter", func(t *testing.T) {
+		users := NewTypedCollection[*PtrNamedUser](NewMemoryStore[*PtrNamedUser]())
+		if users.EntityType() != "ptruser" {
+			t.Errorf("EntityType() = %q, want %q", users.EntityType(), "ptruser")
+		}
+	})
+
+	t.Run("EntityType with typed nil pointer", func(t *testing.T) {
+		if got := EntityType((*PtrNamedUser)(nil)); got != "ptruser" {
+			t.Errorf("EntityType(nil ptr) = %q, want %q", got, "ptruser")
+		}
+	})
+
+	t.Run("pointer-receiver TypeNamer", func(t *testing.T) {
+		msg, err := Insert("1", ptrRecvUser{Name: "Bob"})
+		if err != nil {
+			t.Fatalf("Insert() error = %v", err)
+		}
+		if msg.Type != "ptrrecv" {
+			t.Errorf("Type = %q, want %q", msg.Type, "ptrrecv")
+		}
+		users := NewTypedCollection[*ptrRecvUser](NewMemoryStore[*ptrRecvUser]())
+		if users.EntityType() != "ptrrecv" {
+			t.Errorf("EntityType() = %q, want %q", users.EntityType(), "ptrrecv")
+		}
+	})
+}
+
+func TestSharedStoreCollectionScoping(t *testing.T) {
 	store := NewMemoryStore[User]()
-	users := NewTypedCollection[User](store)
+	users := NewTypedCollectionWithType[User](store, "user")
+	admins := NewTypedCollectionWithType[User](store, "admin")
+
+	mat := NewMaterializer()
 	RegisterCollection(mat, users)
 
-	// Valid headers structure but invalid change message structure
-	// The headers are valid but rest of message is malformed
-	event := &eventbus.StoredEvent{
-		Offset: "1",
-		Data:   []byte(`{"headers":{"operation":"insert"},"type":123,"key":"1"}`),
+	// Populate both collections through the shared store.
+	store.Set("user/1", User{Name: "Alice"})
+	store.Set("admin/1", User{Name: "Root"})
+
+	t.Run("All is scoped to the collection prefix", func(t *testing.T) {
+		all, err := users.All()
+		if err != nil {
+			t.Fatalf("All() error = %v", err)
+		}
+		if len(all) != 1 {
+			t.Fatalf("users.All() returned %d entities, want 1: %v", len(all), all)
+		}
+		if _, ok := all["user/1"]; !ok {
+			t.Error("users.All() should contain user/1")
+		}
+	})
+
+	t.Run("reset clears only registered collections' prefixes", func(t *testing.T) {
+		if err := mat.ApplyControlMessage(Reset("offset-1")); err != nil {
+			t.Fatalf("ApplyControlMessage() error = %v", err)
+		}
+		if _, ok, _ := users.Get("1"); ok {
+			t.Error("user/1 should be cleared by reset")
+		}
+		if _, ok, _ := admins.Get("1"); !ok {
+			t.Error("admin/1 belongs to an unregistered collection and must survive the reset")
+		}
+	})
+}
+
+// failingUserStore fails selected operations to prove store errors surface
+// and never advance the offset.
+type failingUserStore struct {
+	*MemoryStore[User]
+	failSet    bool
+	failDelete bool
+	failAll    bool
+}
+
+func (s *failingUserStore) Set(key string, value User) error {
+	if s.failSet {
+		return errors.New("backend down")
 	}
-	err := mat.Apply(event)
+	return s.MemoryStore.Set(key, value)
+}
+
+func (s *failingUserStore) Delete(key string) error {
+	if s.failDelete {
+		return errors.New("backend down")
+	}
+	return s.MemoryStore.Delete(key)
+}
+
+func (s *failingUserStore) All() (map[string]User, error) {
+	if s.failAll {
+		return nil, errors.New("backend down")
+	}
+	return s.MemoryStore.All()
+}
+
+func TestStoreErrorsDoNotAdvanceOffset(t *testing.T) {
+	newMat := func(store Store[User]) (*Materializer, *int) {
+		count := 0
+		mat := NewMaterializer(WithOnError(func(error) { count++ }))
+		RegisterCollection(mat, NewTypedCollectionWithType[User](store, "state.User"))
+		return mat, &count
+	}
+	insertEvent := func(offset string) *eventbus.StoredEvent {
+		data, _ := json.Marshal(&ChangeMessage{
+			Type: "state.User", Key: "1",
+			Value:   json.RawMessage(`{"name":"Alice"}`),
+			Headers: Headers{Operation: OperationInsert},
+		})
+		return &eventbus.StoredEvent{Offset: eventbus.Offset(offset), Type: "state.ChangeMessage", Data: data}
+	}
+
+	t.Run("set failure aborts and offset stays", func(t *testing.T) {
+		store := &failingUserStore{MemoryStore: NewMemoryStore[User](), failSet: true}
+		mat, count := newMat(store)
+		if err := mat.Apply(insertEvent("5")); err == nil {
+			t.Fatal("Apply() should surface the store failure")
+		}
+		if mat.LastOffset() != eventbus.OffsetOldest {
+			t.Errorf("LastOffset() = %q, want unchanged", mat.LastOffset())
+		}
+		if *count != 1 {
+			t.Errorf("onError called %d times, want 1", *count)
+		}
+	})
+
+	t.Run("store failure is not skippable by ApplySkip", func(t *testing.T) {
+		store := &failingUserStore{MemoryStore: NewMemoryStore[User](), failSet: true}
+		count := 0
+		mat := NewMaterializer(WithOnError(func(error) { count++ }), WithApplyErrorPolicy(ApplySkip))
+		RegisterCollection(mat, NewTypedCollectionWithType[User](store, "state.User"))
+		if err := mat.Apply(insertEvent("5")); err == nil {
+			t.Fatal("Apply() must not skip transient store failures")
+		}
+		if mat.LastOffset() != eventbus.OffsetOldest {
+			t.Errorf("LastOffset() = %q, want unchanged", mat.LastOffset())
+		}
+	})
+
+	t.Run("delete failure surfaces", func(t *testing.T) {
+		store := &failingUserStore{MemoryStore: NewMemoryStore[User](), failDelete: true}
+		mat, _ := newMat(store)
+		data, _ := json.Marshal(&ChangeMessage{
+			Type: "state.User", Key: "1",
+			Headers: Headers{Operation: OperationDelete},
+		})
+		event := &eventbus.StoredEvent{Offset: "5", Type: "state.ChangeMessage", Data: data}
+		if err := mat.Apply(event); err == nil {
+			t.Fatal("Apply() should surface the delete failure")
+		}
+	})
+
+	t.Run("reset clear failure surfaces", func(t *testing.T) {
+		store := &failingUserStore{MemoryStore: NewMemoryStore[User](), failAll: true}
+		mat, count := newMat(store)
+		if err := mat.ApplyControlMessage(Reset("o")); err == nil {
+			t.Fatal("ApplyControlMessage() should surface the clear failure")
+		}
+		if *count != 1 {
+			t.Errorf("onError called %d times, want 1", *count)
+		}
+	})
+}
+
+func TestApplySkipPolicy(t *testing.T) {
+	poison := &eventbus.StoredEvent{
+		Offset: "3",
+		Type:   "state.ChangeMessage",
+		Data:   []byte(`{"type":"state.User","key":"1","value":"not-an-object","headers":{"operation":"insert"}}`),
+	}
+
+	t.Run("poison message is reported and skipped", func(t *testing.T) {
+		var reported error
+		mat := NewMaterializer(WithOnError(func(err error) { reported = err }), WithApplyErrorPolicy(ApplySkip))
+		RegisterCollection(mat, NewTypedCollection[User](NewMemoryStore[User]()))
+
+		if err := mat.Apply(poison); err != nil {
+			t.Fatalf("Apply() with ApplySkip should not return the decode error, got %v", err)
+		}
+		if mat.LastOffset() != "3" {
+			t.Errorf("LastOffset() = %q, want %q (skip advances past poison)", mat.LastOffset(), "3")
+		}
+		if reported == nil || !errors.Is(reported, ErrUndecodable) {
+			t.Errorf("onError should receive the ErrUndecodable-wrapped error, got %v", reported)
+		}
+	})
+
+	t.Run("unknown operation is skippable", func(t *testing.T) {
+		mat := NewMaterializer(WithApplyErrorPolicy(ApplySkip))
+		RegisterCollection(mat, NewTypedCollection[User](NewMemoryStore[User]()))
+		event := &eventbus.StoredEvent{
+			Offset: "4",
+			Type:   "state.ChangeMessage",
+			Data:   []byte(`{"type":"state.User","key":"1","value":{},"headers":{"operation":"upsert"}}`),
+		}
+		if err := mat.Apply(event); err != nil {
+			t.Fatalf("Apply() with ApplySkip should skip unknown operations, got %v", err)
+		}
+		if mat.LastOffset() != "4" {
+			t.Errorf("LastOffset() = %q, want %q", mat.LastOffset(), "4")
+		}
+	})
+
+	t.Run("default policy aborts", func(t *testing.T) {
+		mat := NewMaterializer()
+		RegisterCollection(mat, NewTypedCollection[User](NewMemoryStore[User]()))
+		if err := mat.Apply(poison); err == nil {
+			t.Fatal("Apply() with default policy should return the decode error")
+		}
+		if mat.LastOffset() != eventbus.OffsetOldest {
+			t.Errorf("LastOffset() = %q, want unchanged", mat.LastOffset())
+		}
+	})
+}
+
+func TestUnknownControl(t *testing.T) {
+	t.Run("strict mode errors on typed unknown control", func(t *testing.T) {
+		var reported error
+		mat := NewMaterializer(WithStrictSchema(), WithOnError(func(err error) { reported = err }))
+		event := &eventbus.StoredEvent{
+			Offset: "1",
+			Type:   "state.ControlMessage",
+			Data:   []byte(`{"headers":{"control":"must-refetch"}}`),
+		}
+		if err := mat.Apply(event); err == nil {
+			t.Fatal("Apply() should error on unknown control in strict mode")
+		}
+		if reported == nil {
+			t.Error("onError should have been invoked")
+		}
+		if mat.LastOffset() != eventbus.OffsetOldest {
+			t.Errorf("LastOffset() = %q, want unchanged", mat.LastOffset())
+		}
+	})
+
+	t.Run("lax mode ignores typed unknown control", func(t *testing.T) {
+		mat := NewMaterializer()
+		event := &eventbus.StoredEvent{
+			Offset: "1",
+			Type:   "state.ControlMessage",
+			Data:   []byte(`{"headers":{"control":"must-refetch"}}`),
+		}
+		if err := mat.Apply(event); err != nil {
+			t.Fatalf("Apply() should ignore unknown control in lax mode, got %v", err)
+		}
+		if mat.LastOffset() != "1" {
+			t.Errorf("LastOffset() = %q, want %q", mat.LastOffset(), "1")
+		}
+	})
+
+	t.Run("strict unknown control is skippable", func(t *testing.T) {
+		mat := NewMaterializer(WithStrictSchema(), WithApplyErrorPolicy(ApplySkip))
+		event := &eventbus.StoredEvent{
+			Offset: "2",
+			Type:   "state.ControlMessage",
+			Data:   []byte(`{"headers":{"control":"must-refetch"}}`),
+		}
+		if err := mat.Apply(event); err != nil {
+			t.Fatalf("Apply() with ApplySkip should skip unknown control, got %v", err)
+		}
+		if mat.LastOffset() != "2" {
+			t.Errorf("LastOffset() = %q, want %q", mat.LastOffset(), "2")
+		}
+	})
+}
+
+func TestForeignEventsOnMixedStream(t *testing.T) {
+	newMat := func() (*Materializer, *TypedCollection[User]) {
+		mat := NewMaterializer(WithOnReset(func() { panic("reset must not fire for foreign events") }))
+		users := NewTypedCollectionWithType[User](NewMemoryStore[User](), "user")
+		RegisterCollection(mat, users)
+		return mat, users
+	}
+
+	t.Run("HTTP-ish event with headers does not wedge", func(t *testing.T) {
+		mat, _ := newMat()
+		// The shape that used to permanently wedge replay: a non-state event
+		// carrying a "headers" object and a non-string "type".
+		event := &eventbus.StoredEvent{
+			Offset: "1",
+			Type:   "web.RequestLogged",
+			Data:   []byte(`{"url":"/x","headers":{"Accept":"application/json"},"type":200}`),
+		}
+		if err := mat.Apply(event); err != nil {
+			t.Fatalf("Apply() should skip foreign events, got %v", err)
+		}
+		if mat.LastOffset() != "1" {
+			t.Errorf("LastOffset() = %q, want %q", mat.LastOffset(), "1")
+		}
+	})
+
+	t.Run("foreign headers.control string is not consumed as control", func(t *testing.T) {
+		mat, _ := newMat()
+		event := &eventbus.StoredEvent{
+			Offset: "2",
+			Type:   "web.ResponseLogged",
+			Data:   []byte(`{"headers":{"control":"no-cache"}}`),
+		}
+		if err := mat.Apply(event); err != nil {
+			t.Fatalf("Apply() should skip foreign control-like events, got %v", err)
+		}
+	})
+
+	t.Run("untyped protocol-shaped change message still applies", func(t *testing.T) {
+		mat, users := newMat()
+		event := &eventbus.StoredEvent{
+			Offset: "3",
+			Type:   "some.other.Writer",
+			Data:   []byte(`{"type":"user","key":"1","value":{"name":"Alice"},"headers":{"operation":"insert"}}`),
+		}
+		if err := mat.Apply(event); err != nil {
+			t.Fatalf("Apply() should apply protocol-shaped untyped messages, got %v", err)
+		}
+		if u, ok, _ := users.Get("1"); !ok || u.Name != "Alice" {
+			t.Errorf("users.Get(1) = %+v, %v; want Alice", u, ok)
+		}
+	})
+}
+
+func TestStoreErrorPathsCoverage(t *testing.T) {
+	insertEvent := func(offset string) *eventbus.StoredEvent {
+		data, _ := json.Marshal(&ChangeMessage{
+			Type: "state.User", Key: "1",
+			Value:   json.RawMessage(`{"name":"Alice"}`),
+			Headers: Headers{Operation: OperationInsert},
+		})
+		return &eventbus.StoredEvent{Offset: eventbus.Offset(offset), Type: "state.ChangeMessage", Data: data}
+	}
+
+	t.Run("clear delete failure during reset", func(t *testing.T) {
+		store := &failingUserStore{MemoryStore: NewMemoryStore[User]()}
+		mat := NewMaterializer()
+		RegisterCollection(mat, NewTypedCollectionWithType[User](store, "state.User"))
+		if err := mat.Apply(insertEvent("1")); err != nil {
+			t.Fatalf("Apply() error = %v", err)
+		}
+		store.failDelete = true
+		if err := mat.ApplyControlMessage(Reset("o")); err == nil {
+			t.Fatal("reset should surface the delete failure")
+		}
+	})
+
+	t.Run("snapshot All failure", func(t *testing.T) {
+		store := &failingUserStore{MemoryStore: NewMemoryStore[User]()}
+		mat := NewMaterializer()
+		RegisterCollection(mat, NewTypedCollectionWithType[User](store, "state.User"))
+		if err := mat.Apply(insertEvent("1")); err != nil {
+			t.Fatalf("Apply() error = %v", err)
+		}
+		store.failAll = true
+		snap := newFakeSnapshotStore()
+		if err := mat.SaveSnapshotTo(context.Background(), snap, "users"); err == nil {
+			t.Fatal("SaveSnapshotTo() should surface the All failure")
+		}
+	})
+
+	t.Run("typed control message unmarshal failure", func(t *testing.T) {
+		mat := NewMaterializer()
+		event := &eventbus.StoredEvent{Offset: "1", Type: "state.ControlMessage", Data: []byte(`{invalid`)}
+		err := mat.Apply(event)
+		if err == nil || !errors.Is(err, ErrUndecodable) {
+			t.Fatalf("Apply() should return ErrUndecodable for malformed typed control, got %v", err)
+		}
+	})
+
+	t.Run("restore set failure leaves materializer empty", func(t *testing.T) {
+		// Build a valid snapshot with a working store first.
+		good := &failingUserStore{MemoryStore: NewMemoryStore[User]()}
+		mat := NewMaterializer()
+		RegisterCollection(mat, NewTypedCollectionWithType[User](good, "state.User"))
+		if err := mat.Apply(insertEvent("1")); err != nil {
+			t.Fatalf("Apply() error = %v", err)
+		}
+		snap := newFakeSnapshotStore()
+		if err := mat.SaveSnapshotTo(context.Background(), snap, "users"); err != nil {
+			t.Fatalf("SaveSnapshotTo() error = %v", err)
+		}
+
+		// Restoring into a store whose Set fails must reset to empty.
+		good.failSet = true
+		offset, err := mat.LoadSnapshotFrom(context.Background(), snap, "users")
+		if err == nil {
+			t.Fatal("LoadSnapshotFrom() should surface the Set failure")
+		}
+		if offset != eventbus.OffsetOldest {
+			t.Errorf("offset = %q, want OffsetOldest", offset)
+		}
+		if mat.LastOffset() != eventbus.OffsetOldest {
+			t.Errorf("LastOffset() = %q, want OffsetOldest", mat.LastOffset())
+		}
+	})
+
+	t.Run("restore clear failure joins errors", func(t *testing.T) {
+		good := &failingUserStore{MemoryStore: NewMemoryStore[User]()}
+		mat := NewMaterializer()
+		RegisterCollection(mat, NewTypedCollectionWithType[User](good, "state.User"))
+		if err := mat.Apply(insertEvent("1")); err != nil {
+			t.Fatalf("Apply() error = %v", err)
+		}
+		snap := newFakeSnapshotStore()
+		if err := mat.SaveSnapshotTo(context.Background(), snap, "users"); err != nil {
+			t.Fatalf("SaveSnapshotTo() error = %v", err)
+		}
+
+		// All() failing makes both the initial clearAll and the recovery
+		// clearAll fail; LoadSnapshotFrom must still come back safe.
+		good.failAll = true
+		offset, err := mat.LoadSnapshotFrom(context.Background(), snap, "users")
+		if err == nil {
+			t.Fatal("LoadSnapshotFrom() should surface the clear failure")
+		}
+		if offset != eventbus.OffsetOldest || mat.LastOffset() != eventbus.OffsetOldest {
+			t.Errorf("materializer should reset to OffsetOldest, got %q/%q", offset, mat.LastOffset())
+		}
+	})
+}
+
+func TestRestoreClearFailure(t *testing.T) {
+	store := &failingUserStore{MemoryStore: NewMemoryStore[User](), failAll: true}
+	a := &typedCollectionApplier[User]{collection: NewTypedCollectionWithType[User](store, "state.User")}
+	err := a.restore(map[string]json.RawMessage{"state.User/1": json.RawMessage(`{"name":"Alice"}`)})
 	if err == nil {
-		t.Error("Apply() should error when type field is wrong type")
+		t.Fatal("restore() should surface its clear failure")
 	}
 }

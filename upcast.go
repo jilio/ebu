@@ -21,9 +21,12 @@ type Upcaster struct {
 	Upcast   UpcastFunc // Transformation function
 }
 
-// upcastRegistry manages all registered upcasters
+// upcastRegistry manages all registered upcasters.
+// Each source type has at most one upcaster: apply follows a single chain
+// (v1 -> v2 -> v3), so a second upcaster for the same source type could
+// never run and is rejected at registration instead of silently ignored.
 type upcastRegistry struct {
-	upcasters    map[string][]Upcaster // Map from source type to list of upcasters
+	upcasters    map[string]Upcaster // Map from source type to its upcaster
 	mu           sync.RWMutex
 	errorHandler UpcastErrorHandler
 }
@@ -31,7 +34,7 @@ type upcastRegistry struct {
 // newUpcastRegistry creates a new upcast registry
 func newUpcastRegistry() *upcastRegistry {
 	return &upcastRegistry{
-		upcasters: make(map[string][]Upcaster),
+		upcasters: make(map[string]Upcaster),
 	}
 }
 
@@ -50,18 +53,20 @@ func (r *upcastRegistry) register(fromType, toType string, upcast UpcastFunc) er
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if existing, ok := r.upcasters[fromType]; ok {
+		return fmt.Errorf("eventbus: upcaster already registered for type %s (-> %s): each source type has exactly one successor; chain versions (v1 -> v2 -> v3) instead", fromType, existing.ToType)
+	}
+
 	// Check for circular dependencies
 	if r.wouldCreateCycle(fromType, toType) {
 		return fmt.Errorf("eventbus: upcast would create circular dependency")
 	}
 
-	upcaster := Upcaster{
+	r.upcasters[fromType] = Upcaster{
 		FromType: fromType,
 		ToType:   toType,
 		Upcast:   upcast,
 	}
-
-	r.upcasters[fromType] = append(r.upcasters[fromType], upcaster)
 	return nil
 }
 
@@ -82,10 +87,8 @@ func (r *upcastRegistry) hasCycleDFS(current, target string, visited map[string]
 	}
 	visited[current] = true
 
-	for _, upcaster := range r.upcasters[current] {
-		if r.hasCycleDFS(upcaster.ToType, target, visited) {
-			return true
-		}
+	if upcaster, ok := r.upcasters[current]; ok {
+		return r.hasCycleDFS(upcaster.ToType, target, visited)
 	}
 	return false
 }
@@ -108,13 +111,7 @@ func (r *upcastRegistry) apply(data json.RawMessage, eventType string) (json.Raw
 		// Find the next upcaster and snapshot the error handler under the
 		// read lock; user code runs after the lock is released.
 		r.mu.RLock()
-		var upcaster Upcaster
-		found := false
-		if ups := r.upcasters[currentType]; len(ups) > 0 {
-			// Apply the first available upcaster (could be enhanced to choose best path)
-			upcaster = ups[0]
-			found = true
-		}
+		upcaster, found := r.upcasters[currentType]
 		errorHandler := r.errorHandler
 		r.mu.RUnlock()
 
@@ -148,7 +145,7 @@ func (r *upcastRegistry) apply(data json.RawMessage, eventType string) (json.Raw
 func (r *upcastRegistry) clear() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.upcasters = make(map[string][]Upcaster)
+	r.upcasters = make(map[string]Upcaster)
 }
 
 // clearType removes all upcasters for a specific source type

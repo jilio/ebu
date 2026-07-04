@@ -87,10 +87,11 @@ func (s *SQLiteStore) StreamRows(
 
 // StreamBatch exposes streamBatch for testing error paths (e.g., rows.Close() error)
 func (s *SQLiteStore) StreamBatch(
+	ctx context.Context,
 	rows RowScanner,
 	eventCount *int,
 	iterErr *error,
 	yield StreamRowsYieldFunc,
 ) (batchCount int, lastPos int64, cont bool) {
-	return s.streamBatch(rows, eventCount, iterErr, yield)
+	return s.streamBatch(ctx, rows, eventCount, iterErr, yield)
 }

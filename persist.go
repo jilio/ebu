@@ -29,6 +29,13 @@ const (
 
 	// OffsetNewest represents the current end of the stream.
 	// Useful for subscribing to only new events.
+	//
+	// Contract (all bundled stores): OffsetNewest resolves, at call time, to
+	// the current tail. Read/ReadStream from it return no historical events;
+	// Read returns a concrete resumable offset (never "$" itself) as
+	// nextOffset, so Replay(ctx, OffsetNewest, ...) terminates immediately
+	// and the position it reached can be saved and resumed. SaveOffset
+	// resolves it to the concrete tail before persisting.
 	OffsetNewest Offset = "$"
 )
 
@@ -251,7 +258,15 @@ func (bus *EventBus) Replay(ctx context.Context, from Offset, handler func(*Stor
 		}
 
 		if len(events) == 0 {
-			break
+			// Zero events does not mean the tail was reached: a store may
+			// advance the offset past a stretch it cannot deliver (e.g. a
+			// remote chunk whose events were all skipped as undecodable).
+			// Only a non-advancing offset marks the end of the stream.
+			if nextOffset == offset {
+				break
+			}
+			offset = nextOffset
+			continue
 		}
 
 		for _, event := range events {
@@ -448,6 +463,18 @@ func SubscribeWithReplay[T any](
 	// replay passes the same way PublishContext honors it live.
 	filter, _ := h.filter.(func(T) bool)
 
+	// callReplayed delivers a replayed event under the same mutual-exclusion
+	// guarantee live delivery provides: once the live subscription registers
+	// (before the catch-up pass), a Sequential() handler can be entered by a
+	// concurrent Publish, so the replay path must take the same lock.
+	callReplayed := func(event T) {
+		if h.sequential {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+		}
+		handler(event)
+	}
+
 	// Load last offset for this subscription
 	lastOffset, _ := subStore.LoadOffset(ctx, subscriptionID)
 
@@ -501,7 +528,7 @@ func SubscribeWithReplay[T any](
 			return nil
 		}
 
-		handler(event)
+		callReplayed(event)
 
 		// Save this event's own offset after successful handling
 		saveOffset(ctx, event, stored.Offset)
@@ -579,9 +606,24 @@ func (m *MemoryStore) searchAfter(from Offset) int {
 	if from == OffsetOldest {
 		return 0
 	}
+	if from == OffsetNewest {
+		// "$" is not a stored offset ("$" sorts before the zero-padded
+		// digits, so the binary search would wrongly return 0 = replay
+		// everything); the tail means "after every current event".
+		return len(m.events)
+	}
 	return sort.Search(len(m.events), func(i int) bool {
 		return m.events[i].Offset > from
 	})
+}
+
+// tailOffset returns the offset of the last stored event, or OffsetOldest
+// when the store is empty. Caller must hold at least a read lock.
+func (m *MemoryStore) tailOffset() Offset {
+	if len(m.events) == 0 {
+		return OffsetOldest
+	}
+	return m.events[len(m.events)-1].Offset
 }
 
 // Read implements EventStore
@@ -596,6 +638,12 @@ func (m *MemoryStore) Read(ctx context.Context, from Offset, limit int) ([]*Stor
 	}
 
 	if start == end {
+		if from == OffsetNewest {
+			// Resolve "$" to a concrete, resumable position: echoing the
+			// symbolic offset back would make the caller chase a
+			// perpetually moving tail.
+			return nil, m.tailOffset(), nil
+		}
 		return nil, from, nil
 	}
 
@@ -604,11 +652,16 @@ func (m *MemoryStore) Read(ctx context.Context, from Offset, limit int) ([]*Stor
 	return result, result[len(result)-1].Offset, nil
 }
 
-// SaveOffset implements SubscriptionStore
+// SaveOffset implements SubscriptionStore.
+// OffsetNewest is resolved to the current tail at save time, so the stored
+// value is always a concrete, resumable position.
 func (m *MemoryStore) SaveOffset(ctx context.Context, subscriptionID string, offset Offset) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if offset == OffsetNewest {
+		offset = m.tailOffset()
+	}
 	m.subscriptions[subscriptionID] = offset
 	return nil
 }

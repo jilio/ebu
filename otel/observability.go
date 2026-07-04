@@ -1,3 +1,25 @@
+// Package otel provides an OpenTelemetry implementation of
+// eventbus.Observability, emitting spans and metrics for publish, handler,
+// and persist operations.
+//
+// # Cardinality warning
+//
+// Event type names (as produced by the bus's TypeNamer) are embedded in span
+// names and recorded as the event.type attribute on every metric. Attributes
+// returned by SpanAttributer are attached to publish spans verbatim. Both are
+// user-controlled escape hatches: a TypeNamer that derives names from dynamic
+// data, or a SpanAttributer that returns high-cardinality values (user IDs,
+// request IDs, ...), will explode metric cardinality and span-name
+// cardinality in your telemetry backend. Keep type names static and keep
+// SpanAttributes to low-cardinality, domain-level values.
+//
+// # Publish spans and persist errors
+//
+// OnPublishComplete carries no error parameter: a publish whose persistence
+// failed still produces an unblemished publish span. Only the child persist
+// span records the error (status Error plus a recorded error event). When
+// hunting persistence failures, look at eventbus.persist spans and the
+// eventbus.persist.errors metric, not the publish span's status.
 package otel
 
 import (
@@ -21,7 +43,30 @@ type contextKey int
 
 const (
 	asyncKey contextKey = iota
+	publishSpanKey
+	handlerSpanKey
+	persistSpanKey
 )
+
+// durationBucketBoundaries are the explicit bucket boundaries (in
+// milliseconds) for the duration histograms. The SDK defaults start at 5ms,
+// but in-process handlers routinely finish in well under 1ms, which would
+// collapse nearly all samples into the first bucket. These boundaries add
+// sub-millisecond resolution while still covering slow I/O-bound handlers.
+var durationBucketBoundaries = []float64{
+	0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 25, 50, 100, 250, 500, 1000, 5000,
+}
+
+// spanFromContext returns the span stored under key, falling back to the
+// span in ctx. Retrieving the exact span started by the matching Start hook
+// guards against a chained Observability implementation (or a future bus
+// change) replacing the context's active span between Start and Complete.
+func spanFromContext(ctx context.Context, key contextKey) trace.Span {
+	if span, ok := ctx.Value(key).(trace.Span); ok {
+		return span
+	}
+	return trace.SpanFromContext(ctx)
+}
 
 // millis converts a duration to fractional milliseconds. Using
 // duration.Milliseconds() would truncate: in-process handlers routinely
@@ -125,6 +170,7 @@ func New(opts ...Option) (*Observability, error) {
 		"eventbus.handler.duration",
 		metric.WithDescription("Handler execution duration"),
 		metric.WithUnit("ms"),
+		metric.WithExplicitBucketBoundaries(durationBucketBoundaries...),
 	)
 	if err != nil {
 		return nil, err
@@ -152,6 +198,7 @@ func New(opts ...Option) (*Observability, error) {
 		"eventbus.persist.duration",
 		metric.WithDescription("Event persistence duration"),
 		metric.WithUnit("ms"),
+		metric.WithExplicitBucketBoundaries(durationBucketBoundaries...),
 	)
 	if err != nil {
 		return nil, err
@@ -183,6 +230,10 @@ func (o *Observability) OnPublishStart(ctx context.Context, eventType string, ev
 		span.SetAttributes(sa.SpanAttributes()...)
 	}
 
+	// Remember the exact span so OnPublishComplete ends it even if a chained
+	// implementation replaces the context's active span.
+	ctx = context.WithValue(ctx, publishSpanKey, span)
+
 	// Increment publish counter
 	o.publishCounter.Add(ctx, 1,
 		metric.WithAttributes(
@@ -196,7 +247,7 @@ func (o *Observability) OnPublishStart(ctx context.Context, eventType string, ev
 // OnPublishComplete is called when an event completes publishing (all sync handlers done)
 func (o *Observability) OnPublishComplete(ctx context.Context, eventType string) {
 	// End the publish span
-	span := trace.SpanFromContext(ctx)
+	span := spanFromContext(ctx, publishSpanKey)
 	span.End()
 }
 
@@ -218,12 +269,16 @@ func (o *Observability) OnHandlerStart(ctx context.Context, eventType string, as
 		spanName = "eventbus.handler.async: " + eventType
 	}
 
-	ctx, _ = o.tracer.Start(ctx, spanName,
+	ctx, span := o.tracer.Start(ctx, spanName,
 		trace.WithAttributes(
 			attribute.String("event.type", eventType),
 			attribute.Bool("async", async),
 		),
 	)
+
+	// Remember the exact span so OnHandlerComplete ends it even if a chained
+	// implementation replaces the context's active span.
+	ctx = context.WithValue(ctx, handlerSpanKey, span)
 
 	// Increment handler counter
 	o.handlerCounter.Add(ctx, 1,
@@ -238,7 +293,7 @@ func (o *Observability) OnHandlerStart(ctx context.Context, eventType string, as
 
 // OnHandlerComplete is called when a handler completes (with or without error)
 func (o *Observability) OnHandlerComplete(ctx context.Context, eventType string, duration time.Duration, err error) {
-	span := trace.SpanFromContext(ctx)
+	span := spanFromContext(ctx, handlerSpanKey)
 
 	attrs := []attribute.KeyValue{
 		attribute.String("event.type", eventType),
@@ -247,16 +302,17 @@ func (o *Observability) OnHandlerComplete(ctx context.Context, eventType string,
 		attrs = append(attrs, attribute.Bool("async", async))
 	}
 
-	// Record duration
-	o.handlerDuration.Record(ctx, millis(duration), metric.WithAttributes(attrs...))
+	// Record duration, tagged with error status so error latencies
+	// (typically timeout-shaped) are separable from successes.
+	durationAttrs := append(attrs, attribute.Bool("error", err != nil))
+	o.handlerDuration.Record(ctx, millis(duration), metric.WithAttributes(durationAttrs...))
 
-	// Handle errors
+	// Handle errors. On success the span status is left Unset: the OTel spec
+	// reserves Ok for explicit operator affirmation.
 	if err != nil {
 		span.SetStatus(codes.Error, err.Error())
 		span.RecordError(err)
 		o.handlerErrors.Add(ctx, 1, metric.WithAttributes(attrs...))
-	} else {
-		span.SetStatus(codes.Ok, "")
 	}
 
 	span.End()
@@ -266,11 +322,15 @@ func (o *Observability) OnHandlerComplete(ctx context.Context, eventType string,
 // offset is not known yet; it is attached to the span in OnPersistComplete.
 func (o *Observability) OnPersistStart(ctx context.Context, eventType string) context.Context {
 	// Start a span for persistence
-	ctx, _ = o.tracer.Start(ctx, "eventbus.persist: "+eventType,
+	ctx, span := o.tracer.Start(ctx, "eventbus.persist: "+eventType,
 		trace.WithAttributes(
 			attribute.String("event.type", eventType),
 		),
 	)
+
+	// Remember the exact span so OnPersistComplete ends it even if a chained
+	// implementation replaces the context's active span.
+	ctx = context.WithValue(ctx, persistSpanKey, span)
 
 	// Increment persist counter
 	o.persistCounter.Add(ctx, 1,
@@ -286,7 +346,7 @@ func (o *Observability) OnPersistStart(ctx context.Context, eventType string) co
 // the store-assigned offset is recorded on the persist span (span-only:
 // offsets are high-cardinality and do not belong on metrics).
 func (o *Observability) OnPersistComplete(ctx context.Context, eventType string, duration time.Duration, offset eventbus.Offset, err error) {
-	span := trace.SpanFromContext(ctx)
+	span := spanFromContext(ctx, persistSpanKey)
 
 	if offset != "" {
 		span.SetAttributes(attribute.String("event.offset", string(offset)))
@@ -296,16 +356,17 @@ func (o *Observability) OnPersistComplete(ctx context.Context, eventType string,
 		attribute.String("event.type", eventType),
 	}
 
-	// Record duration
-	o.persistDuration.Record(ctx, millis(duration), metric.WithAttributes(attrs...))
+	// Record duration, tagged with error status so error latencies
+	// (typically timeout-shaped) are separable from successes.
+	durationAttrs := append(attrs, attribute.Bool("error", err != nil))
+	o.persistDuration.Record(ctx, millis(duration), metric.WithAttributes(durationAttrs...))
 
-	// Handle errors
+	// Handle errors. On success the span status is left Unset: the OTel spec
+	// reserves Ok for explicit operator affirmation.
 	if err != nil {
 		span.SetStatus(codes.Error, err.Error())
 		span.RecordError(err)
 		o.persistErrors.Add(ctx, 1, metric.WithAttributes(attrs...))
-	} else {
-		span.SetStatus(codes.Ok, "")
 	}
 
 	span.End()

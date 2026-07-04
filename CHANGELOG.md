@@ -5,6 +5,103 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] - 2026-07-05
+
+### Fixed
+
+- **`Replay` no longer mistakes an empty batch for the end of the stream.**
+  A store may return zero events while still advancing the offset (e.g. a
+  remote chunk whose events were all skipped as undecodable). The fallback
+  read loop treated any empty batch as the tail and stopped, silently
+  dropping every event after the gap. The tail is now detected only by a
+  non-advancing offset.
+- **`Sequential()` mutual exclusion holds during replay.**
+  `SubscribeWithReplay`'s replay passes called the handler without taking
+  the handler mutex, so once the live subscription registered (before the
+  catch-up pass) a concurrent `Publish` could enter a `Sequential()` handler
+  while the replay pass was inside it. The replay path now takes the same
+  lock as live delivery.
+- **sqlite: batched `ReadStream` no longer swallows mid-iteration errors.**
+  `database/sql` surfaces mid-iteration failures — including context
+  cancellation — only through `rows.Err()`, which the batched stream path
+  never checked. A cancelled or failing replay could therefore terminate
+  cleanly after a fraction of the log, and a projection built from it was
+  silently stale. Batched streaming (the default) now yields the error, and
+  responds to cancellation per row rather than per batch.
+- **durablestream: `WithTimeout` is honored.** The pinned client stores but
+  never applies its configured timeout, and the previous default HTTP client
+  had none, so a remote that accepted the connection and never responded
+  blocked `Append` forever — while holding the append lock, wedging every
+  publisher. The default HTTP client now carries the configured timeout, and
+  `Read`/`Create` wrap each attempt in a timeout context.
+- **durablestream: chunks with no decodable events no longer end `Replay`
+  early.** `Read` now advances chunk by chunk (bounded by the server's
+  `UpToDate` signal) until it can return at least one event or the tail is
+  reached, instead of returning an empty advancing result the bus's read
+  loop used to misread as end-of-stream.
+- **durablestream: the cached stream writer is detached from its creator's
+  context.** Cancelling the first `Append` caller's context could abort
+  later, unrelated `Append`s (and with retries exhausted, fail them) because
+  the writer captured that context for all subsequent sends.
+- **state: events are routed by stored type, and foreign events can no
+  longer wedge or corrupt the materializer.** `Apply` previously classified
+  by JSON shape alone: any event carrying a `headers` field — an HTTP log,
+  say — was force-decoded as a state message; failure aborted replay without
+  advancing the offset, wedging every future replay on the same event, and a
+  foreign `headers.control` string was consumed as a control message.
+  Events typed `state.ChangeMessage`/`state.ControlMessage` are now decoded
+  strictly; everything else is detected structurally and skipped as foreign
+  unless it positively identifies as a state protocol message.
+- **state: pointer entity types with a `TypeNamer` no longer panic.**
+  `Insert[*T]`, `NewTypedCollection[*T]`, and `EntityType` on a typed nil
+  pointer derived the name by calling the method on a nil zero value.
+- **state: collections sharing one `Store` are isolated.** `All`, snapshot,
+  restore, and reset were unscoped, so one collection could read, snapshot,
+  or clear another's entities. Every collection operation is now scoped to
+  its `entityType/` key prefix.
+- **state: `SaveSnapshotTo` no longer blocks message application during
+  snapshot I/O.** Application pauses only while collections are captured;
+  the `SaveSnapshot` call runs outside the apply lock. Concurrent savers are
+  serialized with each other so an older snapshot can never overwrite a
+  newer one.
+
+### Added
+
+- **`OffsetNewest` has a defined, uniform contract across all stores**: it
+  resolves at call time to the concrete current tail. Previously the three
+  bundled stores disagreed — sqlite returned a parse error, `MemoryStore`
+  replayed from the beginning (`"$"` sorts before zero-padded digits), and
+  durablestream sent the literal `"$"` to the server.
+- **state: `WithApplyErrorPolicy(ApplySkip)`** — the materializer equivalent
+  of `ReplayErrorPolicy`: reports undecodable (poison) state messages to
+  `WithOnError` and advances past them instead of aborting every future
+  replay on the same event. Store failures are never skipped. New
+  `ErrUndecodable` sentinel distinguishes the two.
+- **state: strict mode reports unknown control values** instead of silently
+  dropping them (a missed `reset` means knowingly stale state).
+- **otel: explicit sub-millisecond histogram buckets** for the handler and
+  persist duration metrics (SDK defaults start at 5ms, collapsing typical
+  in-process handler latencies into one bucket), plus an `error` attribute
+  on duration records so failure latencies are separable.
+
+### Changed
+
+- **state (breaking): `Store` methods return errors** (`Get` returns
+  `(T, bool, error)`, `All` returns `(map[string]T, error)`, `Set`/`Delete`/
+  `Clear` return `error`), and `TypedCollection.Get`/`All` and
+  `ApplyControlMessage` propagate them. A durable backend that could only
+  swallow failures let the materializer advance past updates that were never
+  applied — and a snapshot plus truncation then made the loss permanent. The
+  materializer never advances its offset when a store call fails.
+- **Registering a second upcaster for the same source type now returns an
+  error.** Upcasts follow a single chain per type, so the duplicate could
+  never run; it was accepted silently and never applied.
+- **durablestream: append semantics documented as at-least-once.** A retried
+  append whose first attempt committed but lost its response is duplicated;
+  the pinned protocol's sequence tokens cannot distinguish that case safely
+  (treating the conflict as success could silently lose events instead).
+  Consumers should be idempotent; retry backoff is now capped.
+
 ## [0.14.0] - 2026-07-04
 
 ### Added

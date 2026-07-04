@@ -30,7 +30,9 @@ type config struct {
 
 func defaultConfig() *config {
 	return &config{
-		httpClient:     http.DefaultClient,
+		// httpClient stays nil here; NewWithContext builds the default
+		// client after options are applied so it carries the configured
+		// timeout (http.DefaultClient has none).
 		timeout:        30 * time.Second,
 		contentType:    "application/json",
 		retryAttempts:  3,
@@ -39,6 +41,11 @@ func defaultConfig() *config {
 }
 
 // WithHTTPClient sets a custom HTTP client.
+//
+// The client's own Timeout bounds in-flight append requests (the cached
+// writer's sends cannot be bounded per-call), so a custom client should set
+// one; WithTimeout still bounds reads and initialization via per-attempt
+// context deadlines.
 func WithHTTPClient(client *http.Client) Option {
 	return func(c *config) {
 		if client != nil {
@@ -47,7 +54,10 @@ func WithHTTPClient(client *http.Client) Option {
 	}
 }
 
-// WithTimeout sets the request timeout.
+// WithTimeout sets the request timeout. Each retry attempt gets its own
+// timeout window for reads and initialization; when no custom HTTP client is
+// supplied it also becomes the default client's timeout, bounding append
+// requests. Default is 30s.
 func WithTimeout(d time.Duration) Option {
 	return func(c *config) {
 		if d > 0 {
