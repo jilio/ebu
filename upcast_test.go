@@ -875,3 +875,20 @@ func TestUpcastLoopDetectionInApply(t *testing.T) {
 		t.Errorf("Expected loop detection error, got: %v", err)
 	}
 }
+
+// TestRegisterUpcastInterfaceType verifies that interface type parameters are
+// rejected: upcasts are keyed by type name and events are stored under
+// concrete type names, so an interface-keyed upcast could never match.
+func TestRegisterUpcastInterfaceType(t *testing.T) {
+	bus := New()
+
+	err := RegisterUpcast(bus, func(from fmt.Stringer) UserCreatedV2 { return UserCreatedV2{} })
+	if err == nil || !strings.Contains(err.Error(), "interface") {
+		t.Errorf("Expected interface From rejection, got: %v", err)
+	}
+
+	err = RegisterUpcast(bus, func(from UserCreatedV1) fmt.Stringer { return nil })
+	if err == nil || !strings.Contains(err.Error(), "interface") {
+		t.Errorf("Expected interface To rejection, got: %v", err)
+	}
+}

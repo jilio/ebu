@@ -98,6 +98,10 @@ eventbus.Subscribe(bus, func(event EmailEvent) {
 eventbus.Publish(bus, UserEvent{UserID: "123"})
 ```
 
+Event types must be concrete. Subscribing with an interface type returns an
+error: events are routed by their concrete type, so an interface subscription
+could never receive anything.
+
 ### Async Processing
 
 ```go
@@ -223,6 +227,18 @@ eventbus.SubscribeWithReplay(ctx, bus, "email-sender",
   offset after the handler returns. If the process crashes between handling
   and the offset save, that event is redelivered on the next start — make
   replay handlers idempotent.
+- **Poison events**: by default a stored event that fails to decode aborts the
+  replay (and, because its offset is never saved, aborts it again on every
+  restart). Pass `eventbus.WithReplayErrorPolicy(eventbus.ReplaySkip)` to skip
+  undecodable events instead — each is reported to the
+  `PersistenceErrorHandler` (as its `*StoredEvent`, so the payload can be
+  parked elsewhere), its offset is saved so the skip is durable across
+  restarts, and replay continues.
+- **Validation before replay**: `SubscribeWithReplay` validates all arguments
+  and options (including the `WithFilter` predicate's type) before the replay
+  pass — a call that returns a validation error has delivered nothing and
+  saved no offsets. A `WithFilter` predicate applies to replayed events
+  exactly as it does to live delivery.
 - Handlers can read the offset their event was persisted at with
   `eventbus.OffsetFromContext(ctx)` (context-aware handlers only).
 
@@ -460,7 +476,10 @@ Features:
 - Type-based routing with zero reflection for direct handlers
 - ~200ns and 2 small allocations per publish (handler-slice copy + type hash)
 - Efficient sharding reduces lock contention; throughput stays flat from 1 to 1000 concurrent publishers
-- Async handlers run in separate goroutines (bound them with `WithAsyncHandlerLimit`)
+- Async handlers run in separate goroutines (bound them with `WithAsyncHandlerLimit`;
+  caveat: with a limit set, don't publish async-handled events from inside async
+  handlers — nested publishes can deadlock waiting for a slot the publishing
+  handler occupies)
 
 ## Contributing
 

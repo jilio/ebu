@@ -319,6 +319,42 @@ func typeNameOf(t reflect.Type) string {
 	return t.String()
 }
 
+// ReplayErrorPolicy determines how SubscribeWithReplay handles a stored
+// event that cannot be decoded into the subscription's event type.
+type ReplayErrorPolicy int
+
+const (
+	// ReplayAbort stops the replay and returns the decode error (default).
+	// The subscription's saved offset does not advance past the failing
+	// event, so the next SubscribeWithReplay hits it again. Use this when a
+	// decode failure means a bug that must be fixed before proceeding.
+	ReplayAbort ReplayErrorPolicy = iota
+
+	// ReplaySkip reports the decode error to the PersistenceErrorHandler
+	// (with the *StoredEvent as the event argument) and continues with the
+	// next event. The skip is durable: the poison event's offset is saved,
+	// so it is not re-scanned and re-reported on later restarts — recover
+	// its payload from the reported *StoredEvent if needed.
+	//
+	// Scope: the policy fires only when a stored event OF THE SUBSCRIBED
+	// TYPE fails to decode (malformed or type-incompatible JSON). It does
+	// not cover events stored under a different type name — those are
+	// always skipped silently, by design, since streams may carry many
+	// event types — nor JSON that decodes leniently despite schema drift
+	// (unknown fields are dropped, missing fields zero-filled; use upcasts
+	// for schema evolution).
+	ReplaySkip
+)
+
+// WithReplayErrorPolicy sets how SubscribeWithReplay treats stored events
+// that fail to decode. It has no effect on Subscribe/SubscribeContext live
+// delivery. The default is ReplayAbort.
+func WithReplayErrorPolicy(policy ReplayErrorPolicy) SubscribeOption {
+	return func(h *internalHandler) {
+		h.replayErrorPolicy = policy
+	}
+}
+
 // SubscribeWithReplay subscribes and replays missed events.
 // Requires both an EventStore (for replay) and a SubscriptionStore (for tracking).
 // If the store implements SubscriptionStore, it will be used automatically.
@@ -342,6 +378,15 @@ func typeNameOf(t reflect.Type) string {
 // SaveOffset failures do not stop delivery; they are reported to the
 // PersistenceErrorHandler.
 //
+// Validation: all argument and option validation (nil bus/handler/options,
+// interface event types, filter shape) happens before the replay pass, so a
+// call that returns a validation error has delivered no events and saved no
+// offsets.
+//
+// Filtering: a WithFilter predicate applies to the replay and catch-up
+// passes exactly as it does to live delivery — the handler never sees
+// non-matching events, and their offsets are not saved.
+//
 // Note: If the saved offset is OffsetOldest (""), replay starts from the beginning.
 // The OffsetNewest ("$") constant is typically not stored and is only used for live subscriptions.
 func SubscribeWithReplay[T any](
@@ -351,6 +396,12 @@ func SubscribeWithReplay[T any](
 	handler Handler[T],
 	opts ...SubscribeOption,
 ) error {
+	if bus == nil {
+		return fmt.Errorf("eventbus: bus cannot be nil")
+	}
+	if handler == nil {
+		return fmt.Errorf("eventbus: handler cannot be nil")
+	}
 	if bus.store == nil {
 		return fmt.Errorf("SubscribeWithReplay requires persistence (use WithStore option)")
 	}
@@ -365,10 +416,6 @@ func SubscribeWithReplay[T any](
 		}
 	}
 
-	// Load last offset for this subscription
-	lastOffset, _ := subStore.LoadOffset(ctx, subscriptionID)
-
-	// Replay missed events
 	eventType := reflect.TypeOf((*T)(nil)).Elem()
 	// Match the name events were persisted under (TypeNamer-aware).
 	typeName := typeNameOf(eventType)
@@ -379,6 +426,30 @@ func SubscribeWithReplay[T any](
 				fmt.Errorf("failed to save offset for subscription %q: %w", subscriptionID, err))
 		}
 	}
+
+	// Build the live subscription up front: options are applied exactly once
+	// and ALL subscription-time validation (event type, nil options, filter
+	// shape) runs before the replay pass can deliver events or save offsets.
+	// The handler is registered in the shard only after the first replay pass.
+	var wrappedHandler ContextHandler[T] = func(hctx context.Context, event T) {
+		handler(event)
+
+		// The publish path attaches the persisted offset of the event being
+		// delivered to its context, so each handled event saves its own offset.
+		if offset, ok := OffsetFromContext(hctx); ok {
+			saveOffset(hctx, event, offset)
+		}
+	}
+	h, err := buildHandler(wrappedHandler, eventType, opts)
+	if err != nil {
+		return err
+	}
+	// The filter's shape was validated by buildHandler; honor it during the
+	// replay passes the same way PublishContext honors it live.
+	filter, _ := h.filter.(func(T) bool)
+
+	// Load last offset for this subscription
+	lastOffset, _ := subStore.LoadOffset(ctx, subscriptionID)
 
 	// lastSeen tracks the stream position of the last event observed during
 	// replay (regardless of type), so the catch-up pass below can resume
@@ -406,7 +477,28 @@ func SubscribeWithReplay[T any](
 
 		var event T
 		if err := json.Unmarshal(eventData, &event); err != nil {
+			if h.replayErrorPolicy == ReplaySkip {
+				// Poison event: report and move on rather than wedging the
+				// subscription on it forever. The skip is durable — saving the
+				// poison event's own offset stops it from being re-scanned and
+				// re-reported on every restart. Its payload was just handed to
+				// the error handler as a *StoredEvent for out-of-band recovery.
+				if bus.persistenceErrorHandler != nil {
+					bus.persistenceErrorHandler(stored, eventType,
+						fmt.Errorf("skipping undecodable event at offset %s for subscription %q: %w", stored.Offset, subscriptionID, err))
+				}
+				var zero T
+				saveOffset(ctx, zero, stored.Offset)
+				return nil
+			}
 			return err
+		}
+
+		// Apply the subscription's filter, mirroring live delivery: the
+		// handler never sees non-matching events and their offsets are not
+		// saved (the next handled event advances past them, as it does live).
+		if filter != nil && !filter(event) {
+			return nil
 		}
 
 		handler(event)
@@ -420,20 +512,10 @@ func SubscribeWithReplay[T any](
 		return fmt.Errorf("replay events: %w", err)
 	}
 
-	// Subscribe for future events with offset tracking. The publish path
-	// attaches the persisted offset of the event being delivered to its
-	// context, so each handled event saves exactly its own offset.
-	wrappedHandler := func(hctx context.Context, event T) {
-		handler(event)
-
-		if offset, ok := OffsetFromContext(hctx); ok {
-			saveOffset(hctx, event, offset)
-		}
-	}
-
-	if err := SubscribeContext(bus, wrappedHandler, opts...); err != nil {
-		return err
-	}
+	// Register the pre-built, pre-validated subscription for live events.
+	// Options were already applied by buildHandler above — registering the
+	// same handler instance keeps each option's effect applied exactly once.
+	bus.addHandler(eventType, h)
 
 	// Catch-up pass: an event persisted after the first replay finished but
 	// before the live subscription registered would otherwise be missed

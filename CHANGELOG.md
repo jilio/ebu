@@ -5,6 +5,60 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] - 2026-07-04
+
+### Added
+
+- **`WithReplayErrorPolicy` subscribe option.** By default an undecodable
+  stored event aborts `SubscribeWithReplay` and, because its offset is never
+  saved, aborts it again on every restart — a single poison event could
+  permanently wedge a subscription. `ReplaySkip` instead reports the event to
+  the `PersistenceErrorHandler` (as its `*StoredEvent`, so the payload can be
+  recovered out of band) and continues. The skip is durable: the poison
+  event's own offset is saved, so it is not re-scanned and re-reported on
+  every restart even when it is the last event in the stream. The default
+  (`ReplayAbort`) is unchanged. Scope note: the policy covers decode failures
+  of the subscribed type only — events stored under other type names are
+  always skipped silently (streams may carry many types), and JSON that
+  decodes leniently despite schema drift is delivered (use upcasts for
+  schema evolution).
+
+### Fixed
+
+- **Interface-typed registrations are rejected instead of silently dead.**
+  Publish routes by the event's dynamic (concrete) type and stores events
+  under concrete type names, so a `Subscribe[I]` handler or a
+  `RegisterUpcast` keyed by an interface type could never fire — with no
+  error. `Subscribe`, `SubscribeContext`, `SubscribeWithReplay`, and
+  `RegisterUpcast` now return an error for interface types.
+- **`SubscribeWithReplay` runs all validation before the replay pass.**
+  Previously a nil option or a `WithFilter` predicate of the wrong type was
+  only rejected when the live subscription registered — after the replay
+  pass had already delivered events and saved offsets, permanently consuming
+  them despite the call returning an error. A nil bus or nil handler
+  panicked (nil handler mid-replay) instead of returning an error like the
+  other subscribe entry points. All argument and option validation now
+  happens first; a failing call delivers nothing and saves nothing.
+- **`WithFilter` now applies to replayed events.** The replay and catch-up
+  passes delivered every stored event of the subscribed type to the handler
+  regardless of the subscription's filter (and saved offsets for them),
+  while live delivery filtered correctly. Replay now honors the predicate
+  exactly like live delivery: filtered events are not delivered and their
+  offsets are not saved.
+- **Subscribe options are applied exactly once per subscription.**
+  `SubscribeWithReplay` briefly applied options twice (once to read
+  replay-affecting options, once when registering); it now builds the
+  subscription once, up front, and registers that same instance. All
+  subscription entry points share one validation/registration chokepoint
+  (`buildHandler`/`addHandler`) so no entry point can miss a check.
+
+### Documented
+
+- **`WithAsyncHandlerLimit` re-entrancy deadlock.** With a limit set, a
+  nested `Publish` of async-handled events from inside an async handler
+  blocks waiting for a slot the publishing handler occupies; if all slots are
+  held by handlers blocked this way, none can be released.
+
 ## [0.13.0] - 2026-07-04
 
 ### Fixed

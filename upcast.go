@@ -158,7 +158,13 @@ func (r *upcastRegistry) clearType(eventType string) {
 	delete(r.upcasters, eventType)
 }
 
-// RegisterUpcast registers a type-safe upcast function
+// RegisterUpcast registers a type-safe upcast function.
+//
+// From and To must be concrete types. Interface types are rejected with an
+// error: upcasts are keyed by type name, and events are stored under their
+// concrete type's name (or TypeNamer name), so an upcast keyed by an
+// interface type name could never match a stored event — a silently dead
+// registration.
 func RegisterUpcast[From any, To any](bus *EventBus, upcast func(From) To) error {
 	if bus == nil {
 		return fmt.Errorf("eventbus: bus cannot be nil")
@@ -167,8 +173,14 @@ func RegisterUpcast[From any, To any](bus *EventBus, upcast func(From) To) error
 		return fmt.Errorf("eventbus: upcast function cannot be nil")
 	}
 
-	fromType := reflect.TypeOf((*From)(nil)).Elem().String()
-	toType := reflect.TypeOf((*To)(nil)).Elem().String()
+	from := reflect.TypeOf((*From)(nil)).Elem()
+	to := reflect.TypeOf((*To)(nil)).Elem()
+	if from.Kind() == reflect.Interface || to.Kind() == reflect.Interface {
+		return fmt.Errorf("eventbus: cannot register upcast between interface types (%s -> %s): events are stored under concrete type names, so an interface-keyed upcast would never match", from, to)
+	}
+
+	fromType := from.String()
+	toType := to.String()
 
 	upcastFunc := func(data json.RawMessage) (json.RawMessage, string, error) {
 		var from From

@@ -3026,3 +3026,24 @@ func TestContextHooksCalledWithLegacyHooks(t *testing.T) {
 		t.Error("context-aware afterPublish hook should have been called")
 	}
 }
+
+// TestSubscribeInterfaceTypeRejected verifies that subscribing with an
+// interface event type returns an error instead of registering a handler
+// that can never fire (Publish routes by concrete type).
+func TestSubscribeInterfaceTypeRejected(t *testing.T) {
+	bus := New()
+
+	err := Subscribe(bus, func(e fmt.Stringer) {})
+	if err == nil || !strings.Contains(err.Error(), "interface type") {
+		t.Errorf("Subscribe: expected interface type rejection, got: %v", err)
+	}
+
+	err = SubscribeContext(bus, func(ctx context.Context, e fmt.Stringer) {})
+	if err == nil || !strings.Contains(err.Error(), "interface type") {
+		t.Errorf("SubscribeContext: expected interface type rejection, got: %v", err)
+	}
+
+	if HasHandlers[fmt.Stringer](bus) {
+		t.Error("Expected no handlers registered for rejected interface subscription")
+	}
+}

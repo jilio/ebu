@@ -1525,3 +1525,275 @@ func TestWithReplayBatchSize(t *testing.T) {
 		t.Errorf("Expected 25 replayed events, got %d", replayed)
 	}
 }
+
+// TestSubscribeWithReplaySkipPolicy tests that ReplaySkip skips undecodable
+// events, reports them to the PersistenceErrorHandler, and keeps replaying.
+func TestSubscribeWithReplaySkipPolicy(t *testing.T) {
+	store := NewMemoryStore()
+
+	var reportedEvents []any
+	var reportedErrs []error
+	bus := New(
+		WithStore(store),
+		WithPersistenceErrorHandler(func(event any, eventType reflect.Type, err error) {
+			reportedEvents = append(reportedEvents, event)
+			reportedErrs = append(reportedErrs, err)
+		}),
+	)
+
+	Publish(bus, TestEvent{ID: 1, Value: "valid"})
+
+	// Insert a poison event between two valid ones
+	poisonOffset := appendRaw(store, testEventTypeName(), []byte(`{"ID": "unclosed`))
+
+	Publish(bus, TestEvent{ID: 3, Value: "valid"})
+
+	ctx := context.Background()
+	var received []int
+	err := SubscribeWithReplay(ctx, bus, "skip-policy", func(e TestEvent) {
+		received = append(received, e.ID)
+	}, WithReplayErrorPolicy(ReplaySkip))
+
+	if err != nil {
+		t.Fatalf("SubscribeWithReplay with ReplaySkip failed: %v", err)
+	}
+
+	// Both valid events handled, poison event skipped
+	if len(received) != 2 || received[0] != 1 || received[1] != 3 {
+		t.Errorf("Expected events [1 3], got %v", received)
+	}
+
+	// Poison event reported exactly once, carrying the StoredEvent
+	if len(reportedErrs) != 1 {
+		t.Fatalf("Expected 1 reported error, got %d: %v", len(reportedErrs), reportedErrs)
+	}
+	if !strings.Contains(reportedErrs[0].Error(), string(poisonOffset)) ||
+		!strings.Contains(reportedErrs[0].Error(), "skip-policy") {
+		t.Errorf("Expected error to mention offset and subscription, got: %v", reportedErrs[0])
+	}
+	stored, ok := reportedEvents[0].(*StoredEvent)
+	if !ok || stored.Offset != poisonOffset {
+		t.Errorf("Expected reported event to be the poison *StoredEvent, got %T %v", reportedEvents[0], reportedEvents[0])
+	}
+
+	// Offset advanced past the poison event via the following valid event
+	offset, err := store.LoadOffset(ctx, "skip-policy")
+	if err != nil {
+		t.Fatalf("LoadOffset failed: %v", err)
+	}
+	if offset != Offset("00000000000000000003") {
+		t.Errorf("Expected saved offset '00000000000000000003', got %s", offset)
+	}
+}
+
+// TestSubscribeWithReplayAbortIsDefault verifies the default policy still
+// aborts on a poison event even when other options are passed.
+func TestSubscribeWithReplayAbortIsDefault(t *testing.T) {
+	store := NewMemoryStore()
+	bus := New(WithStore(store))
+
+	appendRaw(store, testEventTypeName(), []byte(`not json`))
+
+	err := SubscribeWithReplay(context.Background(), bus, "abort-default",
+		func(e TestEvent) {}, WithReplayErrorPolicy(ReplayAbort))
+	if err == nil {
+		t.Error("Expected replay to abort on undecodable event with default policy")
+	}
+}
+
+// TestSubscribeWithReplayNilOption tests that a nil option fails before any
+// replay work happens.
+func TestSubscribeWithReplayNilOption(t *testing.T) {
+	store := NewMemoryStore()
+	bus := New(WithStore(store))
+	Publish(bus, TestEvent{ID: 1})
+
+	var received []int
+	err := SubscribeWithReplay(context.Background(), bus, "nil-opt", func(e TestEvent) {
+		received = append(received, e.ID)
+	}, nil)
+
+	if err == nil || !strings.Contains(err.Error(), "subscribe option cannot be nil") {
+		t.Errorf("Expected nil option error, got: %v", err)
+	}
+	if len(received) != 0 {
+		t.Errorf("Expected no events delivered before option validation, got %v", received)
+	}
+}
+
+// TestSubscribeWithReplayInterfaceType tests that interface event types are
+// rejected before the replay pass runs.
+func TestSubscribeWithReplayInterfaceType(t *testing.T) {
+	store := NewMemoryStore()
+	bus := New(WithStore(store))
+
+	err := SubscribeWithReplay(context.Background(), bus, "iface-sub",
+		func(e fmt.Stringer) {})
+	if err == nil || !strings.Contains(err.Error(), "interface type") {
+		t.Errorf("Expected interface type rejection, got: %v", err)
+	}
+}
+
+// TestSubscribeWithReplayFilterMismatch tests that a WithFilter predicate for
+// the wrong event type is rejected BEFORE the replay pass: no events are
+// delivered and no offsets are saved by the failing call.
+func TestSubscribeWithReplayFilterMismatch(t *testing.T) {
+	store := NewMemoryStore()
+	bus := New(WithStore(store))
+	ctx := context.Background()
+
+	Publish(bus, TestEvent{ID: 1})
+	Publish(bus, TestEvent{ID: 2})
+
+	var received []int
+	err := SubscribeWithReplay(ctx, bus, "filter-mismatch", func(e TestEvent) {
+		received = append(received, e.ID)
+	}, WithFilter(func(e AnotherTestEvent) bool { return true }))
+	if err == nil || !strings.Contains(err.Error(), "filter predicate type") {
+		t.Errorf("Expected filter mismatch error, got: %v", err)
+	}
+	if len(received) != 0 {
+		t.Errorf("Expected no events delivered by the failing call, got %v", received)
+	}
+	if offset, _ := store.LoadOffset(ctx, "filter-mismatch"); offset != OffsetOldest {
+		t.Errorf("Expected no offset saved by the failing call, got %s", offset)
+	}
+}
+
+// testEventTypeName returns the persisted type name for TestEvent.
+func testEventTypeName() string {
+	return reflect.TypeOf((*TestEvent)(nil)).Elem().String()
+}
+
+// appendRaw inserts an event with arbitrary raw data directly into a
+// MemoryStore, bypassing JSON marshaling — used to plant poison events.
+func appendRaw(store *MemoryStore, typeName string, data []byte) Offset {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	store.nextOffset++
+	offset := Offset(fmt.Sprintf("%020d", store.nextOffset))
+	store.events = append(store.events, &StoredEvent{
+		Offset:    offset,
+		Type:      typeName,
+		Data:      data,
+		Timestamp: time.Now(),
+	})
+	return offset
+}
+
+// TestSubscribeWithReplayTrailingPoisonDurableSkip verifies that ReplaySkip
+// durably skips a poison event at the tail of the stream: its offset is
+// saved, so a later resubscription does not re-scan or re-report it.
+func TestSubscribeWithReplayTrailingPoisonDurableSkip(t *testing.T) {
+	store := NewMemoryStore()
+
+	var reports int
+	bus := New(
+		WithStore(store),
+		WithPersistenceErrorHandler(func(event any, eventType reflect.Type, err error) {
+			reports++
+		}),
+	)
+	ctx := context.Background()
+
+	Publish(bus, TestEvent{ID: 1})
+	poisonOffset := appendRaw(store, testEventTypeName(), []byte(`{broken`))
+
+	if err := SubscribeWithReplay(ctx, bus, "trailing-poison", func(e TestEvent) {},
+		WithReplayErrorPolicy(ReplaySkip)); err != nil {
+		t.Fatalf("SubscribeWithReplay failed: %v", err)
+	}
+
+	if reports != 1 {
+		t.Fatalf("Expected 1 report for the poison event, got %d", reports)
+	}
+	// The skip is durable: the poison event's own offset is saved even
+	// though it is the last event in the stream.
+	if offset, _ := store.LoadOffset(ctx, "trailing-poison"); offset != poisonOffset {
+		t.Errorf("Expected saved offset %s (poison event), got %s", poisonOffset, offset)
+	}
+
+	// Simulate a restart: a fresh bus resuming the same subscription must
+	// not re-scan or re-report the already-skipped poison event.
+	bus2 := New(
+		WithStore(store),
+		WithPersistenceErrorHandler(func(event any, eventType reflect.Type, err error) {
+			t.Errorf("Poison event re-reported after durable skip: %v", err)
+		}),
+	)
+	if err := SubscribeWithReplay(ctx, bus2, "trailing-poison", func(e TestEvent) {},
+		WithReplayErrorPolicy(ReplaySkip)); err != nil {
+		t.Fatalf("Resumed SubscribeWithReplay failed: %v", err)
+	}
+}
+
+// TestSubscribeWithReplayFilter verifies that a WithFilter predicate applies
+// to the replay pass the same way it applies to live delivery.
+func TestSubscribeWithReplayFilter(t *testing.T) {
+	store := NewMemoryStore()
+	bus := New(WithStore(store))
+	ctx := context.Background()
+
+	for i := 1; i <= 6; i++ {
+		Publish(bus, TestEvent{ID: i})
+	}
+
+	var received []int
+	err := SubscribeWithReplay(ctx, bus, "evens-only", func(e TestEvent) {
+		received = append(received, e.ID)
+	}, WithFilter(func(e TestEvent) bool { return e.ID%2 == 0 }))
+	if err != nil {
+		t.Fatalf("SubscribeWithReplay failed: %v", err)
+	}
+
+	if len(received) != 3 || received[0] != 2 || received[1] != 4 || received[2] != 6 {
+		t.Errorf("Expected replay to deliver only [2 4 6], got %v", received)
+	}
+
+	// Live delivery filters identically.
+	Publish(bus, TestEvent{ID: 7})
+	Publish(bus, TestEvent{ID: 8})
+	time.Sleep(10 * time.Millisecond)
+
+	if len(received) != 4 || received[3] != 8 {
+		t.Errorf("Expected live delivery of only event 8, got %v", received)
+	}
+}
+
+// TestSubscribeWithReplayOptionsAppliedOnce verifies that each SubscribeOption
+// runs exactly once per SubscribeWithReplay call (the pre-built subscription
+// is registered directly, not rebuilt).
+func TestSubscribeWithReplayOptionsAppliedOnce(t *testing.T) {
+	store := NewMemoryStore()
+	bus := New(WithStore(store))
+
+	applications := 0
+	counting := func(h *internalHandler) { applications++ }
+
+	err := SubscribeWithReplay(context.Background(), bus, "opts-once",
+		func(e TestEvent) {}, SubscribeOption(counting))
+	if err != nil {
+		t.Fatalf("SubscribeWithReplay failed: %v", err)
+	}
+	if applications != 1 {
+		t.Errorf("Expected option to be applied exactly once, got %d applications", applications)
+	}
+}
+
+// TestSubscribeWithReplayNilBusAndHandler verifies nil arguments return
+// errors like the other subscribe entry points instead of panicking.
+func TestSubscribeWithReplayNilBusAndHandler(t *testing.T) {
+	err := SubscribeWithReplay(context.Background(), nil, "nil-bus", func(e TestEvent) {})
+	if err == nil || !strings.Contains(err.Error(), "bus cannot be nil") {
+		t.Errorf("Expected nil bus error, got: %v", err)
+	}
+
+	store := NewMemoryStore()
+	bus := New(WithStore(store))
+	Publish(bus, TestEvent{ID: 1})
+
+	err = SubscribeWithReplay[TestEvent](context.Background(), bus, "nil-handler", nil)
+	if err == nil || !strings.Contains(err.Error(), "handler cannot be nil") {
+		t.Errorf("Expected nil handler error, got: %v", err)
+	}
+}

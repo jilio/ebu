@@ -30,6 +30,10 @@ type internalHandler struct {
 	filter      any // Predicate function for filtering events
 	mu          sync.Mutex
 	executed    uint32 // For once handlers, atomically tracks if executed
+
+	// replayErrorPolicy controls how SubscribeWithReplay treats stored
+	// events that cannot be decoded; it has no effect on live delivery.
+	replayErrorPolicy ReplayErrorPolicy
 }
 
 // PanicHandler is called when a handler panics
@@ -217,7 +221,49 @@ func (bus *EventBus) getShard(eventType reflect.Type) *shard {
 	return bus.shards[shardIndex]
 }
 
-// Subscribe registers a handler for events of type T
+// buildHandler is the single validation chokepoint for every subscription
+// entry point: it constructs the internalHandler, applies each option exactly
+// once, and runs all subscription-time validation (event type, options,
+// filter). New entry points must go through it so no check can be missed.
+func buildHandler(handler any, eventType reflect.Type, opts []SubscribeOption) (*internalHandler, error) {
+	if err := validateEventType(eventType); err != nil {
+		return nil, err
+	}
+
+	h := &internalHandler{
+		handler:     handler,
+		handlerType: reflect.TypeOf(handler),
+		eventType:   eventType,
+	}
+
+	for _, opt := range opts {
+		if opt == nil {
+			return nil, fmt.Errorf("eventbus: subscribe option cannot be nil")
+		}
+		opt(h)
+	}
+
+	if err := validateFilter(h, eventType); err != nil {
+		return nil, err
+	}
+
+	return h, nil
+}
+
+// addHandler registers a validated handler in the shard for its event type.
+func (bus *EventBus) addHandler(eventType reflect.Type, h *internalHandler) {
+	shard := bus.getShard(eventType)
+	shard.mu.Lock()
+	shard.handlers[eventType] = append(shard.handlers[eventType], h)
+	shard.mu.Unlock()
+}
+
+// Subscribe registers a handler for events of type T.
+//
+// T must be a concrete type. Interface types are rejected with an error:
+// Publish routes events by their dynamic (concrete) type, so a handler
+// registered under an interface type could never receive an event — even
+// one published through a variable of that interface type.
 func Subscribe[T any](bus *EventBus, handler Handler[T], opts ...SubscribeOption) error {
 	if bus == nil {
 		return fmt.Errorf("eventbus: bus cannot be nil")
@@ -227,33 +273,18 @@ func Subscribe[T any](bus *EventBus, handler Handler[T], opts ...SubscribeOption
 	}
 
 	eventType := reflect.TypeOf((*T)(nil)).Elem()
-
-	h := &internalHandler{
-		handler:     handler,
-		handlerType: reflect.TypeOf(handler),
-		eventType:   eventType,
-	}
-
-	for _, opt := range opts {
-		if opt == nil {
-			return fmt.Errorf("eventbus: subscribe option cannot be nil")
-		}
-		opt(h)
-	}
-
-	if err := validateFilter(h, eventType); err != nil {
+	h, err := buildHandler(handler, eventType, opts)
+	if err != nil {
 		return err
 	}
 
-	shard := bus.getShard(eventType)
-	shard.mu.Lock()
-	shard.handlers[eventType] = append(shard.handlers[eventType], h)
-	shard.mu.Unlock()
-
+	bus.addHandler(eventType, h)
 	return nil
 }
 
-// SubscribeContext registers a context-aware handler for events of type T
+// SubscribeContext registers a context-aware handler for events of type T.
+//
+// T must be a concrete type; interface types are rejected (see Subscribe).
 func SubscribeContext[T any](bus *EventBus, handler ContextHandler[T], opts ...SubscribeOption) error {
 	if bus == nil {
 		return fmt.Errorf("eventbus: bus cannot be nil")
@@ -263,29 +294,22 @@ func SubscribeContext[T any](bus *EventBus, handler ContextHandler[T], opts ...S
 	}
 
 	eventType := reflect.TypeOf((*T)(nil)).Elem()
-
-	h := &internalHandler{
-		handler:     handler,
-		handlerType: reflect.TypeOf(handler),
-		eventType:   eventType,
-	}
-
-	for _, opt := range opts {
-		if opt == nil {
-			return fmt.Errorf("eventbus: subscribe option cannot be nil")
-		}
-		opt(h)
-	}
-
-	if err := validateFilter(h, eventType); err != nil {
+	h, err := buildHandler(handler, eventType, opts)
+	if err != nil {
 		return err
 	}
 
-	shard := bus.getShard(eventType)
-	shard.mu.Lock()
-	shard.handlers[eventType] = append(shard.handlers[eventType], h)
-	shard.mu.Unlock()
+	bus.addHandler(eventType, h)
+	return nil
+}
 
+// validateEventType rejects event types that Publish could never route to.
+// Publish looks handlers up by the event's dynamic (concrete) type, so a
+// subscription registered under an interface type would be silently dead.
+func validateEventType(eventType reflect.Type) error {
+	if eventType.Kind() == reflect.Interface {
+		return fmt.Errorf("eventbus: cannot subscribe to interface type %s: events are routed by their concrete type, so an interface subscription would never receive events; subscribe to each concrete event type instead", eventType)
+	}
 	return nil
 }
 
@@ -694,6 +718,13 @@ func WithObservability(obs Observability) Option {
 // unbounded goroutine growth during publish spikes.
 //
 // A limit <= 0 means unlimited (the default).
+//
+// Deadlock warning: do not publish events that have async subscribers from
+// inside an async handler when a limit is set. Such a nested Publish blocks
+// waiting for a free slot while the publishing handler occupies one; if all
+// slots are held by handlers blocked the same way, none can ever be
+// released. Publish re-entrantly only from synchronous handlers, or size
+// the limit above the maximum possible nesting fan-out.
 func WithAsyncHandlerLimit(n int) Option {
 	return func(bus *EventBus) {
 		if n > 0 {
