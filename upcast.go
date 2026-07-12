@@ -7,8 +7,9 @@ import (
 	"sync"
 )
 
-// UpcastFunc transforms event data from one version to another.
-// It receives the raw JSON data and returns transformed data with the new type name.
+// UpcastFunc transforms event data from one version to another. It receives
+// raw JSON and must return transformed data plus exactly the toType declared
+// when it is registered; another or empty type produces UpcastContractError.
 type UpcastFunc func(data json.RawMessage) (json.RawMessage, string, error)
 
 // UpcastErrorHandler is called when an upcast operation fails
@@ -19,6 +20,20 @@ type Upcaster struct {
 	FromType string     // Source event type
 	ToType   string     // Target event type
 	Upcast   UpcastFunc // Transformation function
+}
+
+// UpcastContractError reports a raw UpcastFunc that returned a type name other
+// than the successor declared at registration. The registry, not user output,
+// owns chain topology; accepting a different type could bypass cycle checks or
+// repeatedly invoke the same upcaster forever.
+type UpcastContractError struct {
+	FromType     string
+	DeclaredType string
+	ReturnedType string
+}
+
+func (e *UpcastContractError) Error() string {
+	return fmt.Sprintf("eventbus: upcast from %s declared successor %q but returned type %q", e.FromType, e.DeclaredType, e.ReturnedType)
 }
 
 // upcastRegistry manages all registered upcasters.
@@ -124,8 +139,10 @@ func (r *upcastRegistry) apply(data json.RawMessage, eventType string) (json.Raw
 			return data, eventType, fmt.Errorf("eventbus: upcast loop detected")
 		}
 
-		// Apply the upcast
-		newData, newType, err := upcaster.Upcast(currentData)
+		// Apply user code behind a panic-to-error boundary. Durable Follow and
+		// resumable replay can then retry the unchanged offset instead of losing
+		// their goroutine/process to an unhandled upcaster panic.
+		newData, newType, err := callUpcast(upcaster.Upcast, currentData)
 		if err != nil {
 			if errorHandler != nil {
 				errorHandler(currentType, currentData, err)
@@ -133,12 +150,32 @@ func (r *upcastRegistry) apply(data json.RawMessage, eventType string) (json.Raw
 			return data, eventType, fmt.Errorf("eventbus: upcast failed from %s to %s: %w",
 				upcaster.FromType, upcaster.ToType, err)
 		}
+		if newType != upcaster.ToType {
+			contractErr := &UpcastContractError{
+				FromType:     upcaster.FromType,
+				DeclaredType: upcaster.ToType,
+				ReturnedType: newType,
+			}
+			if errorHandler != nil {
+				errorHandler(currentType, currentData, contractErr)
+			}
+			return data, eventType, contractErr
+		}
 
 		currentData = newData
 		currentType = newType
 	}
 
 	return currentData, currentType, nil
+}
+
+func callUpcast(upcast UpcastFunc, data json.RawMessage) (newData json.RawMessage, newType string, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("eventbus: upcast panic: %v", recovered)
+		}
+	}()
+	return upcast(data)
 }
 
 // clear removes all registered upcasters
@@ -176,8 +213,19 @@ func RegisterUpcast[From any, To any](bus *EventBus, upcast func(From) To) error
 		return fmt.Errorf("eventbus: cannot register upcast between interface types (%s -> %s): events are stored under concrete type names, so an interface-keyed upcast would never match", from, to)
 	}
 
-	fromType := from.String()
-	toType := to.String()
+	// Use the same TypeNamer-aware derivation as persistence, replay, and
+	// Follow. Reflection-only names silently miss events that use stable
+	// EventTypeName values on the wire.
+	fromType := typeNameOf(from)
+	toType := typeNameOf(to)
+	typeReservation, err := bus.reservePersistedTypes(
+		persistedTypeSpec{name: fromType, eventType: from},
+		persistedTypeSpec{name: toType, eventType: to},
+	)
+	if err != nil {
+		return err
+	}
+	defer typeReservation.Rollback()
 
 	upcastFunc := func(data json.RawMessage) (json.RawMessage, string, error) {
 		var from From
@@ -195,10 +243,19 @@ func RegisterUpcast[From any, To any](bus *EventBus, upcast func(From) To) error
 		return newData, toType, nil
 	}
 
-	return bus.upcastRegistry.register(fromType, toType, upcastFunc)
+	if err := bus.upcastRegistry.register(fromType, toType, upcastFunc); err != nil {
+		return err
+	}
+	typeReservation.Commit()
+	return nil
 }
 
-// RegisterUpcastFunc registers a raw upcast function for complex transformations
+// RegisterUpcastFunc registers a raw upcast function for complex
+// transformations. The function must return exactly toType as its new type;
+// a mismatch is an UpcastContractError and the original event remains
+// unadvanced. Because raw string endpoints carry no Go reflect.Type,
+// they cannot participate in the typed persisted-name collision registry;
+// callers are responsible for choosing globally unique, compatible names.
 func RegisterUpcastFunc(bus *EventBus, fromType, toType string, upcast UpcastFunc) error {
 	if bus == nil {
 		return fmt.Errorf("eventbus: bus cannot be nil")
@@ -206,7 +263,9 @@ func RegisterUpcastFunc(bus *EventBus, fromType, toType string, upcast UpcastFun
 	return bus.upcastRegistry.register(fromType, toType, upcast)
 }
 
-// WithUpcast adds an upcast function during bus creation.
+// WithUpcast adds a raw, string-keyed upcast function during bus creation.
+// Like RegisterUpcastFunc, it cannot participate in typed name-collision
+// checks because no Go endpoint types are available.
 //
 // It panics if the registration is invalid (empty types, self-upcast, nil
 // function, or a circular dependency): these are programming errors that

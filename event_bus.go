@@ -2,6 +2,7 @@ package eventbus
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"reflect"
@@ -21,23 +22,71 @@ type SubscribeOption func(*internalHandler)
 
 // internalHandler wraps a handler with metadata
 type internalHandler struct {
-	handler     any
-	handlerType reflect.Type
-	eventType   reflect.Type
-	once        bool
-	async       bool
-	sequential  bool
-	filter      any // Predicate function for filtering events
-	mu          sync.Mutex
-	executed    uint32 // For once handlers, atomically tracks if executed
+	handler      any
+	handlerType  reflect.Type
+	eventType    reflect.Type
+	once         bool
+	async        bool
+	sequential   bool
+	filter       any // Predicate function for filtering events
+	invoke       func(context.Context, any)
+	filterInvoke func(any) bool
+	mu           sync.Mutex
+	executed     uint32 // For once handlers, atomically tracks if executed
+	onceStateMu  sync.Mutex
+	// onceInFlight is set only for durable dispatch. It distinguishes a Once
+	// handler consumed by an earlier successful delivery from one whose
+	// cancelled async invocation is still finishing and must not be
+	// checkpointed past by an immediate follower restart.
+	onceInFlight uint32
 
 	// replayErrorPolicy controls how SubscribeWithReplay treats stored
 	// events that cannot be decoded; it has no effect on live delivery.
 	replayErrorPolicy ReplayErrorPolicy
+
+	// internalDelivery is used by infrastructure subscriptions that need to
+	// return a delivery error (currently the log-backed resumable coordinator).
+	// suppressObservability prevents that signal handler from double-counting
+	// the real user handler invocation performed by the coordinator. onRemove
+	// lets infrastructure tear down state before its marker leaves the shard.
+	internalDelivery      func(context.Context, any) error
+	suppressObservability bool
+	onRemove              func()
 }
 
 // PanicHandler is called when a handler panics
 type PanicHandler func(event any, handlerType reflect.Type, panicValue any)
+
+type handlerPanicError struct {
+	value any
+}
+
+type durableOnceAttempt struct {
+	handler  *internalHandler
+	rollback atomic.Bool
+}
+
+func (a *durableOnceAttempt) complete() {
+	a.handler.onceStateMu.Lock()
+	atomic.StoreUint32(&a.handler.onceInFlight, 0)
+	if a.rollback.Load() {
+		atomic.StoreUint32(&a.handler.executed, 0)
+	}
+	a.handler.onceStateMu.Unlock()
+}
+
+func (a *durableOnceAttempt) requestRollback() {
+	a.rollback.Store(true)
+	a.handler.onceStateMu.Lock()
+	if atomic.LoadUint32(&a.handler.onceInFlight) == 0 {
+		atomic.StoreUint32(&a.handler.executed, 0)
+	}
+	a.handler.onceStateMu.Unlock()
+}
+
+func (e *handlerPanicError) Error() string {
+	return fmt.Sprintf("handler panic: %v", e.value)
+}
 
 // PersistenceErrorHandler is called when event persistence fails
 type PersistenceErrorHandler func(event any, eventType reflect.Type, err error)
@@ -101,9 +150,23 @@ type EventBus struct {
 	// followDecoders maps a persisted type name to a closure that decodes a
 	// stored event into its Go type and dispatches it locally. Entries are
 	// registered by the generic Subscribe* entry points, which are the only
-	// places the concrete type is statically known.
+	// places the concrete type is statically known. A nil followTypes entry
+	// marks a name made ambiguous on a nonpersistent bus; no decoder is retained
+	// for that name.
 	followMu       sync.RWMutex
 	followDecoders map[string]followDecoder
+	followTypes    map[string]reflect.Type
+
+	// persistedTypes prevents a persistent bus from assigning the same durable
+	// wire name to distinct Go types. configuring defers that audit until every
+	// New option has run. replayIDs prevents two live coordinators on this bus
+	// from racing the same scalar subscription checkpoint.
+	persistedTypes    *persistedTypeRegistry
+	configuring       bool
+	replayMu          sync.Mutex
+	replayIDs         map[string]struct{}
+	replayMarkers     map[*internalHandler]struct{}
+	replayMarkerCount atomic.Int64
 
 	// Upcast registry for event migration
 	upcastRegistry *upcastRegistry
@@ -120,7 +183,14 @@ type EventBus struct {
 //   - Compatibility with external event stores
 //
 // If an event implements TypeNamer, EventType() will use the provided name
-// instead of the reflection-based package-qualified name.
+// instead of the reflection-based name. EventTypeName must depend only on the
+// type, not instance fields: generic replay/follow registration may derive it
+// from a fresh zero value.
+//
+// Persisted or distributed event types should implement TypeNamer. Go's
+// reflection fallback uses the declared package name (for example,
+// "orders.Created"), not its full import path, and can therefore change after
+// refactors or collide with another package that has the same name.
 //
 // Example:
 //
@@ -137,14 +207,15 @@ type TypeNamer interface {
 
 // EventType returns the type name of an event.
 // If the event implements TypeNamer, it returns the custom name.
-// Otherwise, it returns the reflection-based package-qualified name.
+// Otherwise, it returns Go's reflection name, which uses the declared package
+// name rather than the full import path. It returns "nil" for a nil event.
 //
 // This is useful for comparing with StoredEvent.Type during replay.
 //
 // Example with reflection (default):
 //
 //	eventType := EventType(MyEvent{})
-//	// Returns: "github.com/mypackage/MyEvent"
+//	// Returns: "mypackage.MyEvent"
 //
 // Example with TypeNamer:
 //
@@ -155,19 +226,24 @@ type TypeNamer interface {
 //
 // Usage in replay:
 //
-//	bus.Replay(ctx, 0, func(event *StoredEvent) error {
+//	bus.Replay(ctx, OffsetOldest, func(event *StoredEvent) error {
 //	    if event.Type == EventType(MyEvent{}) {
 //	        // Process MyEvent
 //	    }
 //	    return nil
 //	})
 func EventType(event any) string {
-	// Check if event implements TypeNamer
+	if event == nil {
+		return "nil"
+	}
+	value := reflect.ValueOf(event)
+	if value.Kind() == reflect.Pointer && value.IsNil() {
+		return typeNameOf(value.Type())
+	}
 	if namer, ok := event.(TypeNamer); ok {
 		return namer.EventTypeName()
 	}
-	// Fall back to reflection-based name
-	return reflect.TypeOf(event).String()
+	return value.Type().String()
 }
 
 // Observability is an optional interface for metrics and tracing.
@@ -213,12 +289,20 @@ type Observability interface {
 // Option is a function that configures the EventBus
 type Option func(*EventBus)
 
-// New creates a new EventBus with sharded locks for better performance
+// New creates a new EventBus with sharded locks for better performance.
+// It panics when the final option set is internally inconsistent, including
+// when typed registrations made by custom options assign one durable event
+// name to distinct Go types on a bus configured with WithStore.
 func New(opts ...Option) *EventBus {
 	bus := &EventBus{
 		upcastRegistry: newUpcastRegistry(),
 		originID:       NewEventID(),
 		followDecoders: make(map[string]followDecoder),
+		followTypes:    make(map[string]reflect.Type),
+		persistedTypes: newDeferredPersistedTypeRegistry(),
+		configuring:    true,
+		replayIDs:      make(map[string]struct{}),
+		replayMarkers:  make(map[*internalHandler]struct{}),
 	}
 	bus.asyncCond = sync.NewCond(&bus.asyncMu)
 
@@ -232,6 +316,14 @@ func New(opts ...Option) *EventBus {
 	// Apply options
 	for _, opt := range opts {
 		opt(bus)
+	}
+	bus.configuring = false
+
+	// Options are arbitrary functions and may perform typed registrations.
+	// Audit their complete durable-name set only after every option has run so
+	// WithStore has identical behavior regardless of its position in opts.
+	if bus.store != nil {
+		bus.activatePersistenceTypes()
 	}
 
 	// Log-delivery mode without a store would silently drop every publish
@@ -281,6 +373,39 @@ func buildHandler(handler any, eventType reflect.Type, opts []SubscribeOption) (
 	return h, nil
 }
 
+// buildPayloadHandler and buildContextHandler bind typed user functions once
+// at subscription time. Dispatch routes by an event's dynamic concrete type,
+// which can differ from Publish's static type when a value is passed through
+// any or another interface. Keeping these adapters on internalHandler avoids
+// both a static-generic type mismatch and reflection in the hot path.
+func buildPayloadHandler[T any](handler Handler[T], eventType reflect.Type, opts []SubscribeOption) (*internalHandler, error) {
+	h, err := buildHandler(handler, eventType, opts)
+	if err != nil {
+		return nil, err
+	}
+	h.invoke = func(_ context.Context, event any) { handler(event.(T)) }
+	bindFilter[T](h)
+	return h, nil
+}
+
+func buildContextHandler[T any](handler ContextHandler[T], eventType reflect.Type, opts []SubscribeOption) (*internalHandler, error) {
+	h, err := buildHandler(handler, eventType, opts)
+	if err != nil {
+		return nil, err
+	}
+	h.invoke = func(ctx context.Context, event any) { handler(ctx, event.(T)) }
+	bindFilter[T](h)
+	return h, nil
+}
+
+func bindFilter[T any](h *internalHandler) {
+	if h.filter == nil {
+		return
+	}
+	predicate := h.filter.(func(T) bool)
+	h.filterInvoke = func(event any) bool { return predicate(event.(T)) }
+}
+
 // addHandler registers a validated handler in the shard for its event type.
 func (bus *EventBus) addHandler(eventType reflect.Type, h *internalHandler) {
 	shard := bus.getShard(eventType)
@@ -296,15 +421,19 @@ func (bus *EventBus) addHandler(eventType reflect.Type, h *internalHandler) {
 func (bus *EventBus) removeHandler(eventType reflect.Type, h *internalHandler) {
 	shard := bus.getShard(eventType)
 	shard.mu.Lock()
-	defer shard.mu.Unlock()
 
 	handlers := shard.handlers[eventType]
 	for i, existing := range handlers {
 		if existing == h {
+			if existing.onRemove != nil {
+				existing.onRemove()
+			}
 			shard.handlers[eventType] = append(handlers[:i], handlers[i+1:]...)
+			shard.mu.Unlock()
 			return
 		}
 	}
+	shard.mu.Unlock()
 }
 
 // OriginID returns the unique identifier of this bus instance. Every event
@@ -348,13 +477,15 @@ func SubscribeWithHandle[T any](bus *EventBus, handler Handler[T], opts ...Subsc
 	}
 
 	eventType := reflect.TypeOf((*T)(nil)).Elem()
-	h, err := buildHandler(handler, eventType, opts)
+	h, err := buildPayloadHandler(handler, eventType, opts)
 	if err != nil {
 		return nil, err
 	}
 
+	if err := registerFollowDecoder[T](bus); err != nil {
+		return nil, err
+	}
 	bus.addHandler(eventType, h)
-	registerFollowDecoder[T](bus)
 	return &Subscription{bus: bus, eventType: eventType, h: h}, nil
 }
 
@@ -370,13 +501,15 @@ func SubscribeContextWithHandle[T any](bus *EventBus, handler ContextHandler[T],
 	}
 
 	eventType := reflect.TypeOf((*T)(nil)).Elem()
-	h, err := buildHandler(handler, eventType, opts)
+	h, err := buildContextHandler(handler, eventType, opts)
 	if err != nil {
 		return nil, err
 	}
 
+	if err := registerFollowDecoder[T](bus); err != nil {
+		return nil, err
+	}
 	bus.addHandler(eventType, h)
-	registerFollowDecoder[T](bus)
 	return &Subscription{bus: bus, eventType: eventType, h: h}, nil
 }
 
@@ -395,13 +528,15 @@ func Subscribe[T any](bus *EventBus, handler Handler[T], opts ...SubscribeOption
 	}
 
 	eventType := reflect.TypeOf((*T)(nil)).Elem()
-	h, err := buildHandler(handler, eventType, opts)
+	h, err := buildPayloadHandler(handler, eventType, opts)
 	if err != nil {
 		return err
 	}
 
+	if err := registerFollowDecoder[T](bus); err != nil {
+		return err
+	}
 	bus.addHandler(eventType, h)
-	registerFollowDecoder[T](bus)
 	return nil
 }
 
@@ -417,13 +552,15 @@ func SubscribeContext[T any](bus *EventBus, handler ContextHandler[T], opts ...S
 	}
 
 	eventType := reflect.TypeOf((*T)(nil)).Elem()
-	h, err := buildHandler(handler, eventType, opts)
+	h, err := buildContextHandler(handler, eventType, opts)
 	if err != nil {
 		return err
 	}
 
+	if err := registerFollowDecoder[T](bus); err != nil {
+		return err
+	}
 	bus.addHandler(eventType, h)
-	registerFollowDecoder[T](bus)
 	return nil
 }
 
@@ -448,6 +585,9 @@ func validateFilter(h *internalHandler, eventType reflect.Type) error {
 	if ft.Kind() != reflect.Func || ft.NumIn() != 1 || ft.In(0) != eventType {
 		return fmt.Errorf("eventbus: filter predicate type %s does not match event type %s", ft, eventType)
 	}
+	if reflect.ValueOf(h.filter).IsNil() {
+		return fmt.Errorf("eventbus: filter predicate cannot be nil")
+	}
 	return nil
 }
 
@@ -468,7 +608,11 @@ func Unsubscribe[T any, H any](bus *EventBus, handler H) error {
 		return fmt.Errorf("eventbus: bus cannot be nil")
 	}
 	eventType := reflect.TypeOf((*T)(nil)).Elem()
-	handlerPtr := reflect.ValueOf(handler).Pointer()
+	handlerValue := reflect.ValueOf(handler)
+	if !handlerValue.IsValid() || handlerValue.Kind() != reflect.Func || handlerValue.IsNil() {
+		return fmt.Errorf("eventbus: handler must be a non-nil function")
+	}
+	handlerPtr := handlerValue.Pointer()
 
 	shard := bus.getShard(eventType)
 	shard.mu.Lock()
@@ -476,7 +620,16 @@ func Unsubscribe[T any, H any](bus *EventBus, handler H) error {
 
 	handlers := shard.handlers[eventType]
 	for i, h := range handlers {
-		if reflect.ValueOf(h.handler).Pointer() == handlerPtr {
+		// Infrastructure markers route through internalDelivery and deliberately
+		// have no public handler function to compare.
+		if h.handler == nil {
+			continue
+		}
+		registered := reflect.ValueOf(h.handler)
+		if registered.Kind() == reflect.Func && !registered.IsNil() && registered.Pointer() == handlerPtr {
+			if h.onRemove != nil {
+				h.onRemove()
+			}
 			// Remove handler efficiently
 			shard.handlers[eventType] = append(handlers[:i], handlers[i+1:]...)
 			return nil
@@ -496,30 +649,38 @@ func Publish[T any](bus *EventBus, event T) {
 // It panics if bus is nil.
 //
 // When the bus has a store configured (WithStore), the event is persisted
-// before handlers run. Persistence is best-effort by default: on failure the
-// event is still delivered to handlers and the error is reported to the
-// PersistenceErrorHandler (see WithPersistenceErrorHandler). With
-// WithStrictPersistence, a failed persist skips delivery instead. Use
+// before handlers run. Persistence is best-effort by default for ordinary
+// Subscribe handlers: on failure they still receive the in-memory event and
+// the error is reported to the PersistenceErrorHandler (see
+// WithPersistenceErrorHandler). Log-backed resumable subscriptions consume
+// only records visible in EventStore. An Append error can be ambiguous: if a
+// remote store committed before its acknowledgement was lost, that durable
+// record may still be delivered now or by a later replay. WithStrictPersistence
+// makes every handler skip immediate delivery after a reported persist error. Use
 // TryPublish/TryPublishContext to receive the persistence error directly.
 func PublishContext[T any](bus *EventBus, ctx context.Context, event T) {
 	publishContext(bus, ctx, event)
 }
 
-// TryPublish is Publish with the persistence outcome returned: it reports the
-// error when the bus failed to persist the event (nil on success or when no
-// store is configured). It panics if bus is nil.
+// TryPublish is Publish with the reported persistence outcome returned: it
+// returns the marshal/Append error (nil on success or when no store is
+// configured). An Append error may be ambiguous if a remote commit succeeded
+// before its acknowledgement was lost. It panics if bus is nil.
 func TryPublish[T any](bus *EventBus, event T) error {
 	return publishContext(bus, context.Background(), event)
 }
 
 // TryPublishContext is PublishContext with the persistence outcome returned.
 //
-// The returned error does not by itself imply handlers were skipped: in
-// best-effort mode (the default) delivery proceeds despite the error, while
-// under WithStrictPersistence delivery is skipped. Either way the error is
-// also reported to the PersistenceErrorHandler, which remains the right
-// channel for passive monitoring; TryPublishContext is for publishers that
-// must act on the failure (e.g. fail the request that caused the publish).
+// The returned error does not by itself imply ordinary Subscribe handlers were
+// skipped: in best-effort mode (the default) their delivery proceeds despite
+// the error, while under WithStrictPersistence it is skipped. Log-backed
+// resumable subscriptions consume only records visible in EventStore. Because
+// an Append error may arrive after a remote commit, such a record can still be
+// delivered now or by a later replay. Either way the error is also reported to
+// the PersistenceErrorHandler, which remains the right channel for passive
+// monitoring; TryPublishContext is for publishers that must act on the failure
+// (e.g. fail the request that caused the publish).
 // It panics if bus is nil.
 func TryPublishContext[T any](bus *EventBus, ctx context.Context, event T) error {
 	return publishContext(bus, ctx, event)
@@ -535,6 +696,11 @@ func publishContext[T any](bus *EventBus, ctx context.Context, event T) error {
 
 	eventType := reflect.TypeOf(event)
 	eventTypeName := EventType(event)
+	if bus != nil && bus.store != nil {
+		// Persistent routing must use the reproducible type-derived name. The
+		// persistence step separately rejects an instance-dependent TypeNamer.
+		eventTypeName = typeNameOf(eventType)
+	}
 
 	// Observability: Track publish start
 	if bus.observability != nil {
@@ -568,6 +734,17 @@ func publishContext[T any](bus *EventBus, ctx context.Context, event T) error {
 	if deliver {
 		dispatch(bus, ctx, eventType, eventTypeName, event)
 	}
+	if bus.store != nil && !bus.logDelivery && (persistErr == nil || deliver) {
+		// A stored predecessor may upcast into a different concrete subscriber
+		// type, whose shard the ordinary in-memory dispatch cannot know to wake.
+		// Signal every resumable coordinator so it can scan the durable log and
+		// apply the registry. Same-type wake-ups are intentionally idempotent:
+		// ordinary dispatch may have skipped its marker when an earlier handler
+		// cancelled ctx. Best-effort delivery also wakes after an ambiguous
+		// Append error, matching its existing same-type behavior; strict failures
+		// remain suppressed and can be recovered by a later Follow/replay.
+		signalReplayMarkers(bus, ctx, eventTypeName, event)
+	}
 
 	// For async handlers, we don't wait inline to avoid blocking
 	// Users can call bus.Wait() if they need to wait for completion
@@ -588,6 +765,28 @@ func publishContext[T any](bus *EventBus, ctx context.Context, event T) error {
 	return persistErr
 }
 
+// signalReplayMarkers wakes log-backed resumable subscriptions whose concrete
+// shard was not reached by the ordinary publish dispatch. Markers are tracked
+// separately from shards so this path is O(active replay subscriptions), not a
+// scan of every handler shard. The snapshot lock is released before any
+// coordinator runs, preserving Clear's shard -> replay registry ordering.
+func signalReplayMarkers[T any](bus *EventBus, ctx context.Context, eventTypeName string, event T) {
+	if bus.replayMarkerCount.Load() == 0 {
+		return
+	}
+	bus.replayMu.Lock()
+	markers := make([]*internalHandler, 0, len(bus.replayMarkers))
+	for marker := range bus.replayMarkers {
+		markers = append(markers, marker)
+	}
+	bus.replayMu.Unlock()
+
+	for _, marker := range markers {
+		_ = callHandlerWithContext(marker, ctx, event, bus.panicHandler,
+			bus.observability, eventTypeName, false)
+	}
+}
+
 // dispatch delivers an event to the handlers registered for eventType. It is
 // the delivery half of the publish path, shared by publishContext (live
 // publishes) and the follower (events read back from a shared store): all
@@ -595,6 +794,21 @@ func publishContext[T any](bus *EventBus, ctx context.Context, event T) error {
 // identically on both paths. It does not run the publish hooks or
 // publish-level observability; those belong to the publish, not to delivery.
 func dispatch[T any](bus *EventBus, ctx context.Context, eventType reflect.Type, eventTypeName string, event T) {
+	_ = dispatchWithMode(bus, ctx, eventType, eventTypeName, event, dispatchNonBlocking)
+}
+
+// dispatchMode controls whether delivery returns immediately after launching
+// async handlers or waits for the async work belonging to this event. Local
+// Publish uses the non-blocking mode; durable Follow uses the waiting mode so
+// its checkpoint cannot overtake handler completion.
+type dispatchMode uint8
+
+const (
+	dispatchNonBlocking dispatchMode = iota
+	dispatchWaitForAsync
+)
+
+func dispatchWithMode[T any](bus *EventBus, ctx context.Context, eventType reflect.Type, eventTypeName string, event T, mode dispatchMode) error {
 	// Get handlers from appropriate shard
 	shard := bus.getShard(eventType)
 	shard.mu.RLock()
@@ -606,82 +820,233 @@ func dispatch[T any](bus *EventBus, ctx context.Context, eventType reflect.Type,
 
 	// Execute handlers without holding the lock
 	var onceHandlersToRemove []*internalHandler
+	var durableOnceAttempts []*durableOnceAttempt
+	var handlerErrors []error
+	var cancellationErr error
+	var asyncDone chan error
+	if mode == dispatchWaitForAsync {
+		asyncDone = make(chan error, len(handlersCopy))
+	}
+	asyncCount := 0
 
+handlerLoop:
 	for _, h := range handlersCopy {
 		// Check context cancellation before doing anything with the handler.
 		// This must happen before the Once CAS so a cancelled publish never
 		// consumes a once-handler without executing it.
-		select {
-		case <-ctx.Done():
-			continue
-		default:
+		if err := ctx.Err(); err != nil {
+			cancellationErr = err
+			break
 		}
 
 		// Check filter if present. The predicate type is validated at
 		// Subscribe time; if the assertion still fails, fail closed.
 		if h.filter != nil {
-			filterFunc, ok := h.filter.(func(T) bool)
-			if !ok || !filterFunc(event) {
+			matches, err := callFilter(h, event, bus.panicHandler)
+			if err != nil {
+				handlerErrors = append(handlerErrors, err)
+				continue
+			}
+			if !matches {
 				continue // Skip this handler as event doesn't match filter
 			}
 		}
 
-		// For once handlers, use CompareAndSwap to ensure atomic execution
+		// For Once handlers, use CompareAndSwap to ensure atomic execution. A
+		// durable dispatch additionally publishes its in-flight state under a
+		// small per-handler lock: an immediate follower restart must fail/retry,
+		// not skip and checkpoint past an async invocation still unwinding from a
+		// cancelled attempt.
+		var onceAttempt *durableOnceAttempt
 		if h.once {
-			if !atomic.CompareAndSwapUint32(&h.executed, 0, 1) {
-				continue // Already executed
+			if mode == dispatchWaitForAsync {
+				h.onceStateMu.Lock()
+				claimed := atomic.CompareAndSwapUint32(&h.executed, 0, 1)
+				if claimed {
+					atomic.StoreUint32(&h.onceInFlight, 1)
+					onceAttempt = &durableOnceAttempt{handler: h}
+				}
+				inFlight := atomic.LoadUint32(&h.onceInFlight) != 0
+				h.onceStateMu.Unlock()
+				if !claimed {
+					if inFlight {
+						handlerErrors = append(handlerErrors,
+							fmt.Errorf("eventbus: Once handler %v is still completing a previous durable attempt", h.handlerType))
+						break handlerLoop
+					}
+					continue // Already completed and awaiting/removing its registration.
+				}
+			} else if !atomic.CompareAndSwapUint32(&h.executed, 0, 1) {
+				continue // Already executed.
 			}
 			// Mark for removal after execution
 			onceHandlersToRemove = append(onceHandlersToRemove, h)
 		}
 
+		// Bounded async capacity remains cancellable. A Once handler is selected
+		// before waiting so concurrent publishes can fail its CAS immediately;
+		// if cancellation wins before the goroutine starts, roll that selection
+		// back so a later durable retry can still execute it.
+		asyncSlot := false
+		if h.async && bus.asyncSem != nil {
+			select {
+			case bus.asyncSem <- struct{}{}:
+				asyncSlot = true
+			case <-ctx.Done():
+				if h.once {
+					if onceAttempt != nil {
+						onceAttempt.requestRollback()
+						onceAttempt.complete()
+					}
+					atomic.StoreUint32(&h.executed, 0)
+					onceHandlersToRemove = onceHandlersToRemove[:len(onceHandlersToRemove)-1]
+				}
+				cancellationErr = ctx.Err()
+				break handlerLoop
+			}
+		}
+		if onceAttempt != nil {
+			durableOnceAttempts = append(durableOnceAttempts, onceAttempt)
+		}
+
 		if h.async {
-			// Bounded async concurrency: acquire a slot before spawning.
-			// This intentionally blocks the publisher when the limit is
-			// reached so a publish spike cannot create an unbounded number
-			// of goroutines (see WithAsyncHandlerLimit).
-			if bus.asyncSem != nil {
-				bus.asyncSem <- struct{}{}
+			if mode == dispatchWaitForAsync {
+				asyncCount++
 			}
 			bus.asyncStarted()
-			go func(handler *internalHandler) {
-				defer bus.asyncFinished()
-				if bus.asyncSem != nil {
-					defer func() { <-bus.asyncSem }()
-				}
+			go func(handler *internalHandler, attempt *durableOnceAttempt, releaseSlot bool, completion chan<- error, waitForCompletion bool) {
+				var handlerErr error
+				defer func() {
+					if attempt != nil {
+						attempt.complete()
+					}
+					if releaseSlot {
+						<-bus.asyncSem
+					}
+					bus.asyncFinished()
+					if waitForCompletion {
+						// Buffered for every snapshotted handler: cancellation may make
+						// dispatch return before this handler, but completion never leaks
+						// a goroutine waiting for a receiver.
+						completion <- handlerErr
+					}
+				}()
 
 				// Once handlers always run: their execution slot was already
 				// consumed by the CAS above, so skipping here would silently
 				// drop them forever. Other handlers re-check the context.
-				if !handler.once {
-					select {
-					case <-ctx.Done():
-						return
-					default:
-					}
+				if !handler.once && ctx.Err() != nil {
+					handlerErr = ctx.Err()
+					return
 				}
-				callHandlerWithContext(handler, ctx, event, bus.panicHandler, bus.observability, eventTypeName, true)
-			}(h)
+				handlerErr = callHandlerWithContext(handler, ctx, event, bus.panicHandler, bus.observability, eventTypeName, true)
+			}(h, onceAttempt, asyncSlot, asyncDone, mode == dispatchWaitForAsync)
 		} else {
-			callHandlerWithContext(h, ctx, event, bus.panicHandler, bus.observability, eventTypeName, false)
+			deliveryCtx := ctx
+			if mode == dispatchWaitForAsync && h.internalDelivery != nil {
+				// Only infrastructure delivery needs to know that its outer durable
+				// caller must wait. Keeping this marker off ordinary handler contexts
+				// avoids an allocation on every non-durable publish.
+				deliveryCtx = context.WithValue(ctx, durableDispatchCtxKey{}, true)
+			}
+			if err := callHandlerWithContext(h, deliveryCtx, event, bus.panicHandler, bus.observability, eventTypeName, false); err != nil {
+				handlerErrors = append(handlerErrors, err)
+			}
+			if onceAttempt != nil {
+				onceAttempt.complete()
+			}
 		}
 	}
 
-	// Remove once handlers that were executed
-	if len(onceHandlersToRemove) > 0 {
-		shard.mu.Lock()
-		handlers := shard.handlers[eventType]
-		for _, onceHandler := range onceHandlersToRemove {
-			for i, h := range handlers {
-				if h == onceHandler {
-					handlers = append(handlers[:i], handlers[i+1:]...)
-					break
+	if cancellationErr != nil {
+		if mode == dispatchWaitForAsync {
+			// The follower cannot know whether every selected handler completed
+			// before cancellation. Keep them retryable; at-least-once duplication
+			// is safer than silently checkpointing a failed one on a later run.
+			rollbackDurableOnceAttempts(durableOnceAttempts)
+		} else {
+			removeOnceHandlers(shard, eventType, onceHandlersToRemove)
+		}
+		return errors.Join(append(handlerErrors, cancellationErr)...)
+	}
+
+	if mode == dispatchWaitForAsync {
+		for asyncCount > 0 {
+			select {
+			case err := <-asyncDone:
+				asyncCount--
+				if err != nil {
+					handlerErrors = append(handlerErrors, err)
 				}
+			case <-ctx.Done():
+				rollbackDurableOnceAttempts(durableOnceAttempts)
+				return errors.Join(append(handlerErrors, ctx.Err())...)
 			}
 		}
-		shard.handlers[eventType] = handlers
-		shard.mu.Unlock()
+		// A synchronous handler may cancel the delivery context itself, and an
+		// async completion can win the final select at the same instant as
+		// cancellation. In either case Follow will refuse to checkpoint this
+		// attempt, so keep every selected Once handler eligible for its retry.
+		if err := ctx.Err(); err != nil {
+			rollbackDurableOnceAttempts(durableOnceAttempts)
+			return errors.Join(append(handlerErrors, err)...)
+		}
 	}
+
+	if len(handlerErrors) == 0 {
+		commitDurableOnceAttempts(durableOnceAttempts)
+		removeOnceHandlers(shard, eventType, onceHandlersToRemove)
+		return nil
+	}
+
+	deliveryErr := errors.Join(handlerErrors...)
+	if deliveryErr != nil && mode == dispatchWaitForAsync {
+		// A durable event is retried as one unit. Keep every Once handler selected
+		// for this failed attempt registered and make it eligible again, including
+		// handlers that succeeded before a sibling failed.
+		rollbackDurableOnceAttempts(durableOnceAttempts)
+		return deliveryErr
+	}
+
+	commitDurableOnceAttempts(durableOnceAttempts)
+	removeOnceHandlers(shard, eventType, onceHandlersToRemove)
+	return deliveryErr
+}
+
+func rollbackDurableOnceAttempts(attempts []*durableOnceAttempt) {
+	for _, attempt := range attempts {
+		attempt.requestRollback()
+	}
+}
+
+func commitDurableOnceAttempts(attempts []*durableOnceAttempt) {
+	for _, attempt := range attempts {
+		// A successful durable dispatch has waited for every async completion,
+		// so complete has already cleared onceInFlight. Keeping executed at one
+		// prevents a snapshotted concurrent dispatch from running the handler
+		// again before removeOnceHandlers takes the shard lock.
+		attempt.handler.onceStateMu.Lock()
+		atomic.StoreUint32(&attempt.handler.onceInFlight, 0)
+		attempt.handler.onceStateMu.Unlock()
+	}
+}
+
+func removeOnceHandlers(shard *shard, eventType reflect.Type, onceHandlers []*internalHandler) {
+	if len(onceHandlers) == 0 {
+		return
+	}
+	shard.mu.Lock()
+	handlers := shard.handlers[eventType]
+	for _, onceHandler := range onceHandlers {
+		for i, h := range handlers {
+			if h == onceHandler {
+				handlers = append(handlers[:i], handlers[i+1:]...)
+				break
+			}
+		}
+	}
+	shard.handlers[eventType] = handlers
+	shard.mu.Unlock()
 }
 
 // Clear removes all handlers for events of type T
@@ -690,6 +1055,11 @@ func Clear[T any](bus *EventBus) {
 
 	shard := bus.getShard(eventType)
 	shard.mu.Lock()
+	for _, handler := range shard.handlers[eventType] {
+		if handler.onRemove != nil {
+			handler.onRemove()
+		}
+	}
 	delete(shard.handlers, eventType)
 	shard.mu.Unlock()
 }
@@ -698,6 +1068,13 @@ func Clear[T any](bus *EventBus) {
 func ClearAll(bus *EventBus) {
 	for i := 0; i < numShards; i++ {
 		bus.shards[i].mu.Lock()
+		for _, handlers := range bus.shards[i].handlers {
+			for _, handler := range handlers {
+				if handler.onRemove != nil {
+					handler.onRemove()
+				}
+			}
+		}
 		bus.shards[i].handlers = make(map[reflect.Type][]*internalHandler)
 		bus.shards[i].mu.Unlock()
 	}
@@ -743,7 +1120,9 @@ func (bus *EventBus) asyncFinished() {
 	bus.asyncMu.Unlock()
 }
 
-// Wait blocks until all async handlers complete.
+// Wait blocks until all async handlers and deferred resumable-subscription
+// drains complete. Ordinary synchronous handlers still complete inline in
+// their Publish call and are not independently tracked.
 // It is safe to call concurrently with Publish.
 func (bus *EventBus) Wait() {
 	bus.asyncMu.Lock()
@@ -754,14 +1133,16 @@ func (bus *EventBus) Wait() {
 }
 
 // callHandlerWithContext calls a handler with proper type checking and panic recovery
-func callHandlerWithContext[T any](h *internalHandler, ctx context.Context, event T, panicHandler PanicHandler, obs Observability, eventTypeName string, async bool) {
+func callHandlerWithContext[T any](h *internalHandler, ctx context.Context, event T, panicHandler PanicHandler, obs Observability, eventTypeName string, async bool) (panicErr error) {
+	if h.suppressObservability {
+		obs = nil
+	}
 	start := time.Now()
-	var panicErr error
 
 	defer func() {
 		duration := time.Since(start)
 		if r := recover(); r != nil {
-			panicErr = fmt.Errorf("handler panic: %v", r)
+			panicErr = &handlerPanicError{value: r}
 			if panicHandler != nil {
 				panicHandler(event, h.handlerType, r)
 			}
@@ -782,15 +1163,48 @@ func callHandlerWithContext[T any](h *internalHandler, ctx context.Context, even
 		h.mu.Lock()
 		defer h.mu.Unlock()
 	}
+	if h.internalDelivery != nil {
+		return h.internalDelivery(ctx, event)
+	}
 
-	// Handlers are always stored as Handler[T] (Subscribe) or
-	// ContextHandler[T] (SubscribeContext); no other shapes can be registered.
+	// Keep the common concrete-T path monomorphized and allocation-free. The
+	// bound adapter is the correctness fallback when Publish's static T is any
+	// or another interface while routing selected a concrete handler shard.
 	switch fn := h.handler.(type) {
 	case Handler[T]:
 		fn(event)
 	case ContextHandler[T]:
 		fn(ctx, event)
+	case nil:
+		// Infrastructure handlers returned through internalDelivery above.
+	default:
+		if h.invoke != nil {
+			h.invoke(ctx, event)
+		}
 	}
+	return nil
+}
+
+// callFilter keeps user predicate panics inside the same isolation contract as
+// handler panics while deliberately remaining outside handler observability: a
+// rejected event never starts the handler, and neither does a predicate that
+// fails before that boundary.
+func callFilter[T any](h *internalHandler, event T, panicHandler PanicHandler) (matches bool, panicErr error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			panicErr = &handlerPanicError{value: recovered}
+			if panicHandler != nil {
+				panicHandler(event, h.handlerType, recovered)
+			}
+		}
+	}()
+	if filter, ok := h.filter.(func(T) bool); ok {
+		return filter(event), nil
+	}
+	if h.filterInvoke != nil {
+		return h.filterInvoke(event), nil
+	}
+	return false, nil
 }
 
 // Subscribe Options
@@ -816,7 +1230,10 @@ func Sequential() SubscribeOption {
 	}
 }
 
-// WithFilter configures the handler to only receive events that match the predicate
+// WithFilter configures the handler to only receive events that match the
+// predicate. The predicate runs before handler observability. Its panics are
+// isolated like handler panics and sent to PanicHandler; local/non-durable
+// delivery continues, while durable Follow/replay retries without checkpointing.
 func WithFilter[T any](predicate func(T) bool) SubscribeOption {
 	return func(h *internalHandler) {
 		h.filter = predicate
@@ -860,12 +1277,15 @@ func WithAfterPublishContext(hook PublishHookContext) Option {
 	}
 }
 
-// WithStrictPersistence makes persistence a delivery precondition: when an
-// event cannot be persisted (marshal or Append failure), it is NOT delivered
-// to handlers. Without this option persistence is best-effort — handlers can
-// observe an event the log never recorded, so a later replay would diverge
-// from what live handlers saw. Enable it when the store is the source of
-// truth (event sourcing, cross-process delivery).
+// WithStrictPersistence makes persistence a delivery precondition: when a
+// publish reports a persistence error (marshal or Append failure), it is NOT
+// delivered to handlers immediately. Without this option persistence is
+// best-effort — handlers can observe an event the log never recorded, so a
+// later replay would diverge from what live handlers saw. Append errors can be
+// ambiguous, so a record committed before an acknowledgement failure may
+// still appear in a later Replay, Follow, or resumable-subscription delivery.
+// Enable this option when the store is the source of truth (event sourcing,
+// cross-process delivery).
 //
 // The failure is still reported to the PersistenceErrorHandler, and
 // TryPublish/TryPublishContext return it to the publisher. It has no effect
@@ -928,7 +1348,8 @@ func WithAsyncHandlerLimit(n int) Option {
 	}
 }
 
-// Shutdown gracefully shuts down the event bus, waiting for async handlers to complete.
+// Shutdown gracefully shuts down the event bus, waiting for async handlers and
+// deferred resumable-subscription drains to complete.
 // It respects the context timeout/cancellation.
 // If the store implements io.Closer, its Close() method will be called after handlers complete.
 func (bus *EventBus) Shutdown(ctx context.Context) error {

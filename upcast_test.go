@@ -1,11 +1,13 @@
 package eventbus
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -44,6 +46,19 @@ type ProductAddedV2 struct {
 	Description string
 }
 
+type namedUpcastV1 struct {
+	Value string
+}
+
+func (namedUpcastV1) EventTypeName() string { return "review.named-upcast.v1" }
+
+type namedUpcastV2 struct {
+	Value   string
+	Version int
+}
+
+func (namedUpcastV2) EventTypeName() string { return "review.named-upcast.v2" }
+
 // TestRegisterUpcast tests basic upcast registration
 func TestRegisterUpcast(t *testing.T) {
 	bus := New()
@@ -79,6 +94,39 @@ func TestRegisterUpcast(t *testing.T) {
 	err = RegisterUpcast[UserCreatedV1, UserCreatedV2](bus, nil)
 	if err == nil || !strings.Contains(err.Error(), "upcast function cannot be nil") {
 		t.Error("Expected error for nil upcast function")
+	}
+}
+
+// TestRegisterUpcastUsesStableTypeNames verifies typed upcasts use the same
+// TypeNamer identity that Publish writes to the event log.
+func TestRegisterUpcastUsesStableTypeNames(t *testing.T) {
+	store := NewMemoryStore()
+	bus := New(WithStore(store))
+
+	if err := RegisterUpcast(bus, func(v1 namedUpcastV1) namedUpcastV2 {
+		return namedUpcastV2{Value: v1.Value, Version: 2}
+	}); err != nil {
+		t.Fatalf("RegisterUpcast: %v", err)
+	}
+
+	Publish(bus, namedUpcastV1{Value: "stable"})
+
+	var got *StoredEvent
+	if err := bus.ReplayWithUpcast(context.Background(), OffsetOldest, func(event *StoredEvent) error {
+		got = event
+		return nil
+	}); err != nil {
+		t.Fatalf("ReplayWithUpcast: %v", err)
+	}
+	if got == nil || got.Type != "review.named-upcast.v2" {
+		t.Fatalf("typed upcast did not use stable names: %#v", got)
+	}
+	var decoded namedUpcastV2
+	if err := json.Unmarshal(got.Data, &decoded); err != nil {
+		t.Fatalf("unmarshal upcasted event: %v", err)
+	}
+	if decoded.Value != "stable" || decoded.Version != 2 {
+		t.Fatalf("unexpected upcasted event: %+v", decoded)
 	}
 }
 
@@ -308,6 +356,108 @@ func TestUpcastWithSubscribeWithReplay(t *testing.T) {
 	}
 }
 
+func TestLivePredecessorPublishWakesUpcastReplaySubscription(t *testing.T) {
+	store := NewMemoryStore()
+	bus := New(WithStore(store))
+	if err := RegisterUpcast(bus, func(v1 UserCreatedV1) UserCreatedV2 {
+		parts := strings.SplitN(v1.Name, " ", 2)
+		result := UserCreatedV2{UserID: v1.UserID, FirstName: parts[0]}
+		if len(parts) == 2 {
+			result.LastName = parts[1]
+		}
+		return result
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var received []UserCreatedV2
+	if err := SubscribeWithReplay(context.Background(), bus, "live-upcast", func(event UserCreatedV2) {
+		received = append(received, event)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	Publish(bus, UserCreatedV1{UserID: "live-1", Name: "Grace Hopper"})
+	bus.Wait()
+	if len(received) != 1 || received[0].FirstName != "Grace" || received[0].LastName != "Hopper" {
+		t.Fatalf("live upcast delivery = %+v", received)
+	}
+	if offset, err := store.LoadOffset(context.Background(), "live-upcast"); err != nil || offset == OffsetOldest {
+		t.Fatalf("live upcast checkpoint = %q, %v", offset, err)
+	}
+}
+
+func TestCancelledPersistedPublishStillWakesReplaySubscription(t *testing.T) {
+	tests := []struct {
+		name    string
+		publish func(*EventBus, context.Context)
+	}{
+		{
+			name: "same type",
+			publish: func(bus *EventBus, ctx context.Context) {
+				PublishContext(bus, ctx, UserCreatedV2{UserID: "direct", FirstName: "Direct"})
+			},
+		},
+		{
+			name: "upcast predecessor",
+			publish: func(bus *EventBus, ctx context.Context) {
+				PublishContext(bus, ctx, UserCreatedV1{UserID: "legacy", Name: "Legacy Event"})
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewMemoryStore()
+			bus := New(WithStore(store))
+			if err := RegisterUpcast(bus, func(v1 UserCreatedV1) UserCreatedV2 {
+				return UserCreatedV2{UserID: v1.UserID, FirstName: v1.Name}
+			}); err != nil {
+				t.Fatal(err)
+			}
+			var calls atomic.Int32
+			if err := SubscribeWithReplay(context.Background(), bus, "cancelled-publish", func(UserCreatedV2) {
+				calls.Add(1)
+			}); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			tt.publish(bus, ctx)
+			bus.Wait()
+			if calls.Load() != 1 {
+				t.Fatalf("cancelled persisted publish deliveries = %d, want 1", calls.Load())
+			}
+			if offset, err := store.LoadOffset(context.Background(), "cancelled-publish"); err != nil || offset == OffsetOldest {
+				t.Fatalf("cancelled persisted publish checkpoint = %q, %v", offset, err)
+			}
+		})
+	}
+}
+
+func TestLogDeliveryKeepsUpcastReplayBehindFollow(t *testing.T) {
+	store := NewMemoryStore()
+	bus := New(WithStore(store), WithLogDelivery())
+	if err := RegisterUpcast(bus, func(v1 UserCreatedV1) UserCreatedV2 {
+		return UserCreatedV2{UserID: v1.UserID, FirstName: v1.Name}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	if err := SubscribeWithReplay(context.Background(), bus, "log-only-upcast", func(UserCreatedV2) {
+		calls.Add(1)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	Publish(bus, UserCreatedV1{UserID: "log-1", Name: "Ada"})
+	bus.Wait()
+	if calls.Load() != 0 {
+		t.Fatalf("log-delivery replay ran before Follow %d time(s)", calls.Load())
+	}
+
+	stop := startFollower(t, bus, fastPoll)
+	defer stop()
+	waitFor(t, 5*time.Second, "log-delivery upcast replay", func() bool { return calls.Load() == 1 })
+}
+
 // TestReplayWithUpcast tests the ReplayWithUpcast function
 func TestReplayWithUpcast(t *testing.T) {
 	store := NewMemoryStore()
@@ -332,8 +482,11 @@ func TestReplayWithUpcast(t *testing.T) {
 	v1Data, _ := json.Marshal(v1Event)
 	ctx := context.Background()
 	event := &Event{
+		ID:        "event-123",
+		Origin:    "origin-456",
 		Type:      "eventbus.ProductAddedV1",
 		Data:      v1Data,
+		Metadata:  map[string]string{"correlation_id": "request-789"},
 		Timestamp: time.Now(),
 	}
 	if _, err := store.Append(ctx, event); err != nil {
@@ -366,6 +519,40 @@ func TestReplayWithUpcast(t *testing.T) {
 
 	if v2.Currency != "USD" || v2.Description != "Migrated product" {
 		t.Errorf("Unexpected upcasted data: %+v", v2)
+	}
+	if replayed[0].ID != event.ID || replayed[0].Origin != event.Origin ||
+		replayed[0].Metadata["correlation_id"] != event.Metadata["correlation_id"] {
+		t.Errorf("upcast dropped event envelope: %+v", replayed[0])
+	}
+}
+
+// TestReplayWithUpcastPreservesEnvelopeWithoutTransform covers the default
+// registry path: even when no upcaster matches, ReplayWithUpcast must not
+// rebuild a partial StoredEvent and discard its envelope.
+func TestReplayWithUpcastPreservesEnvelopeWithoutTransform(t *testing.T) {
+	store := NewMemoryStore()
+	bus := New(WithStore(store))
+	event := &Event{
+		ID:        "no-op-id",
+		Origin:    "no-op-origin",
+		Type:      "NoUpcastRegistered",
+		Data:      json.RawMessage(`{"value":1}`),
+		Metadata:  map[string]string{"tenant": "acme"},
+		Timestamp: time.Now(),
+	}
+	if _, err := store.Append(context.Background(), event); err != nil {
+		t.Fatal(err)
+	}
+
+	var got *StoredEvent
+	if err := bus.ReplayWithUpcast(context.Background(), OffsetOldest, func(stored *StoredEvent) error {
+		got = stored
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.ID != event.ID || got.Origin != event.Origin || got.Metadata["tenant"] != "acme" {
+		t.Fatalf("no-op upcast dropped envelope: %#v", got)
 	}
 }
 
@@ -669,29 +856,72 @@ func TestComplexCycleDFS(t *testing.T) {
 	}
 }
 
-// TestUpcastLoopDetection tests loop detection during upcast application
-func TestUpcastLoopDetection(t *testing.T) {
-	bus := New()
+func TestRawUpcastReturnedTypeMustMatchDeclaration(t *testing.T) {
+	tests := []struct {
+		name     string
+		returned string
+	}{
+		{name: "source type", returned: "LoopType"},
+		{name: "empty type", returned: ""},
+		{name: "unrelated type", returned: "Elsewhere"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var reportedType string
+			var reportedData json.RawMessage
+			var reportedErr error
+			bus := New(WithUpcastErrorHandler(func(eventType string, data json.RawMessage, err error) {
+				reportedType, reportedData, reportedErr = eventType, data, err
+			}))
+			if err := RegisterUpcastFunc(bus, "LoopType", "LoopType2", func(data json.RawMessage) (json.RawMessage, string, error) {
+				return json.RawMessage(`{"changed":true}`), tt.returned, nil
+			}); err != nil {
+				t.Fatal(err)
+			}
 
-	// Manually create a scenario that could cause a loop if not handled
-	// This tests the appliedTypes check in the apply function
-	count := 0
-	RegisterUpcastFunc(bus, "LoopType", "LoopType2", func(data json.RawMessage) (json.RawMessage, string, error) {
-		count++
-		if count > 1 {
-			// Return the same type to simulate a potential loop
-			return data, "LoopType", nil
-		}
-		return data, "LoopType2", nil
+			original := json.RawMessage(`{"test":"data"}`)
+			gotData, gotType, err := bus.upcastRegistry.apply(original, "LoopType")
+			var contractErr *UpcastContractError
+			if !errors.As(err, &contractErr) {
+				t.Fatalf("mismatched returned type error = %v", err)
+			}
+			if contractErr.FromType != "LoopType" || contractErr.DeclaredType != "LoopType2" || contractErr.ReturnedType != tt.returned {
+				t.Fatalf("contract error = %+v", contractErr)
+			}
+			if gotType != "LoopType" || !bytes.Equal(gotData, original) {
+				t.Fatalf("contract failure result = type:%q data:%s", gotType, gotData)
+			}
+			if reportedType != "LoopType" || !bytes.Equal(reportedData, original) || !errors.As(reportedErr, &contractErr) {
+				t.Fatalf("contract failure report = type:%q data:%s err:%v", reportedType, reportedData, reportedErr)
+			}
+		})
+	}
+}
+
+func TestReplayWithUpcastRejectsReturnedTypeMismatch(t *testing.T) {
+	store := NewMemoryStore()
+	bus := New(WithStore(store))
+	if err := RegisterUpcastFunc(bus, "legacy.event", "current.event", func(data json.RawMessage) (json.RawMessage, string, error) {
+		return data, "legacy.event", nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Append(context.Background(), &Event{
+		ID: NewEventID(), Type: "legacy.event", Data: json.RawMessage(`{"value":1}`), Timestamp: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var calls int
+	err := bus.ReplayWithUpcast(context.Background(), OffsetOldest, func(*StoredEvent) error {
+		calls++
+		return nil
 	})
-
-	testData := json.RawMessage(`{"test": "data"}`)
-	_, _, err := bus.upcastRegistry.apply(testData, "LoopType")
-
-	// Should handle this gracefully without infinite loop
-	if err != nil && strings.Contains(err.Error(), "loop detected") {
-		// This is expected if loop is detected
-		return
+	var contractErr *UpcastContractError
+	if !errors.As(err, &contractErr) {
+		t.Fatalf("ReplayWithUpcast mismatch error = %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("ReplayWithUpcast delivered %d mismatched event(s)", calls)
 	}
 }
 

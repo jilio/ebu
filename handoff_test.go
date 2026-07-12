@@ -100,9 +100,22 @@ func TestSubscribeWithReplayCatchUpError(t *testing.T) {
 	store.inject = func(s *gapStore) { s.failRead.Store(true) }
 
 	bus := New(WithStore(store))
-	err := SubscribeWithReplay(context.Background(), bus, "gap-err", func(e gapEvent) {})
+	var calls atomic.Int32
+	err := SubscribeWithReplay(context.Background(), bus, "gap-err", func(e gapEvent) {
+		calls.Add(1)
+	})
 	if err == nil {
 		t.Fatal("expected catch-up replay error")
+	}
+	if got := HandlerCount[gapEvent](bus); got != 0 {
+		t.Fatalf("failed subscription leaked %d live handler(s)", got)
+	}
+
+	// A call that reports failure must have no live side effects. Publishing
+	// after the failed catch-up would invoke a leaked handler immediately.
+	Publish(bus, gapEvent{ID: 99})
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("failed subscription still received a live event (%d calls)", got)
 	}
 }
 
