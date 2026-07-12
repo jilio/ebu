@@ -306,6 +306,33 @@ bus.ReplayWithUpcast(ctx, eventbus.OffsetOldest, func(event *eventbus.StoredEven
 })
 ```
 
+For raw, string-keyed migrations registered with `RegisterUpcastFunc` or
+`WithUpcast`, the callback must return exactly the `toType` declared at
+registration. The registry owns the chain topology; returning a different or
+empty type fails replay with `*UpcastContractError` instead of silently
+rewriting the chain or delivering the original schema:
+
+```go
+err := eventbus.RegisterUpcastFunc(bus, "user.created.v1", "user.created.v2",
+    func(data json.RawMessage) (json.RawMessage, string, error) {
+        migrated, err := migrateUserCreated(data)
+        return migrated, "user.created.v2", err // Must match the declared toType.
+    })
+if err != nil {
+    log.Fatal(err)
+}
+
+err = bus.ReplayWithUpcast(ctx, eventbus.OffsetOldest, replayHandler)
+var contractErr *eventbus.UpcastContractError
+if errors.As(err, &contractErr) {
+    log.Printf("invalid upcast %s -> %s: returned %s",
+        contractErr.FromType, contractErr.DeclaredType, contractErr.ReturnedType)
+}
+```
+
+Typed `RegisterUpcast` derives both endpoints and the returned type from its Go
+signature, so this runtime contract check is specific to raw callbacks.
+
 ### Replay from Specific Offset
 
 Replay events starting from a specific offset:

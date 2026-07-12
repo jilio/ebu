@@ -512,6 +512,7 @@ See [TypeNamer examples](docs/EXAMPLES.md#custom-event-type-names-typenamer) for
 - 📖 [**Complete Examples**](docs/EXAMPLES.md) - Comprehensive usage examples
 - 💾 [**Persistence Guide**](docs/PERSISTENCE.md) - Event storage and replay patterns
 - 🔗 [**Distributed Guide**](docs/DISTRIBUTED.md) - Cross-process delivery with Follow
+- 📝 [**Changelog**](CHANGELOG.md) - Release notes and migration-relevant changes
 - 📚 [**API Reference**](https://godoc.org/github.com/jilio/ebu) - Complete API documentation
 
 ## Storage Backends
