@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -53,10 +54,67 @@ func TestEntityType(t *testing.T) {
 }
 
 func TestCompositeKey(t *testing.T) {
-	got := CompositeKey("user", "123")
-	want := "user/123"
-	if got != want {
-		t.Errorf("CompositeKey() = %q, want %q", got, want)
+	tests := []struct {
+		name       string
+		entityType string
+		key        string
+		want       string
+	}{
+		{name: "common form is preserved", entityType: "user", key: "123", want: "user/123"},
+		{name: "slash in type", entityType: "tenant/user", key: "123", want: "tenant%2Fuser/123"},
+		{name: "slash in key", entityType: "tenant", key: "user/123", want: "tenant/user%2F123"},
+		{name: "percent sequences remain literal", entityType: "tenant%2Fuser", key: "%/123", want: "tenant%252Fuser/%25%2F123"},
+		{name: "empty components", entityType: "", key: "", want: "/"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := CompositeKey(tt.entityType, tt.key); got != tt.want {
+				t.Errorf("CompositeKey(%q, %q) = %q, want %q", tt.entityType, tt.key, got, tt.want)
+			}
+		})
+	}
+
+	// Exercise every pairing of empty, ordinary, reserved, escape-looking,
+	// nested-looking, and Unicode components. This includes the former
+	// ("tenant", "user/123") / ("tenant/user", "123") collision.
+	components := []string{
+		"",
+		"tenant",
+		"123",
+		"/",
+		"%",
+		"%2F",
+		"tenant/user",
+		"tenant%2Fuser",
+		"tenant/%2F/user",
+		"用户/%",
+	}
+	seen := make(map[string][2]string, len(components)*len(components))
+	for _, entityType := range components {
+		for _, key := range components {
+			composite := CompositeKey(entityType, key)
+			if previous, ok := seen[composite]; ok {
+				t.Fatalf("CompositeKey collision: (%q, %q) and (%q, %q) both produced %q", previous[0], previous[1], entityType, key, composite)
+			}
+			seen[composite] = [2]string{entityType, key}
+
+			encodedType, encodedKey, ok := strings.Cut(composite, "/")
+			if !ok || strings.Contains(encodedKey, "/") {
+				t.Fatalf("CompositeKey(%q, %q) = %q, want exactly one separator", entityType, key, composite)
+			}
+			decodedType, err := url.PathUnescape(encodedType)
+			if err != nil {
+				t.Fatalf("decode entity type in %q: %v", composite, err)
+			}
+			decodedKey, err := url.PathUnescape(encodedKey)
+			if err != nil {
+				t.Fatalf("decode key in %q: %v", composite, err)
+			}
+			if decodedType != entityType || decodedKey != key {
+				t.Fatalf("CompositeKey(%q, %q) round trip = (%q, %q)", entityType, key, decodedType, decodedKey)
+			}
+		}
 	}
 }
 
@@ -1349,6 +1407,13 @@ func TestMaterializerSnapshotRoundTrip(t *testing.T) {
 	if snaps.offsets["users"] != mat.LastOffset() {
 		t.Errorf("snapshot offset = %q, want %q", snaps.offsets["users"], mat.LastOffset())
 	}
+	var saved materializerSnapshot
+	if err := json.Unmarshal(snaps.blobs["users"], &saved); err != nil {
+		t.Fatalf("Unmarshal saved snapshot: %v", err)
+	}
+	if saved.Version != materializerSnapshotVersion || saved.KeyCodec != snapshotKeyCodecPercentV1 || saved.Collections == nil {
+		t.Fatalf("snapshot format = version %d, codec %q, collections %v", saved.Version, saved.KeyCodec, saved.Collections)
+	}
 
 	// An event published after the snapshot; only this tail should need replay.
 	msg3, _ := Update("1", User{Name: "Alice Smith"})
@@ -1388,6 +1453,343 @@ func TestMaterializerSnapshotRoundTrip(t *testing.T) {
 	}
 	if u1.Name != "Alice Smith" {
 		t.Errorf("User 1 name = %q, want %q", u1.Name, "Alice Smith")
+	}
+}
+
+func TestMaterializerSnapshotUsesEncodedCollectionPrefix(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore[User]()
+	users := NewTypedCollectionWithType[User](store, "tenant")
+	nestedUsers := NewTypedCollectionWithType[User](store, "tenant/%2Fuser")
+
+	if err := store.Set(CompositeKey(nestedUsers.EntityType(), "1/%"), User{Name: "Nested"}); err != nil {
+		t.Fatalf("seed nested collection: %v", err)
+	}
+
+	mat := NewMaterializer()
+	RegisterCollection(mat, users)
+	insert, err := Insert("%2Fuser/1", User{Name: "Parent"}, WithEntityType(users.EntityType()))
+	if err != nil {
+		t.Fatalf("Insert() error = %v", err)
+	}
+	data, err := json.Marshal(insert)
+	if err != nil {
+		t.Fatalf("Marshal insert: %v", err)
+	}
+	if err := mat.Apply(&eventbus.StoredEvent{Offset: "7", Type: changeMessageEventType, Data: data}); err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+
+	snaps := newFakeSnapshotStore()
+	if err := mat.SaveSnapshotTo(ctx, snaps, "tenant"); err != nil {
+		t.Fatalf("SaveSnapshotTo() error = %v", err)
+	}
+	var snapshot materializerSnapshot
+	if err := json.Unmarshal(snaps.blobs["tenant"], &snapshot); err != nil {
+		t.Fatalf("Unmarshal snapshot: %v", err)
+	}
+	if len(snapshot.Collections[users.EntityType()]) != 1 {
+		t.Fatalf("snapshot parent collection has %d entries, want 1: %v", len(snapshot.Collections[users.EntityType()]), snapshot)
+	}
+	parentKey := CompositeKey(users.EntityType(), "%2Fuser/1")
+	if _, ok := snapshot.Collections[users.EntityType()][parentKey]; !ok {
+		t.Errorf("snapshot missing encoded parent key %q: %v", parentKey, snapshot)
+	}
+	if _, ok := snapshot.Collections[users.EntityType()][CompositeKey(nestedUsers.EntityType(), "1/%")]; ok {
+		t.Error("snapshot leaked an unregistered nested collection into the parent collection")
+	}
+
+	restoredStore := NewMemoryStore[User]()
+	restoredUsers := NewTypedCollectionWithType[User](restoredStore, users.EntityType())
+	restoredNestedUsers := NewTypedCollectionWithType[User](restoredStore, nestedUsers.EntityType())
+	if err := restoredStore.Set(CompositeKey(restoredUsers.EntityType(), "stale/%"), User{Name: "Stale"}); err != nil {
+		t.Fatalf("seed stale parent: %v", err)
+	}
+	if err := restoredStore.Set(CompositeKey(restoredNestedUsers.EntityType(), "1/%"), User{Name: "Nested"}); err != nil {
+		t.Fatalf("seed restored nested collection: %v", err)
+	}
+
+	restored := NewMaterializer()
+	RegisterCollection(restored, restoredUsers)
+	if offset, err := restored.LoadSnapshotFrom(ctx, snaps, "tenant"); err != nil {
+		t.Fatalf("LoadSnapshotFrom() error = %v", err)
+	} else if offset != "7" {
+		t.Errorf("LoadSnapshotFrom() offset = %q, want 7", offset)
+	}
+	if _, ok, _ := restoredUsers.Get("stale/%"); ok {
+		t.Error("snapshot restore should clear stale parent state")
+	}
+	if got, ok, _ := restoredUsers.Get("%2Fuser/1"); !ok || got.Name != "Parent" {
+		t.Errorf("restored parent = %+v, %v; want Parent", got, ok)
+	}
+	if got, ok, _ := restoredNestedUsers.Get("1/%"); !ok || got.Name != "Nested" {
+		t.Errorf("snapshot restore changed nested collection: got %+v, %v", got, ok)
+	}
+}
+
+func TestMaterializerLoadsSafeLegacySnapshot(t *testing.T) {
+	// "version" remains a valid entity type in the legacy top-level map. Its
+	// object value distinguishes it from the scalar version marker in current
+	// snapshots.
+	snaps := newFakeSnapshotStore()
+	snaps.offsets["legacy"] = "9"
+	snaps.blobs["legacy"] = json.RawMessage(`{"version":{"version/1":{"name":"Legacy"}},"removed":{"removed/1":{"name":"Ignored"}}}`)
+
+	store := NewMemoryStore[User]()
+	users := NewTypedCollectionWithType[User](store, "version")
+	if err := store.Set(CompositeKey("version", "stale"), User{Name: "Stale"}); err != nil {
+		t.Fatalf("seed stale state: %v", err)
+	}
+	mat := NewMaterializer()
+	RegisterCollection(mat, users)
+
+	offset, err := mat.LoadSnapshotFrom(context.Background(), snaps, "legacy")
+	if err != nil {
+		t.Fatalf("LoadSnapshotFrom(safe legacy) error = %v", err)
+	}
+	if offset != "9" || mat.LastOffset() != "9" {
+		t.Fatalf("legacy snapshot offsets = %q/%q, want 9", offset, mat.LastOffset())
+	}
+	if _, ok, _ := users.Get("stale"); ok {
+		t.Error("legacy snapshot restore should clear stale state")
+	}
+	if got, ok, _ := users.Get("1"); !ok || got.Name != "Legacy" {
+		t.Errorf("safe legacy entity = %+v, %v; want Legacy", got, ok)
+	}
+}
+
+func TestMaterializerRejectsUnsafeLegacySnapshotAtomically(t *testing.T) {
+	tests := []struct {
+		name string
+		blob json.RawMessage
+	}{
+		{
+			name: "slash in key or leaked nested prefix",
+			blob: json.RawMessage(`{"tenant":{"tenant/user/1":{"name":"Ambiguous"}}}`),
+		},
+		{
+			name: "percent in key",
+			blob: json.RawMessage(`{"tenant":{"tenant/user%2F1":{"name":"Escape-looking"}}}`),
+		},
+		{
+			name: "slash in entity type",
+			blob: json.RawMessage(`{"tenant/user":{"tenant/user/1":{"name":"Nested"}}}`),
+		},
+		{
+			name: "percent in entity type",
+			blob: json.RawMessage(`{"tenant%2Fuser":{"tenant%2Fuser/1":{"name":"Literal percent"}}}`),
+		},
+		{
+			name: "composite key outside collection prefix",
+			blob: json.RawMessage(`{"tenant":{"other/1":{"name":"Wrong prefix"}}}`),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewMemoryStore[User]()
+			users := NewTypedCollectionWithType[User](store, "tenant")
+			mat := NewMaterializer()
+			RegisterCollection(mat, users)
+
+			// Establish state and an offset that must survive rejection. A legacy
+			// snapshot may be the only copy of earlier data after log compaction;
+			// accepting its offset while restoring unreachable keys would skip that
+			// history permanently.
+			data := json.RawMessage(`{"type":"tenant","key":"current","value":{"name":"Current"},"headers":{"operation":"insert"}}`)
+			if err := mat.Apply(&eventbus.StoredEvent{Offset: "3", Type: changeMessageEventType, Data: data}); err != nil {
+				t.Fatalf("Apply current state: %v", err)
+			}
+
+			snaps := newFakeSnapshotStore()
+			snaps.offsets["legacy"] = "100"
+			snaps.blobs["legacy"] = tt.blob
+			offset, err := mat.LoadSnapshotFrom(context.Background(), snaps, "legacy")
+			if err == nil || !strings.Contains(err.Error(), "legacy snapshot") ||
+				!strings.Contains(err.Error(), "complete source history") {
+				t.Fatalf("LoadSnapshotFrom() error = %v, want legacy codec rejection", err)
+			}
+			if offset != eventbus.OffsetOldest {
+				t.Errorf("returned offset = %q, want OffsetOldest on rejection", offset)
+			}
+			if mat.LastOffset() != "3" {
+				t.Errorf("LastOffset() = %q, want unchanged offset 3", mat.LastOffset())
+			}
+			if got, ok, _ := users.Get("current"); !ok || got.Name != "Current" {
+				t.Errorf("current state mutated on rejection: got %+v, %v", got, ok)
+			}
+			if all, _ := store.All(); len(all) != 1 {
+				t.Errorf("store mutated on rejection: %v", all)
+			}
+		})
+	}
+}
+
+func TestMaterializerRejectsForgedVersionedSnapshotAtomically(t *testing.T) {
+	tests := []struct {
+		name         string
+		entityType   string
+		compositeKey string
+	}{
+		{name: "raw slash creates a second separator", entityType: "tenant", compositeKey: "tenant/user/1"},
+		{name: "wrong collection prefix", entityType: "tenant", compositeKey: "other/1"},
+		{name: "raw reserved entity type prefix", entityType: "tenant/user", compositeKey: "tenant/user/1"},
+		{name: "lowercase slash escape is noncanonical", entityType: "tenant", compositeKey: "tenant/user%2f1"},
+		{name: "escape not produced by codec", entityType: "tenant", compositeKey: "tenant/user%41"},
+		{name: "malformed escape", entityType: "tenant", compositeKey: "tenant/user%ZZ"},
+		{name: "raw percent", entityType: "tenant", compositeKey: "tenant/user%1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewMemoryStore[User]()
+			users := NewTypedCollectionWithType[User](store, "tenant")
+			mat := NewMaterializer()
+			RegisterCollection(mat, users)
+
+			current := json.RawMessage(`{"type":"tenant","key":"current","value":{"name":"Current"},"headers":{"operation":"insert"}}`)
+			if err := mat.Apply(&eventbus.StoredEvent{Offset: "3", Type: changeMessageEventType, Data: current}); err != nil {
+				t.Fatalf("Apply current state: %v", err)
+			}
+
+			forged := materializerSnapshot{
+				Version:  materializerSnapshotVersion,
+				KeyCodec: snapshotKeyCodecPercentV1,
+				Collections: map[string]map[string]json.RawMessage{
+					tt.entityType: {tt.compositeKey: json.RawMessage(`{"name":"Forged"}`)},
+				},
+			}
+			blob, err := json.Marshal(forged)
+			if err != nil {
+				t.Fatalf("Marshal forged snapshot: %v", err)
+			}
+			snaps := newFakeSnapshotStore()
+			snaps.offsets["forged"] = "100"
+			snaps.blobs["forged"] = blob
+
+			offset, err := mat.LoadSnapshotFrom(context.Background(), snaps, "forged")
+			if err == nil || !strings.Contains(err.Error(), "versioned snapshot composite key") {
+				t.Fatalf("LoadSnapshotFrom() error = %v, want versioned key rejection", err)
+			}
+			if offset != eventbus.OffsetOldest {
+				t.Errorf("returned offset = %q, want OffsetOldest on rejection", offset)
+			}
+			if mat.LastOffset() != "3" {
+				t.Errorf("LastOffset() = %q, want unchanged offset 3", mat.LastOffset())
+			}
+			if got, ok, _ := users.Get("current"); !ok || got.Name != "Current" {
+				t.Errorf("current state mutated on rejection: got %+v, %v", got, ok)
+			}
+			if all, _ := store.All(); len(all) != 1 {
+				t.Errorf("store mutated on rejection: %v", all)
+			}
+		})
+	}
+}
+
+func TestMaterializerRejectsNullSnapshotCollectionAtomically(t *testing.T) {
+	tests := []struct {
+		name    string
+		blob    json.RawMessage
+		wantErr string
+	}{
+		{
+			name:    "versioned",
+			blob:    json.RawMessage(`{"version":1,"key_codec":"percent-v1","collections":{"tenant":null}}`),
+			wantErr: "versioned snapshot collection",
+		},
+		{
+			name:    "legacy",
+			blob:    json.RawMessage(`{"tenant":null}`),
+			wantErr: "legacy snapshot collection",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewMemoryStore[User]()
+			users := NewTypedCollectionWithType[User](store, "tenant")
+			mat := NewMaterializer()
+			RegisterCollection(mat, users)
+
+			current := json.RawMessage(`{"type":"tenant","key":"current","value":{"name":"Current"},"headers":{"operation":"insert"}}`)
+			if err := mat.Apply(&eventbus.StoredEvent{Offset: "3", Type: changeMessageEventType, Data: current}); err != nil {
+				t.Fatalf("Apply current state: %v", err)
+			}
+
+			snaps := newFakeSnapshotStore()
+			snaps.offsets["null-collection"] = "100"
+			snaps.blobs["null-collection"] = tt.blob
+
+			offset, err := mat.LoadSnapshotFrom(context.Background(), snaps, "null-collection")
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) || !strings.Contains(err.Error(), "not null") {
+				t.Fatalf("LoadSnapshotFrom() error = %v, want null collection rejection", err)
+			}
+			if offset != eventbus.OffsetOldest {
+				t.Errorf("returned offset = %q, want OffsetOldest on rejection", offset)
+			}
+			if mat.LastOffset() != "3" {
+				t.Errorf("LastOffset() = %q, want unchanged offset 3", mat.LastOffset())
+			}
+			if got, ok, _ := users.Get("current"); !ok || got.Name != "Current" {
+				t.Errorf("current state mutated on rejection: got %+v, %v", got, ok)
+			}
+			if all, _ := store.All(); len(all) != 1 {
+				t.Errorf("store mutated on rejection: %v", all)
+			}
+		})
+	}
+}
+
+func TestMaterializerRejectsSnapshotMissingRegisteredCollectionAtomically(t *testing.T) {
+	tests := []struct {
+		name string
+		blob json.RawMessage
+	}{
+		{
+			name: "versioned",
+			blob: json.RawMessage(`{"version":1,"key_codec":"percent-v1","collections":{"removed":{}}}`),
+		},
+		{
+			name: "safe legacy",
+			blob: json.RawMessage(`{"removed":{}}`),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewMemoryStore[User]()
+			users := NewTypedCollectionWithType[User](store, "tenant")
+			mat := NewMaterializer()
+			RegisterCollection(mat, users)
+
+			current := json.RawMessage(`{"type":"tenant","key":"current","value":{"name":"Current"},"headers":{"operation":"insert"}}`)
+			if err := mat.Apply(&eventbus.StoredEvent{Offset: "3", Type: changeMessageEventType, Data: current}); err != nil {
+				t.Fatalf("Apply current state: %v", err)
+			}
+
+			snaps := newFakeSnapshotStore()
+			snaps.offsets["missing-collection"] = "100"
+			snaps.blobs["missing-collection"] = tt.blob
+
+			offset, err := mat.LoadSnapshotFrom(context.Background(), snaps, "missing-collection")
+			if err == nil || !strings.Contains(err.Error(), `missing registered collection "tenant"`) ||
+				!strings.Contains(err.Error(), "history was compacted") {
+				t.Fatalf("LoadSnapshotFrom() error = %v, want missing collection rejection", err)
+			}
+			if offset != eventbus.OffsetOldest {
+				t.Errorf("returned offset = %q, want OffsetOldest on rejection", offset)
+			}
+			if mat.LastOffset() != "3" {
+				t.Errorf("LastOffset() = %q, want unchanged offset 3", mat.LastOffset())
+			}
+			if got, ok, _ := users.Get("current"); !ok || got.Name != "Current" {
+				t.Errorf("current state mutated on rejection: got %+v, %v", got, ok)
+			}
+			if all, _ := store.All(); len(all) != 1 {
+				t.Errorf("store mutated on rejection: %v", all)
+			}
+		})
 	}
 }
 
@@ -1476,6 +1878,33 @@ func TestMaterializerSaveSnapshotErrors(t *testing.T) {
 		}
 	})
 
+	t.Run("refuses to label a noncanonical store key as percent-v1", func(t *testing.T) {
+		mat := NewMaterializer()
+		store := NewMemoryStore[User]()
+		users := NewTypedCollectionWithType[User](store, "tenant")
+		RegisterCollection(mat, users)
+
+		data := json.RawMessage(`{"type":"tenant","key":"current","value":{"name":"Current"},"headers":{"operation":"insert"}}`)
+		if err := mat.Apply(&eventbus.StoredEvent{Offset: "1", Type: changeMessageEventType, Data: data}); err != nil {
+			t.Fatalf("Apply current state: %v", err)
+		}
+		// A custom or pre-migration store can contain a raw legacy key under
+		// this collection's broad historical prefix. Saving it as percent-v1
+		// would invite callers to compact behind a snapshot that cannot load.
+		if err := store.Set("tenant/legacy/key", User{Name: "Legacy"}); err != nil {
+			t.Fatalf("seed noncanonical key: %v", err)
+		}
+
+		snaps := newFakeSnapshotStore()
+		err := mat.SaveSnapshotTo(ctx, snaps, "tenant")
+		if err == nil || !strings.Contains(err.Error(), "versioned snapshot composite key") {
+			t.Fatalf("SaveSnapshotTo() error = %v, want key-codec rejection", err)
+		}
+		if _, ok := snaps.blobs["tenant"]; ok {
+			t.Error("invalid snapshot was persisted despite codec validation")
+		}
+	})
+
 	t.Run("store save failure", func(t *testing.T) {
 		mat := NewMaterializer()
 		store := NewMemoryStore[User]()
@@ -1532,6 +1961,28 @@ func TestMaterializerLoadSnapshotErrors(t *testing.T) {
 			t.Fatal("LoadSnapshotFrom() should fail on corrupt blob")
 		}
 	})
+
+	for _, tt := range []struct {
+		name string
+		blob json.RawMessage
+	}{
+		{name: "null envelope", blob: json.RawMessage(`null`)},
+		{name: "malformed version marker", blob: json.RawMessage(`{"version":"one","key_codec":"percent-v1","collections":{}}`)},
+		{name: "unsupported version", blob: json.RawMessage(`{"version":2,"key_codec":"percent-v1","collections":{}}`)},
+		{name: "unsupported key codec", blob: json.RawMessage(`{"version":1,"key_codec":"raw-v0","collections":{}}`)},
+		{name: "missing collections", blob: json.RawMessage(`{"version":1,"key_codec":"percent-v1"}`)},
+		{name: "malformed legacy collection", blob: json.RawMessage(`{"tenant":42}`)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			mat := NewMaterializer()
+			snaps := newFakeSnapshotStore()
+			snaps.offsets["users"] = "5"
+			snaps.blobs["users"] = tt.blob
+			if _, err := mat.LoadSnapshotFrom(ctx, snaps, "users"); err == nil {
+				t.Fatalf("LoadSnapshotFrom() accepted invalid snapshot %s", tt.blob)
+			}
+		})
+	}
 
 	t.Run("entity restore failure leaves materializer empty", func(t *testing.T) {
 		mat := NewMaterializer()
@@ -1713,6 +2164,67 @@ func TestSharedStoreCollectionScoping(t *testing.T) {
 			t.Error("admin/1 belongs to an unregistered collection and must survive the reset")
 		}
 	})
+}
+
+func TestReservedCompositeKeyCollectionIsolation(t *testing.T) {
+	store := NewMemoryStore[User]()
+	users := NewTypedCollectionWithType[User](store, "tenant")
+	nestedUsers := NewTypedCollectionWithType[User](store, "tenant/user")
+	escapeLookingUsers := NewTypedCollectionWithType[User](store, "tenant%2Fuser")
+
+	entries := []struct {
+		collection *TypedCollection[User]
+		key        string
+		name       string
+	}{
+		{collection: users, key: "user/1", name: "Parent"},
+		{collection: nestedUsers, key: "1", name: "Nested"},
+		{collection: escapeLookingUsers, key: "%/1", name: "Percent"},
+	}
+	for _, entry := range entries {
+		if err := store.Set(CompositeKey(entry.collection.EntityType(), entry.key), User{Name: entry.name}); err != nil {
+			t.Fatalf("Set(%q, %q) error = %v", entry.collection.EntityType(), entry.key, err)
+		}
+	}
+
+	for _, entry := range entries {
+		t.Run(entry.name+" round trip and All scope", func(t *testing.T) {
+			got, ok, err := entry.collection.Get(entry.key)
+			if err != nil {
+				t.Fatalf("Get(%q) error = %v", entry.key, err)
+			}
+			if !ok || got.Name != entry.name {
+				t.Fatalf("Get(%q) = %+v, %v; want %q", entry.key, got, ok, entry.name)
+			}
+
+			all, err := entry.collection.All()
+			if err != nil {
+				t.Fatalf("All() error = %v", err)
+			}
+			if len(all) != 1 {
+				t.Fatalf("All() returned %d entries, want 1: %v", len(all), all)
+			}
+			composite := CompositeKey(entry.collection.EntityType(), entry.key)
+			if _, ok := all[composite]; !ok {
+				t.Errorf("All() missing encoded composite key %q: %v", composite, all)
+			}
+		})
+	}
+
+	mat := NewMaterializer()
+	RegisterCollection(mat, users)
+	if err := mat.ApplyControlMessage(Reset("offset-1")); err != nil {
+		t.Fatalf("ApplyControlMessage(reset) error = %v", err)
+	}
+	if _, ok, _ := users.Get("user/1"); ok {
+		t.Error("reset should clear the registered parent collection")
+	}
+	if got, ok, _ := nestedUsers.Get("1"); !ok || got.Name != "Nested" {
+		t.Errorf("reset changed nested collection: got %+v, %v", got, ok)
+	}
+	if got, ok, _ := escapeLookingUsers.Get("%/1"); !ok || got.Name != "Percent" {
+		t.Errorf("reset changed percent-named collection: got %+v, %v", got, ok)
+	}
 }
 
 // failingUserStore fails selected operations to prove store errors surface

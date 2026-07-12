@@ -3,6 +3,7 @@ package state
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 )
 
 // Operation represents the type of change operation per the State Protocol.
@@ -130,10 +131,18 @@ func EntityType(entity any) string {
 	return reflect.TypeOf(entity).String()
 }
 
-// CompositeKey returns a composite key from type and key components.
-// The State Protocol uses type + key as a composite identifier.
+// CompositeKey returns an unambiguous composite key from type and key
+// components. Percent signs and slashes within either component are
+// percent-encoded, leaving the sole unescaped slash as the separator.
+// Components without those reserved characters retain the familiar type/key
+// representation.
 func CompositeKey(entityType, key string) string {
-	return entityType + "/" + key
+	return encodeKeyComponent(entityType) + "/" + encodeKeyComponent(key)
+}
+
+func encodeKeyComponent(component string) string {
+	component = strings.ReplaceAll(component, "%", "%25")
+	return strings.ReplaceAll(component, "/", "%2F")
 }
 
 // EventTypeName implements ebu's TypeNamer interface for ChangeMessage.
