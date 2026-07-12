@@ -248,11 +248,37 @@ func (s *SQLiteStore) resolveNewest(ctx context.Context) (int64, error) {
 }
 
 // formatOffset converts an int64 position to an Offset.
-// Offsets are zero-padded to 20 digits so they compare lexicographically,
-// as the eventbus.Offset contract requires ("999" < "1000" fails as plain
-// strings). parseOffset accepts both padded and legacy unpadded values.
+// Offsets are zero-padded to 20 digits so their textual representation keeps
+// the store's numeric order ("999" < "1000" fails as plain strings).
+// eventbus itself treats offsets as opaque; parseOffset accepts both padded
+// and legacy unpadded values.
 func formatOffset(position int64) eventbus.Offset {
 	return eventbus.Offset(fmt.Sprintf("%020d", position))
+}
+
+// CompareOffsets orders two concrete offsets issued by a SQLiteStore. Both
+// current zero-padded tokens and legacy unpadded numeric tokens are accepted.
+// OffsetNewest is a symbolic query sentinel and cannot be compared.
+func (*SQLiteStore) CompareOffsets(left, right eventbus.Offset) (int, error) {
+	if left == eventbus.OffsetNewest || right == eventbus.OffsetNewest {
+		return 0, fmt.Errorf("sqlite: cannot compare symbolic offset %q", eventbus.OffsetNewest)
+	}
+	leftPosition, err := parseOffset(left)
+	if err != nil {
+		return 0, fmt.Errorf("sqlite: parse left offset %q: %w", left, err)
+	}
+	rightPosition, err := parseOffset(right)
+	if err != nil {
+		return 0, fmt.Errorf("sqlite: parse right offset %q: %w", right, err)
+	}
+	switch {
+	case leftPosition < rightPosition:
+		return -1, nil
+	case leftPosition > rightPosition:
+		return 1, nil
+	default:
+		return 0, nil
+	}
 }
 
 // Append stores an event and returns its assigned offset.
@@ -464,8 +490,8 @@ func (s *SQLiteStore) SaveOffset(ctx context.Context, subscriptionID string, off
 	return nil
 }
 
-// LoadOffset implements eventbus.SubscriptionStore
-func (s *SQLiteStore) LoadOffset(ctx context.Context, subscriptionID string) (eventbus.Offset, error) {
+// LookupOffset implements eventbus.SubscriptionStoreLookup.
+func (s *SQLiteStore) LookupOffset(ctx context.Context, subscriptionID string) (eventbus.Offset, bool, error) {
 	start := time.Now()
 
 	var position int64
@@ -475,19 +501,25 @@ func (s *SQLiteStore) LoadOffset(ctx context.Context, subscriptionID string) (ev
 			if s.metricsHook != nil {
 				s.metricsHook.OnLoadOffset(time.Since(start), nil)
 			}
-			return eventbus.OffsetOldest, nil
+			return eventbus.OffsetOldest, false, nil
 		}
 		if s.metricsHook != nil {
 			s.metricsHook.OnLoadOffset(time.Since(start), err)
 		}
-		return eventbus.OffsetOldest, fmt.Errorf("sqlite: load offset: %w", err)
+		return eventbus.OffsetOldest, false, fmt.Errorf("sqlite: load offset: %w", err)
 	}
 
 	if s.metricsHook != nil {
 		s.metricsHook.OnLoadOffset(time.Since(start), nil)
 	}
 
-	return formatOffset(position), nil
+	return formatOffset(position), true, nil
+}
+
+// LoadOffset implements eventbus.SubscriptionStore.
+func (s *SQLiteStore) LoadOffset(ctx context.Context, subscriptionID string) (eventbus.Offset, error) {
+	offset, _, err := s.LookupOffset(ctx, subscriptionID)
+	return offset, err
 }
 
 // SaveSnapshot upserts the compaction snapshot for snapshotID, recording that

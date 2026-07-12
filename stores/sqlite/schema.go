@@ -76,8 +76,9 @@ func migrate(ctx context.Context, db *sql.DB) error {
 	}
 
 	// Apply migrations in order. Each step seeds its own version row, so a v0
-	// database runs v1, v2 then v3; a v2 database runs only v3; a v3 database
-	// applies nothing. Version rows are inserted with INSERT OR IGNORE so two
+	// database runs every step through the current version; an older database
+	// runs only the missing suffix. Version rows are inserted with INSERT OR
+	// IGNORE so two
 	// processes racing through migrate() (both reading the same stale version)
 	// both succeed instead of the loser failing on the schema_version PK.
 	if version < 1 {
@@ -95,7 +96,7 @@ func migrate(ctx context.Context, db *sql.DB) error {
 			return err
 		}
 	}
-	if version < 4 {
+	if version < currentSchemaVersion {
 		return migrateV4(ctx, db)
 	}
 

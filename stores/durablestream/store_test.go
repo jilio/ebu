@@ -1812,6 +1812,88 @@ func TestRead_OffsetNewest(t *testing.T) {
 	})
 }
 
+func TestCompareOffsetsDetectsCapturedTailOverrun(t *testing.T) {
+	srv := newTestServer()
+	defer srv.Close()
+
+	store, err := ds.New(srv.URL+"/v1/stream", "offset-comparison")
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		left    eventbus.Offset
+		right   eventbus.Offset
+		want    int
+		wantErr bool
+	}{
+		{name: "oldest before offset", left: eventbus.OffsetOldest, right: "0000000001", want: -1},
+		{name: "equal", left: "0000000001", right: "0000000001", want: 0},
+		{name: "later after earlier", left: "0000000002", right: "0000000001", want: 1},
+		{name: "symbolic left", left: eventbus.OffsetNewest, right: "0000000001", wantErr: true},
+		{name: "symbolic right", left: "0000000001", right: eventbus.OffsetNewest, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := store.CompareOffsets(tc.left, tc.right)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("CompareOffsets(%q, %q) unexpectedly succeeded", tc.left, tc.right)
+				}
+				return
+			}
+			if err != nil || got != tc.want {
+				t.Fatalf("CompareOffsets(%q, %q) = (%d, %v), want (%d, nil)", tc.left, tc.right, got, err, tc.want)
+			}
+		})
+	}
+
+	ctx := context.Background()
+	for i := 1; i <= 3; i++ {
+		if _, err := store.Append(ctx, &eventbus.Event{
+			Type: fmt.Sprintf("before.%d", i),
+			Data: json.RawMessage(`{}`),
+		}); err != nil {
+			t.Fatalf("append before barrier: %v", err)
+		}
+	}
+	_, barrier, err := store.Read(ctx, eventbus.OffsetNewest, 0)
+	if err != nil {
+		t.Fatalf("capture tail: %v", err)
+	}
+	for i := 1; i <= 2; i++ {
+		if _, err := store.Append(ctx, &eventbus.Event{
+			Type: fmt.Sprintf("after.%d", i),
+			Data: json.RawMessage(`{}`),
+		}); err != nil {
+			t.Fatalf("append after barrier: %v", err)
+		}
+	}
+
+	events, next, err := store.Read(ctx, eventbus.OffsetOldest, 1)
+	if err != nil {
+		t.Fatalf("read crossing chunk: %v", err)
+	}
+	if len(events) != 5 {
+		t.Fatalf("crossing chunk returned %d events, want all 5 as one resume-safe unit", len(events))
+	}
+	for _, event := range events {
+		if event.Offset == barrier {
+			t.Fatalf("captured tail %q unexpectedly appeared as an event boundary", barrier)
+		}
+	}
+	if next == barrier {
+		t.Fatalf("captured tail %q unexpectedly appeared as the chunk boundary", barrier)
+	}
+	order, err := store.CompareOffsets(next, barrier)
+	if err != nil {
+		t.Fatalf("compare crossing boundary: %v", err)
+	}
+	if order <= 0 {
+		t.Fatalf("crossing chunk next offset %q did not sort after captured tail %q", next, barrier)
+	}
+}
+
 // TestRead_OffsetNewestRetryAndNotFound exercises resolveTail's retry and
 // permanent-error paths.
 func TestRead_OffsetNewestRetryAndNotFound(t *testing.T) {
