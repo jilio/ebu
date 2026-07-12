@@ -1,14 +1,11 @@
-FROM golang:1.24-alpine AS builder
+FROM golang:1.25.12-alpine AS builder
 
 WORKDIR /build
 
-# Copy go mod files
-COPY go.mod ./
-COPY otel/go.mod ./otel/
-COPY examples/observability/generator/go.mod ./examples/observability/generator/
-
-# Copy source code
+# The build context is the repository root. Use its workspace so the
+# generator is compiled against the local ebu and otel modules.
 COPY . .
+ENV GOWORK=/build/go.work
 
 # Build the generator
 WORKDIR /build/examples/observability/generator

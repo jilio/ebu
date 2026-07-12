@@ -7,16 +7,33 @@ on:
     branches: [ main ]
 
 jobs:
-  test:
+  standalone:
+    name: Standalone (${{ matrix.module }}, Go ${{ matrix.go_version }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        # Every module in the repo. `go test ./...` at the root does NOT
-        # descend into sub-modules, so each one is tested explicitly.
-        module: ['.', 'stores/sqlite', 'stores/durablestream', 'otel']
+        # Test every module through its published go.mod graph at the minimum
+        # Go version it declares. `go test ./...` does not cross module roots.
+        include:
+          - module: '.'
+            go_version: '1.24.2'
+            dependency_file: go.mod
+          - module: stores/sqlite
+            go_version: '1.24.2'
+            dependency_file: stores/sqlite/go.sum
+          - module: stores/durablestream
+            go_version: '1.25.1'
+            dependency_file: stores/durablestream/go.sum
+          - module: otel
+            go_version: '1.25.12'
+            dependency_file: otel/go.sum
+          - module: examples/observability
+            go_version: '1.25.12'
+            dependency_file: examples/observability/go.sum
+          - module: examples/observability/generator
+            go_version: '1.25.12'
+            dependency_file: examples/observability/generator/go.sum
     env:
-      # Test each module against its own go.mod/go.sum (what external
-      # importers resolve), not the local workspace.
       GOWORK: off
 
     steps:
@@ -25,12 +42,8 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.24'
-
-    - name: Check formatting
-      run: |
-        cd ${{ matrix.module }}
-        test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+        go-version: ${{ matrix.go_version }}
+        cache-dependency-path: ${{ matrix.dependency_file }}
 
     - name: Build
       run: |
@@ -47,8 +60,48 @@ jobs:
         cd ${{ matrix.module }}
         go test -v -race ./...
 
+  workspace:
+    name: Workspace (all modules, Go 1.25.12)
+    runs-on: ubuntu-latest
+    env:
+      GOWORK: auto
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.25.12'
+        cache-dependency-path: |
+          otel/go.sum
+          stores/sqlite/go.sum
+          stores/durablestream/go.sum
+          examples/observability/go.sum
+          examples/observability/generator/go.sum
+
+    - name: Verify workspace and formatting
+      run: |
+        test "$(go env GOWORK)" = "$GITHUB_WORKSPACE/go.work"
+        test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+
+    - name: Build, vet, and test every workspace module
+      run: |
+        for module in . stores/sqlite stores/durablestream otel examples/observability examples/observability/generator; do
+          echo "::group::$module"
+          (
+            cd "$module"
+            go build -v ./...
+            go vet ./...
+            go test -v -race ./...
+          )
+          echo "::endgroup::"
+        done
+
   coverage:
     runs-on: ubuntu-latest
+    env:
+      GOWORK: off
     permissions:
       contents: write
 
@@ -58,10 +111,13 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.24'
+        go-version: '1.24.2'
+        cache: false
 
     - name: Generate coverage report
-      run: go test -v -coverprofile=coverage.out ./...
+      run: |
+        go test -v -coverprofile=coverage.out ./...
+        test "$(go tool cover -func=coverage.out | awk '/^total:/ {print $3}')" = "100.0%"
 
     - name: Upload coverage reports
       uses: ncruces/go-coverage-report@v0
