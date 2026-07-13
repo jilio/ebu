@@ -5,6 +5,148 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`SubscribeContextWithReplay`.** Context-aware resumable handlers now see
+  the persisted event ID, offset, and metadata during historical, catch-up,
+  and live delivery through the same context accessors.
+- **`EventStoreOffsetComparer`.** Stores whose smallest resume-safe read unit
+  can cross a previously captured tail without exposing that exact opaque token
+  can provide their protocol's ordering rule. The bundled stores implement it.
+- **`SubscriptionStoreLookup`.** Checkpoint stores can atomically distinguish
+  an absent durable follower from a legitimately saved `OffsetOldest`, making
+  explicit first-run offsets safe for chunk-oriented protocols.
+
+### Changed
+
+- **Resumable subscriptions are log-backed in every phase.** Live handlers now
+  receive a fresh decode of durable JSON plus the stored envelope, not pointer
+  identity or transient fields from the object passed to `Publish`; events
+  absent from the store are not delivered. An `Append` error that follows a
+  durable remote commit can still be observed from the log.
+  Concurrent/reentrant signals are coalesced, so
+  their publisher may return before the resumable drain (which `Wait` and
+  `Shutdown` track). Ordinary subscriptions retain their configured
+  synchronous/async, best-effort behavior. Custom `EventStore.Read`
+  implementations must resolve `OffsetNewest` efficiently to a concrete tail
+  without returning history; resumable setup uses it as a bounded handoff. A
+  positive read limit is a requested batch target that may be exceeded only to
+  preserve an indivisible resume-token unit such as a shared-offset chunk. If
+  that unit crosses the handoff, the store's optional comparer bounds delivery
+  to the one crossing unit and preserves its actual resume token.
+- **Resumable subscriptions reject `Async()` and `Once()`, empty IDs, and reuse
+  after successful setup on one bus.** Durable offsets are checkpointed only
+  after ordered handler completion; one-time delivery has no unambiguous
+  restart contract, and two coordinators cannot safely race one scalar
+  checkpoint. Failed setup releases its ID for retry; create a new bus to
+  restart a successfully registered subscription ID.
+- **Reserved state-key components are encoded.** `state.CompositeKey` now
+  percent-encodes `%` and `/` within both the entity type and key, while
+  preserving the familiar `type/key` output for ordinary components. This
+  prevents shared-store prefix collisions. Materialized stores that already
+  contain reserved-character keys should be rebuilt from their log or
+  migrated to the encoded form.
+- **Materializer snapshots carry an explicit key codec.** New snapshots use
+  format version 1 and `percent-v1`; every key is validated before save or
+  restore. Safe versionless snapshots remain readable, while legacy snapshots
+  containing reserved or prefix-ambiguous keys fail atomically before state or
+  `LastOffset` changes. If their covered log was compacted, preserve and
+  explicitly migrate those snapshots rather than discarding the only copy.
+
+### Fixed
+
+- **Durable follower startup is a committed boundary.** Every first-run
+  `FollowWithSubscriptionID` saves its selected concrete offset before polling
+  or tailing; `OffsetNewest` is resolved exactly once. Restarts can no longer
+  move an unrecorded live-only boundary past events appended while down.
+  Legacy checkpoint stores reject ambiguous non-oldest `FollowFrom` values
+  unless they implement `SubscriptionStoreLookup`.
+- **Interface-typed publishes reach concrete handlers.** Handler and filter
+  adapters are bound at subscription time, so a concrete event passed through
+  `any` or another interface still runs payload/context, filter, async,
+  sequential, and once semantics without per-dispatch reflection.
+- **Live resumable wakes cross schema and cancellation boundaries.** A durable
+  publish wakes active replay coordinators across concrete type shards, so a
+  V1 record that upcasts into a V2 subscription—or a record committed under an
+  already-cancelled publish context—cannot remain parked until a later event.
+  `WithLogDelivery` retains its Follow-only live boundary.
+- **Poison log entries wake resumable consumers.** A `Follow` decode failure
+  now signals replay coordinators by stored type before applying its generic
+  poison behavior, so a trailing malformed event cannot strand ReplaySkip or
+  ReplayAbort until a later healthy event arrives.
+- **Raw upcasts cannot rewrite their declared chain.** Returning an empty or
+  unexpected successor produces `UpcastContractError` instead of bypassing
+  cycle checks or looping forever. `ReplayWithUpcast` now aborts a failed
+  migration rather than delivering the original schema as success;
+  non-durable `Follow` reports and skips failed migrations instead of
+  dispatching the legacy type, while still waking durable replay coordinators
+  so their autonomous retry is not stranded.
+- **Replay validation is side-effect-free for edge inputs.** TypeNamer
+  interface handlers return the documented interface-type error instead of
+  panicking, and typed-nil filters are rejected before registration/replay.
+- **Per-event offsets are explicitly prefix-safe.** `EventStore.Read` and
+  `EventStoreTailer` now state the checkpoint contract required by durable
+  consumers: resuming from any yielded event offset may redeliver completed
+  work but must never skip a later event. Chunk-only stores use the chunk-start
+  token on non-last members and the chunk-end token only on the last member.
+- **Log-only startup cannot skip pre-follower publishes.** A
+  `WithLogDelivery` follower defaults to `OffsetOldest` when no explicit or
+  durable starting position exists, closing the race between append and
+  follower startup.
+- **Durable followers checkpoint only successful event attempts.** The
+  follower waits for async handlers, retries recovered sync/async panics and
+  returned or panicking upcast failures from the unchanged offset, checkpoints
+  each successful prefix event in a batch, restores `Once` handlers selected by
+  a failed attempt without allowing an immediate restart to overlap an in-flight
+  async invocation, and makes semaphore/completion waits cancellable. One bus
+  rejects overlapping durable owners of the same subscription ID; `Follow`
+  releases its ownership when it returns. Ordinary local `Publish` remains
+  non-blocking.
+- **Resumable checkpoints cannot leapfrog unfinished events.** An ordered
+  coordinator drains to a captured tail barrier while sharing sequential
+  locking, panic recovery, handler observability, filters, and envelope context
+  across historical, catch-up, and live delivery. An aborting
+  panic/read/decode/upcast failure leaves the scan cursor before its batch;
+  later offsets cannot be saved past it, including for stores whose events
+  share a chunk-level resume offset. Store-defined offset ordering also stops a
+  drain after the one indivisible unit that crosses its captured tail, rather
+  than chasing concurrent appends when the exact barrier token is not exposed.
+  Live failures retain their wake-up and retry with capped backoff instead of
+  stranding the final event or discarding a coalesced concurrent signal.
+- **Replay setup failures leave no live subscription.** `LoadOffset` errors
+  abort instead of replaying from the beginning, a failed catch-up marks its
+  signal inactive before removal, ID reservations always roll back, and type
+  reservations roll back when no durable evidence was decoded.
+- **Upcasting preserves identity.** Typed upcasts use `TypeNamer` wire names,
+  and `ReplayWithUpcast` preserves ID, Origin, Metadata, offset, and timestamp
+  while replacing only type and payload.
+- **Persisted event names are derived safely and consistently.** Typed nil
+  pointer events no longer panic, names come from the type rather than instance
+  state, and one transactional registry covers append attempts,
+  subscriptions, and typed upcast endpoints. Persistent buses reject distinct
+  Go types with the same wire name instead of decoding by registration order.
+  A claim becomes sticky before `EventStore.Append` is called because an error
+  may follow a durable remote commit; a colliding type can no longer reinterpret
+  that ambiguously written payload.
+  Typed registrations made by custom `New` options are audited after every
+  option has run, so enforcement no longer depends on whether `WithStore`
+  comes first or last; invalid persistent construction panics without returning an
+  ambiguous bus. Failed setup leaves no decoder behind.
+- **`MemoryStore` history is mutation-safe.** Append takes ownership by copying
+  mutable payload bytes and metadata, while `Read` and `ReadStream` return fresh
+  envelope copies. Reusing an input event or mutating a replay result can no
+  longer rewrite in-memory durable history.
+- **Observability examples build in supported modes.** Both example modules
+  are part of the workspace and CI matrix, `GOWORK=off` resolves the tagged
+  v0.16.0 dependencies, Docker uses the workspace, and the generator shuts
+  down the exact OpenTelemetry providers it configures. CI also exercises each
+  module at its declared minimum Go version and enforces 100% core coverage.
+  The runnable examples and adapter now use OpenTelemetry 1.43.0 and Go
+  1.25.12, which include the upstream fixes for reachable SDK and OTLP/HTTP
+  vulnerabilities in their previous dependency graph.
+
 ## [0.16.0] - 2026-07-05
 
 ### Added
@@ -640,7 +782,10 @@ Initial release of ebu (Event BUs) - a lightweight, type-safe event bus for Go.
 - `ClearAll`: Remove all handlers
 - `WaitAsync`: Wait for async handlers to complete
 
-[Unreleased]: https://github.com/jilio/ebu/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/jilio/ebu/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/jilio/ebu/compare/v0.15.0...v0.16.0
+[0.15.0]: https://github.com/jilio/ebu/compare/v0.14.0...v0.15.0
+[0.14.0]: https://github.com/jilio/ebu/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/jilio/ebu/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/jilio/ebu/compare/v0.11.0...v0.12.0
 [0.10.0]: https://github.com/jilio/ebu/compare/v0.9.2...v0.10.0

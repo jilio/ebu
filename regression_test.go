@@ -24,6 +24,14 @@ type ptrNamedReplayEvent struct {
 
 func (e *ptrNamedReplayEvent) EventTypeName() string { return "ptr-named.replay.v1" }
 
+type collidingEventA struct{}
+
+func (collidingEventA) EventTypeName() string { return "review.collision" }
+
+type collidingEventB struct{}
+
+func (collidingEventB) EventTypeName() string { return "review.collision" }
+
 // TestSubscribeWithReplayTypeNamer is a regression test: events implementing
 // TypeNamer are persisted under their custom name, and SubscribeWithReplay
 // must match that same name during replay. Previously it compared against the
@@ -57,11 +65,113 @@ func TestTypeNameOf(t *testing.T) {
 	if got := typeNameOf(reflect.TypeOf(namedReplayEvent{})); got != "named.replay.v1" {
 		t.Errorf("value receiver: got %q", got)
 	}
-	if got := typeNameOf(reflect.TypeOf(ptrNamedReplayEvent{})); got != "ptr-named.replay.v1" {
-		t.Errorf("pointer receiver: got %q", got)
+	if got := typeNameOf(reflect.TypeOf(ptrNamedReplayEvent{})); got != "eventbus.ptrNamedReplayEvent" {
+		t.Errorf("non-pointer value must match EventType(value): got %q", got)
+	}
+	if got := typeNameOf(reflect.TypeOf(&ptrNamedReplayEvent{})); got != "ptr-named.replay.v1" {
+		t.Errorf("pointer event: got %q", got)
 	}
 	if got := typeNameOf(reflect.TypeOf(TestEvent{})); got != "eventbus.TestEvent" {
 		t.Errorf("plain type: got %q", got)
+	}
+}
+
+// TestSubscribeWithReplayPointerTypeNamer verifies pointer event types derive
+// their stable name from a fresh value rather than invoking a promoted
+// value-receiver method through a nil pointer.
+func TestSubscribeWithReplayPointerTypeNamer(t *testing.T) {
+	store := NewMemoryStore()
+	bus := New(WithStore(store))
+	Publish(bus, &namedReplayEvent{ID: "pointer"})
+
+	bus2 := New(WithStore(store))
+	var received []*namedReplayEvent
+	if err := SubscribeWithReplay(context.Background(), bus2, "pointer-namer",
+		func(event *namedReplayEvent) { received = append(received, event) }); err != nil {
+		t.Fatalf("SubscribeWithReplay: %v", err)
+	}
+	if len(received) != 1 || received[0].ID != "pointer" {
+		t.Fatalf("pointer TypeNamer event was not replayed: %+v", received)
+	}
+}
+
+func TestSubscribeRejectsPersistedTypeNameCollisions(t *testing.T) {
+	tests := []struct {
+		name      string
+		collision func(*EventBus) error
+	}{
+		{
+			name: "Subscribe",
+			collision: func(bus *EventBus) error {
+				return Subscribe(bus, func(collidingEventB) {})
+			},
+		},
+		{
+			name: "SubscribeContext",
+			collision: func(bus *EventBus) error {
+				return SubscribeContext(bus, func(context.Context, collidingEventB) {})
+			},
+		},
+		{
+			name: "SubscribeWithHandle",
+			collision: func(bus *EventBus) error {
+				_, err := SubscribeWithHandle(bus, func(collidingEventB) {})
+				return err
+			},
+		},
+		{
+			name: "SubscribeContextWithHandle",
+			collision: func(bus *EventBus) error {
+				_, err := SubscribeContextWithHandle(bus, func(context.Context, collidingEventB) {})
+				return err
+			},
+		},
+		{
+			name: "SubscribeWithReplay",
+			collision: func(bus *EventBus) error {
+				return SubscribeWithReplay(context.Background(), bus, "collision", func(collidingEventB) {})
+			},
+		},
+		{
+			name: "SubscribeContextWithReplay",
+			collision: func(bus *EventBus) error {
+				return SubscribeContextWithReplay(context.Background(), bus, "context-collision", func(context.Context, collidingEventB) {})
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			bus := New(WithStore(NewMemoryStore()))
+			if err := Subscribe(bus, func(collidingEventA) {}); err != nil {
+				t.Fatal(err)
+			}
+			err := tc.collision(bus)
+			if err == nil || !strings.Contains(err.Error(), "persisted event type name") ||
+				!strings.Contains(err.Error(), "distinct TypeNamer.EventTypeName") {
+				t.Fatalf("expected persisted-name collision error, got %v", err)
+			}
+			if got := HandlerCount[collidingEventB](bus); got != 0 {
+				t.Fatalf("collision registered %d handler(s)", got)
+			}
+		})
+	}
+}
+
+func TestSubscribeAllowsTypeNameCollisionsWithoutPersistence(t *testing.T) {
+	bus := New()
+	var aCalls, bCalls int
+	if err := Subscribe(bus, func(collidingEventA) { aCalls++ }); err != nil {
+		t.Fatal(err)
+	}
+	if err := Subscribe(bus, func(collidingEventB) { bCalls++ }); err != nil {
+		t.Fatalf("in-process subscriptions route by Go type and must not collide: %v", err)
+	}
+
+	Publish(bus, collidingEventA{})
+	Publish(bus, collidingEventB{})
+	if aCalls != 1 || bCalls != 1 {
+		t.Fatalf("in-process collision delivery = (%d, %d), want (1, 1)", aCalls, bCalls)
 	}
 }
 

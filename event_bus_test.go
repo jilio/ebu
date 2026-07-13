@@ -33,6 +33,10 @@ func (e CustomNamedEvent) EventTypeName() string {
 	return "custom.event.v1"
 }
 
+type customNamedView interface {
+	EventTypeName() string
+}
+
 // VersionedEvent implements TypeNamer with versioning
 type VersionedEvent struct {
 	Data string
@@ -113,6 +117,21 @@ func TestEventType(t *testing.T) {
 			name:     "pointer named event (TypeNamer on pointer receiver)",
 			event:    &PointerNamedEvent{Value: 42},
 			expected: "pointer.named.event",
+		},
+		{
+			name:     "typed nil pointer with pointer receiver",
+			event:    (*PointerNamedEvent)(nil),
+			expected: "pointer.named.event",
+		},
+		{
+			name:     "typed nil pointer with promoted value receiver",
+			event:    (*CustomNamedEvent)(nil),
+			expected: "custom.event.v1",
+		},
+		{
+			name:     "nil interface",
+			event:    nil,
+			expected: "nil",
 		},
 	}
 
@@ -425,6 +444,131 @@ func TestWithFilter(t *testing.T) {
 			t.Errorf("Expected 2 calls with filter that accepts all, got %d", callCount)
 		}
 	})
+
+	t.Run("FilterPanicIsolated", func(t *testing.T) {
+		var panicCalls, laterCalls int
+		bus := New(WithPanicHandler(func(event any, handlerType reflect.Type, recovered any) {
+			panicCalls++
+			if recovered != "filter failed" {
+				t.Errorf("recovered filter panic = %v", recovered)
+			}
+		}))
+		if err := Subscribe(bus, func(UserEvent) {
+			t.Fatal("handler ran after its filter panicked")
+		}, WithFilter(func(UserEvent) bool { panic("filter failed") })); err != nil {
+			t.Fatal(err)
+		}
+		if err := Subscribe(bus, func(UserEvent) { laterCalls++ }); err != nil {
+			t.Fatal(err)
+		}
+
+		Publish(bus, UserEvent{UserID: "1", Action: "test"})
+		if panicCalls != 1 || laterCalls != 1 {
+			t.Fatalf("filter panic isolation = panic:%d later:%d, want 1/1", panicCalls, laterCalls)
+		}
+	})
+
+	t.Run("InvalidInternalFilterFailsClosed", func(t *testing.T) {
+		h := &internalHandler{filter: 42}
+		matches, err := callFilter(h, UserEvent{}, nil)
+		if err != nil || matches {
+			t.Fatalf("invalid internal filter = matches:%v err:%v, want false/nil", matches, err)
+		}
+	})
+
+	t.Run("TypedNilFilterRejected", func(t *testing.T) {
+		tests := []struct {
+			name      string
+			subscribe func(*EventBus) error
+		}{
+			{
+				name: "payload",
+				subscribe: func(bus *EventBus) error {
+					return Subscribe(bus, func(UserEvent) {}, WithFilter[UserEvent](nil))
+				},
+			},
+			{
+				name: "context",
+				subscribe: func(bus *EventBus) error {
+					return SubscribeContext(bus, func(context.Context, UserEvent) {}, WithFilter[UserEvent](nil))
+				},
+			},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				bus := New()
+				err := tt.subscribe(bus)
+				if err == nil || !strings.Contains(err.Error(), "filter predicate cannot be nil") {
+					t.Fatalf("typed-nil filter error = %v", err)
+				}
+				if got := HandlerCount[UserEvent](bus); got != 0 {
+					t.Fatalf("typed-nil filter registered %d handler(s)", got)
+				}
+			})
+		}
+	})
+}
+
+func TestPublishThroughInterfaceUsesConcreteHandlerAdapters(t *testing.T) {
+	store := NewMemoryStore()
+	bus := New(WithStore(store), WithAsyncHandlerLimit(1))
+	type contextKey string
+
+	var mu sync.Mutex
+	var payloadIDs, contextIDs []string
+	var filterCalls atomic.Int32
+	var asyncOnceCalls atomic.Int32
+	if err := Subscribe(bus, func(event CustomNamedEvent) {
+		mu.Lock()
+		payloadIDs = append(payloadIDs, event.ID)
+		mu.Unlock()
+	}, WithFilter(func(event CustomNamedEvent) bool {
+		filterCalls.Add(1)
+		return event.ID != "filtered"
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if err := SubscribeContext(bus, func(ctx context.Context, event CustomNamedEvent) {
+		if ctx.Value(contextKey("source")) == nil {
+			t.Error("context handler lost the publish context")
+		}
+		mu.Lock()
+		contextIDs = append(contextIDs, event.ID)
+		mu.Unlock()
+	}, Sequential()); err != nil {
+		t.Fatal(err)
+	}
+	if err := Subscribe(bus, func(CustomNamedEvent) {
+		asyncOnceCalls.Add(1)
+	}, Async(), Once()); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.WithValue(context.Background(), contextKey("source"), "interface-test")
+	var throughAny any = CustomNamedEvent{ID: "any"}
+	PublishContext(bus, ctx, throughAny)
+	var throughCustom customNamedView = CustomNamedEvent{ID: "custom-interface"}
+	PublishContext(bus, ctx, throughCustom)
+	bus.Wait()
+
+	mu.Lock()
+	gotPayload := append([]string(nil), payloadIDs...)
+	gotContext := append([]string(nil), contextIDs...)
+	mu.Unlock()
+	want := []string{"any", "custom-interface"}
+	if !reflect.DeepEqual(gotPayload, want) || !reflect.DeepEqual(gotContext, want) {
+		t.Fatalf("interface delivery = payload:%v context:%v, want %v", gotPayload, gotContext, want)
+	}
+	if filterCalls.Load() != 2 || asyncOnceCalls.Load() != 1 {
+		t.Fatalf("interface options = filter:%d async-once:%d, want 2/1", filterCalls.Load(), asyncOnceCalls.Load())
+	}
+	events, _, err := store.Read(context.Background(), OffsetOldest, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 || events[0].Type != "custom.event.v1" || events[1].Type != "custom.event.v1" {
+		t.Fatalf("persisted interface events = %#v", events)
+	}
 }
 
 func TestAsyncSubscribe(t *testing.T) {
@@ -568,6 +712,26 @@ func TestClearAll(t *testing.T) {
 	}
 	if orderCalled {
 		t.Error("Order handler was called after ClearAll")
+	}
+}
+
+func TestSignalReplayMarkersStillWakesWithCancelledPublishContext(t *testing.T) {
+	bus := New()
+	var calls int
+	marker := &internalHandler{
+		eventType: reflect.TypeOf(OrderEvent{}),
+		internalDelivery: func(context.Context, any) error {
+			calls++
+			return nil
+		},
+	}
+	bus.registerReplayMarker(marker)
+	defer bus.unregisterReplayMarker(marker)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	signalReplayMarkers(bus, ctx, "eventbus.UserEvent", UserEvent{})
+	if calls != 1 {
+		t.Fatalf("cancelled publish woke %d replay marker(s), want 1", calls)
 	}
 }
 

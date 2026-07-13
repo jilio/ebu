@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
@@ -57,8 +58,9 @@ type NotificationSentEvent struct {
 func main() {
 	ctx := context.Background()
 
-	// Setup OpenTelemetry
-	shutdown, err := setupOTel(ctx)
+	// Create observability and keep the exact providers it uses so they can be
+	// flushed and shut down when the generator exits.
+	obs, shutdown, err := setupObservability(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -67,12 +69,6 @@ func main() {
 			log.Printf("Error shutting down: %v", err)
 		}
 	}()
-
-	// Create event bus with observability
-	obs, err := createObservability()
-	if err != nil {
-		log.Fatal(err)
-	}
 
 	bus := eventbus.New(eventbus.WithObservability(obs))
 
@@ -100,7 +96,7 @@ func main() {
 	log.Println("✅ Shutdown complete")
 }
 
-func setupOTel(ctx context.Context) (func(context.Context) error, error) {
+func setupObservability(ctx context.Context) (*otel.Observability, func(context.Context) error, error) {
 	// Setup resource
 	res, err := resource.Merge(
 		resource.Default(),
@@ -111,7 +107,7 @@ func setupOTel(ctx context.Context) (func(context.Context) error, error) {
 		),
 	)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Setup trace exporter
@@ -120,7 +116,7 @@ func setupOTel(ctx context.Context) (func(context.Context) error, error) {
 		otlptracehttp.WithEndpoint(getOTelEndpoint()),
 	)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	tracerProvider := sdktrace.NewTracerProvider(
@@ -134,7 +130,8 @@ func setupOTel(ctx context.Context) (func(context.Context) error, error) {
 		otlpmetrichttp.WithEndpoint(getOTelEndpoint()),
 	)
 	if err != nil {
-		return nil, err
+		shutdownErr := shutdownOTelProviders(ctx, tracerProvider.Shutdown)
+		return nil, nil, errors.Join(err, shutdownErr)
 	}
 
 	meterProvider := sdkmetric.NewMeterProvider(
@@ -142,16 +139,29 @@ func setupOTel(ctx context.Context) (func(context.Context) error, error) {
 		sdkmetric.WithResource(res),
 	)
 
-	// Return cleanup function
-	return func(ctx context.Context) error {
-		if err := tracerProvider.Shutdown(ctx); err != nil {
-			return err
-		}
-		if err := meterProvider.Shutdown(ctx); err != nil {
-			return err
-		}
-		return nil
-	}, nil
+	obs, err := otel.New(
+		otel.WithTracerProvider(tracerProvider),
+		otel.WithMeterProvider(meterProvider),
+	)
+	if err != nil {
+		shutdownErr := shutdownOTelProviders(ctx, meterProvider.Shutdown, tracerProvider.Shutdown)
+		return nil, nil, errors.Join(err, shutdownErr)
+	}
+
+	shutdown := func(ctx context.Context) error {
+		return shutdownOTelProviders(ctx, meterProvider.Shutdown, tracerProvider.Shutdown)
+	}
+	return obs, shutdown, nil
+}
+
+// shutdownOTelProviders attempts every shutdown even if an earlier provider
+// fails, so one exporter cannot prevent the other from flushing and closing.
+func shutdownOTelProviders(ctx context.Context, shutdowns ...func(context.Context) error) error {
+	var errs []error
+	for _, shutdown := range shutdowns {
+		errs = append(errs, shutdown(ctx))
+	}
+	return errors.Join(errs...)
 }
 
 func getOTelEndpoint() string {
@@ -164,51 +174,6 @@ func getOTelEndpoint() string {
 		endpoint = endpoint[7:]
 	}
 	return endpoint
-}
-
-func createObservability() (*otel.Observability, error) {
-	ctx := context.Background()
-
-	// Setup trace exporter
-	traceExporter, err := otlptracehttp.New(ctx,
-		otlptracehttp.WithInsecure(),
-		otlptracehttp.WithEndpoint(getOTelEndpoint()),
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	res, _ := resource.Merge(
-		resource.Default(),
-		resource.NewWithAttributes(
-			semconv.SchemaURL,
-			semconv.ServiceName("ebu-load-generator"),
-		),
-	)
-
-	tracerProvider := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(traceExporter),
-		sdktrace.WithResource(res),
-	)
-
-	// Setup metric exporter
-	metricExporter, err := otlpmetrichttp.New(ctx,
-		otlpmetrichttp.WithInsecure(),
-		otlpmetrichttp.WithEndpoint(getOTelEndpoint()),
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	meterProvider := sdkmetric.NewMeterProvider(
-		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(metricExporter)),
-		sdkmetric.WithResource(res),
-	)
-
-	return otel.New(
-		otel.WithTracerProvider(tracerProvider),
-		otel.WithMeterProvider(meterProvider),
-	)
 }
 
 func registerHandlers(bus *eventbus.EventBus) {

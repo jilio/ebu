@@ -69,7 +69,11 @@
 // materializer never advances its offset past an event whose store write
 // failed. Several collections may share one Store: entities are keyed by
 // "entityType/key" and every collection operation is scoped to its own
-// prefix.
+// prefix. CompositeKey percent-encodes '%' and '/' inside each component, so
+// an entity type such as "tenant/user" cannot overlap type "tenant" with key
+// "user/...". Existing materialized stores that used reserved characters in
+// either component should be rebuilt from a complete event log or migrated to
+// the encoded keys; do not discard the only legacy copy after log compaction.
 //
 // # Mixed Streams and Routing
 //
@@ -103,6 +107,23 @@
 //	if tr, ok := bus.GetStore().(eventbus.EventStoreTruncator); ok {
 //	    tr.TruncateBefore(ctx, offset) // offset the snapshot was saved at
 //	}
+//
+// Snapshots carry an explicit format version and composite-key codec, and every
+// encoded key is validated before restore. Legacy versionless snapshots remain
+// readable when their entity types and keys use no reserved '%' or '/'
+// characters (their stored keys are unchanged). A legacy snapshot containing
+// either character is rejected before state or the resume offset changes. If
+// complete source history remains, discard it and rebuild from OffsetOldest;
+// if the history was already compacted, preserve and explicitly migrate the
+// snapshot before loading. Never compact the source history until the migrated
+// snapshot has been saved durably.
+//
+// Register every collection before loading a snapshot. Loading rejects a
+// snapshot that lacks any currently registered collection, because resuming at
+// its offset would skip that projection's earlier events. Extra collections in
+// an older snapshot are harmless and ignored. When adding a collection, rebuild
+// from OffsetOldest if complete history remains; after compaction, migrate the
+// snapshot to include the new collection before loading it.
 //
 // Truncation is only safe once the snapshot is durably saved and no other
 // reader or subscription still needs the truncated prefix.

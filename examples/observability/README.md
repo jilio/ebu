@@ -44,7 +44,9 @@ This example demonstrates comprehensive observability for the EBU event bus usin
 ### Prerequisites
 
 - Docker and Docker Compose
-- Go 1.24+ (for local development)
+- Go 1.25.12+ for repository workspace development and standalone example
+  builds. This keeps the runnable telemetry binaries on the patched Go 1.25
+  toolchain.
 
 ### Running the Stack
 

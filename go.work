@@ -1,4 +1,4 @@
-go 1.25.1
+go 1.25.12
 
 // Local development across the ebu module and its sub-modules. External
 // importers ignore go.work and resolve each module by its go.mod require
@@ -6,6 +6,8 @@ go 1.25.1
 // sum file breaks workspace resolution of the local modules.
 use (
 	.
+	./examples/observability
+	./examples/observability/generator
 	./otel
 	./stores/durablestream
 	./stores/sqlite

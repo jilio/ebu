@@ -359,6 +359,16 @@ func (s *Store) Read(ctx context.Context, from eventbus.Offset, limit int) ([]*e
 	}
 }
 
+// CompareOffsets orders two concrete, server-issued offsets using the Durable
+// Streams protocol's lexicographic ordering rule. OffsetNewest is an ebu query
+// sentinel rather than a protocol offset and cannot be compared.
+func (*Store) CompareOffsets(left, right eventbus.Offset) (int, error) {
+	if left == eventbus.OffsetNewest || right == eventbus.OffsetNewest {
+		return 0, fmt.Errorf("durablestream: cannot compare symbolic offset %q", eventbus.OffsetNewest)
+	}
+	return durablestream.Offset(left).Compare(durablestream.Offset(right)), nil
+}
+
 // decodeChunk converts one read result into StoredEvents, assigning each a
 // resume-safe offset (see Read's offset semantics). chunkStart is the offset
 // the chunk was read from; allEmbedded reports whether every event carried

@@ -2,6 +2,7 @@ package eventbus
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"iter"
@@ -287,6 +288,56 @@ func TestSubscribeWithReplay(t *testing.T) {
 	}
 }
 
+func TestSubscribeContextWithReplayCarriesEnvelope(t *testing.T) {
+	store := NewMemoryStore()
+	publisher := New(WithStore(store))
+
+	firstCtx := ContextWithMetadata(context.Background(), map[string]string{"phase": "replay"})
+	PublishContext(publisher, firstCtx, TestEvent{ID: 1})
+	stored, _, err := store.Read(context.Background(), OffsetOldest, 0)
+	if err != nil || len(stored) != 1 {
+		t.Fatalf("read first stored event: count=%d err=%v", len(stored), err)
+	}
+
+	type observation struct {
+		eventID  int
+		envelope string
+		offset   Offset
+		metadata string
+	}
+	var observations []observation
+	subscriber := New(WithStore(store))
+	err = SubscribeContextWithReplay(context.Background(), subscriber, "context-replay",
+		func(ctx context.Context, event TestEvent) {
+			envelope, _ := EventIDFromContext(ctx)
+			offset, _ := OffsetFromContext(ctx)
+			metadata, _ := MetadataFromContext(ctx)
+			observations = append(observations, observation{
+				eventID:  event.ID,
+				envelope: envelope,
+				offset:   offset,
+				metadata: metadata["phase"],
+			})
+		})
+	if err != nil {
+		t.Fatalf("SubscribeContextWithReplay: %v", err)
+	}
+
+	secondCtx := ContextWithMetadata(context.Background(), map[string]string{"phase": "live"})
+	PublishContext(subscriber, secondCtx, TestEvent{ID: 2})
+	if len(observations) != 2 {
+		t.Fatalf("expected replay and live observations, got %+v", observations)
+	}
+	if got := observations[0]; got.eventID != 1 || got.envelope != stored[0].ID ||
+		got.offset != stored[0].Offset || got.metadata != "replay" {
+		t.Errorf("replay context lost envelope: %+v (stored=%+v)", got, stored[0])
+	}
+	if got := observations[1]; got.eventID != 2 || got.envelope == "" ||
+		got.offset == OffsetOldest || got.metadata != "live" {
+		t.Errorf("live context lost envelope: %+v", got)
+	}
+}
+
 // TestSubscribeWithReplayResume tests resuming from saved offset
 func TestSubscribeWithReplayResume(t *testing.T) {
 	store := NewMemoryStore()
@@ -496,6 +547,130 @@ func TestMemoryStore(t *testing.T) {
 	}
 }
 
+func TestMemoryStoreOwnershipIsolation(t *testing.T) {
+	assertOriginal := func(t *testing.T, event *StoredEvent, offset Offset) {
+		t.Helper()
+		if event.Offset != offset || event.ID != "event-id" || event.Origin != "origin-id" || event.Type != "owned.event" {
+			t.Fatalf("stored envelope was mutated: %+v", event)
+		}
+		if got := string(event.Data); got != `{"value":"original"}` {
+			t.Fatalf("stored data = %q, want original payload", got)
+		}
+		if !reflect.DeepEqual(event.Metadata, map[string]string{"tenant": "original", "keep": "yes"}) {
+			t.Fatalf("stored metadata = %v, want original map", event.Metadata)
+		}
+	}
+
+	newEvent := func() *Event {
+		return &Event{
+			ID:        "event-id",
+			Origin:    "origin-id",
+			Type:      "owned.event",
+			Data:      json.RawMessage(`{"value":"original"}`),
+			Metadata:  map[string]string{"tenant": "original", "keep": "yes"},
+			Timestamp: time.Unix(123, 0),
+		}
+	}
+
+	t.Run("append owns caller data and metadata", func(t *testing.T) {
+		store := NewMemoryStore()
+		input := newEvent()
+		offset, err := store.Append(context.Background(), input)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		input.ID = "mutated-id"
+		input.Type = "mutated.type"
+		input.Data[2] = 'X'
+		input.Metadata["tenant"] = "mutated"
+		delete(input.Metadata, "keep")
+		input.Metadata["added"] = "later"
+
+		events, _, err := store.Read(context.Background(), OffsetOldest, 1)
+		if err != nil || len(events) != 1 {
+			t.Fatalf("Read() = %d events, err=%v", len(events), err)
+		}
+		assertOriginal(t, events[0], offset)
+	})
+
+	t.Run("batched read owns returned envelope", func(t *testing.T) {
+		store := NewMemoryStore()
+		firstOffset, err := store.Append(context.Background(), newEvent())
+		if err != nil {
+			t.Fatal(err)
+		}
+		secondOffset, err := store.Append(context.Background(), newEvent())
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		events, _, err := store.Read(context.Background(), OffsetOldest, 2)
+		if err != nil || len(events) != 2 {
+			t.Fatalf("first Read() = %d events, err=%v", len(events), err)
+		}
+		events[0].Offset = "mutated-offset"
+		events[0].ID = "mutated-id"
+		events[0].Origin = "mutated-origin"
+		events[0].Type = "mutated.type"
+		events[0].Data[2] = 'X'
+		events[0].Metadata["tenant"] = "mutated"
+		delete(events[0].Metadata, "keep")
+		assertOriginal(t, events[1], secondOffset)
+
+		again, _, err := store.Read(context.Background(), OffsetOldest, 2)
+		if err != nil || len(again) != 2 {
+			t.Fatalf("second Read() = %d events, err=%v", len(again), err)
+		}
+		if again[0] == events[0] {
+			t.Fatal("Read returned the store-backed StoredEvent pointer twice")
+		}
+		assertOriginal(t, again[0], firstOffset)
+		assertOriginal(t, again[1], secondOffset)
+	})
+
+	t.Run("stream owns returned envelope", func(t *testing.T) {
+		store := NewMemoryStore()
+		offset, err := store.Append(context.Background(), newEvent())
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var first *StoredEvent
+		for event, streamErr := range store.ReadStream(context.Background(), OffsetOldest) {
+			if streamErr != nil {
+				t.Fatal(streamErr)
+			}
+			first = event
+			break
+		}
+		if first == nil {
+			t.Fatal("first ReadStream returned no event")
+		}
+		first.Offset = "mutated-offset"
+		first.ID = "mutated-id"
+		first.Type = "mutated.type"
+		first.Data[2] = 'X'
+		first.Metadata["tenant"] = "mutated"
+
+		var again *StoredEvent
+		for event, streamErr := range store.ReadStream(context.Background(), OffsetOldest) {
+			if streamErr != nil {
+				t.Fatal(streamErr)
+			}
+			again = event
+			break
+		}
+		if again == nil {
+			t.Fatal("second ReadStream returned no event")
+		}
+		if again == first {
+			t.Fatal("ReadStream returned its prior mutable StoredEvent pointer")
+		}
+		assertOriginal(t, again, offset)
+	})
+}
+
 // TestPersistEventWithNilStore tests defensive check in persistEvent
 func TestPersistEventWithNilStore(t *testing.T) {
 	// Create bus with store first to set up the hook
@@ -542,6 +717,66 @@ type errorStore struct {
 	failAppend bool
 }
 
+type configurableCheckpointStore struct {
+	*errorStore
+	offset Offset
+}
+
+func (s *configurableCheckpointStore) LoadOffset(context.Context, string) (Offset, error) {
+	return s.offset, nil
+}
+
+type loadErrorSubscriptionStore struct{}
+
+func (*loadErrorSubscriptionStore) SaveOffset(context.Context, string, Offset) error {
+	return nil
+}
+
+func (*loadErrorSubscriptionStore) LoadOffset(context.Context, string) (Offset, error) {
+	return OffsetOldest, errors.New("subscription database unavailable")
+}
+
+func TestSubscribeWithReplayLoadOffsetErrorIsFatal(t *testing.T) {
+	store := NewMemoryStore()
+	bus := New(WithStore(store), WithSubscriptionStore(&loadErrorSubscriptionStore{}))
+	Publish(bus, TestEvent{ID: 1})
+
+	var received int
+	err := SubscribeWithReplay(context.Background(), bus, "load-failure", func(TestEvent) {
+		received++
+	})
+	if err == nil || !strings.Contains(err.Error(), "load offset") ||
+		!strings.Contains(err.Error(), "subscription database unavailable") {
+		t.Fatalf("expected LoadOffset failure, got %v", err)
+	}
+	if received != 0 {
+		t.Fatalf("LoadOffset failure replayed %d event(s)", received)
+	}
+	if got := HandlerCount[TestEvent](bus); got != 0 {
+		t.Fatalf("LoadOffset failure registered %d live handler(s)", got)
+	}
+}
+
+func TestSubscribeWithReplayRejectsSymbolicSavedOffset(t *testing.T) {
+	store := &configurableCheckpointStore{errorStore: &errorStore{}, offset: OffsetNewest}
+	bus := New(WithStore(store))
+	var calls int
+	err := SubscribeWithReplay(context.Background(), bus, "symbolic-checkpoint", func(TestEvent) { calls++ })
+	if err == nil || !strings.Contains(err.Error(), "not a durable checkpoint") {
+		t.Fatalf("symbolic checkpoint error = %v", err)
+	}
+	if calls != 0 || HandlerCount[TestEvent](bus) != 0 {
+		t.Fatalf("symbolic checkpoint side effects = calls:%d handlers:%d", calls, HandlerCount[TestEvent](bus))
+	}
+
+	// Rejection happens before replay and must release the provisional ID/type
+	// reservations so a corrected checkpoint can be retried on the same bus.
+	store.offset = OffsetOldest
+	if err := SubscribeWithReplay(context.Background(), bus, "symbolic-checkpoint", func(TestEvent) { calls++ }); err != nil {
+		t.Fatalf("retry after corrected checkpoint: %v", err)
+	}
+}
+
 func (e *errorStore) Append(ctx context.Context, event *Event) (Offset, error) {
 	if e.failAppend {
 		return "", errors.New("append failed")
@@ -552,6 +787,9 @@ func (e *errorStore) Append(ctx context.Context, event *Event) (Offset, error) {
 func (e *errorStore) Read(ctx context.Context, from Offset, limit int) ([]*StoredEvent, Offset, error) {
 	if e.failRead {
 		return nil, "", errors.New("read failed")
+	}
+	if from == OffsetNewest {
+		return nil, OffsetOldest, nil
 	}
 	return []*StoredEvent{}, from, nil
 }
@@ -1254,6 +1492,99 @@ func (s *nonStreamingStoreWithReadError) LoadOffset(ctx context.Context, subscri
 	return OffsetOldest, nil
 }
 
+type replayNewestFixture struct {
+	read func(context.Context, Offset, int) ([]*StoredEvent, Offset, error)
+}
+
+func (*replayNewestFixture) Append(context.Context, *Event) (Offset, error) {
+	return OffsetOldest, errors.New("append unsupported")
+}
+
+func (s *replayNewestFixture) Read(ctx context.Context, from Offset, limit int) ([]*StoredEvent, Offset, error) {
+	return s.read(ctx, from, limit)
+}
+
+func TestReplayOffsetNewestResolvesOnceAndTerminates(t *testing.T) {
+	t.Run("pre-cancelled", func(t *testing.T) {
+		var reads int
+		store := &replayNewestFixture{read: func(context.Context, Offset, int) ([]*StoredEvent, Offset, error) {
+			reads++
+			return nil, OffsetOldest, nil
+		}}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		err := New(WithStore(store)).Replay(ctx, OffsetNewest, func(*StoredEvent) error { return nil })
+		if !errors.Is(err, context.Canceled) || reads != 0 {
+			t.Fatalf("pre-cancelled replay = err:%v reads:%d", err, reads)
+		}
+	})
+
+	t.Run("read failure", func(t *testing.T) {
+		store := &replayNewestFixture{read: func(context.Context, Offset, int) ([]*StoredEvent, Offset, error) {
+			return nil, OffsetOldest, errors.New("tail unavailable")
+		}}
+		err := New(WithStore(store)).Replay(context.Background(), OffsetNewest, func(*StoredEvent) error { return nil })
+		if err == nil || !strings.Contains(err.Error(), "tail unavailable") {
+			t.Fatalf("tail read error = %v", err)
+		}
+	})
+
+	t.Run("cancellation during read", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		store := &replayNewestFixture{read: func(context.Context, Offset, int) ([]*StoredEvent, Offset, error) {
+			cancel()
+			return nil, OffsetOldest, nil
+		}}
+		err := New(WithStore(store)).Replay(ctx, OffsetNewest, func(*StoredEvent) error { return nil })
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancellation after tail read = %v", err)
+		}
+	})
+
+	for _, tc := range []struct {
+		name      string
+		events    []*StoredEvent
+		next      Offset
+		wantError string
+	}{
+		{name: "history returned", events: []*StoredEvent{{Offset: "tail"}}, next: "tail", wantError: "returned 1 event(s)"},
+		{name: "symbolic tail", next: OffsetNewest, wantError: "returned symbolic offset"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &replayNewestFixture{read: func(context.Context, Offset, int) ([]*StoredEvent, Offset, error) {
+				return tc.events, tc.next, nil
+			}}
+			err := New(WithStore(store)).Replay(context.Background(), OffsetNewest, func(*StoredEvent) error { return nil })
+			if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("invalid tail error = %v, want %q", err, tc.wantError)
+			}
+		})
+	}
+
+	t.Run("concurrent append is outside replay boundary", func(t *testing.T) {
+		var reads, handled int
+		store := &replayNewestFixture{read: func(_ context.Context, from Offset, limit int) ([]*StoredEvent, Offset, error) {
+			reads++
+			if reads == 1 {
+				if from != OffsetNewest || limit != 0 {
+					t.Fatalf("tail resolution = Read(%q, %d)", from, limit)
+				}
+				return nil, "captured-tail", nil
+			}
+			return []*StoredEvent{{Offset: "later"}}, "later", nil
+		}}
+		if err := New(WithStore(store)).Replay(context.Background(), OffsetNewest, func(*StoredEvent) error {
+			handled++
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if reads != 1 || handled != 0 {
+			t.Fatalf("moving-tail replay = reads:%d handled:%d, want 1/0", reads, handled)
+		}
+	})
+}
+
 // TestReplayNonStreamingReadError tests Read error for non-streaming stores
 func TestReplayNonStreamingReadError(t *testing.T) {
 	store := &nonStreamingStoreWithReadError{}
@@ -1625,13 +1956,87 @@ func TestSubscribeWithReplayNilOption(t *testing.T) {
 // TestSubscribeWithReplayInterfaceType tests that interface event types are
 // rejected before the replay pass runs.
 func TestSubscribeWithReplayInterfaceType(t *testing.T) {
-	store := NewMemoryStore()
-	bus := New(WithStore(store))
+	tests := []struct {
+		name      string
+		subscribe func(*EventBus) error
+	}{
+		{
+			name: "payload TypeNamer interface",
+			subscribe: func(bus *EventBus) error {
+				return SubscribeWithReplay(context.Background(), bus, "iface-payload", func(TypeNamer) {})
+			},
+		},
+		{
+			name: "context TypeNamer interface",
+			subscribe: func(bus *EventBus) error {
+				return SubscribeContextWithReplay(context.Background(), bus, "iface-context", func(context.Context, TypeNamer) {})
+			},
+		},
+		{
+			name: "ordinary interface",
+			subscribe: func(bus *EventBus) error {
+				return SubscribeWithReplay(context.Background(), bus, "iface-stringer", func(fmt.Stringer) {})
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bus := New(WithStore(NewMemoryStore()))
+			err := tt.subscribe(bus)
+			if err == nil || !strings.Contains(err.Error(), "interface type") {
+				t.Fatalf("interface rejection = %v", err)
+			}
+			if got := HandlerCount[TypeNamer](bus); got != 0 {
+				t.Fatalf("interface validation registered %d handler(s)", got)
+			}
+		})
+	}
+}
 
-	err := SubscribeWithReplay(context.Background(), bus, "iface-sub",
-		func(e fmt.Stringer) {})
-	if err == nil || !strings.Contains(err.Error(), "interface type") {
-		t.Errorf("Expected interface type rejection, got: %v", err)
+func TestSubscribeWithReplayTypedNilFilterRejectedWithoutSideEffects(t *testing.T) {
+	tests := []struct {
+		name      string
+		subscribe func(*EventBus, string) error
+	}{
+		{
+			name: "payload",
+			subscribe: func(bus *EventBus, id string) error {
+				return SubscribeWithReplay(context.Background(), bus, id, func(TestEvent) {}, WithFilter[TestEvent](nil))
+			},
+		},
+		{
+			name: "context",
+			subscribe: func(bus *EventBus, id string) error {
+				return SubscribeContextWithReplay(context.Background(), bus, id, func(context.Context, TestEvent) {}, WithFilter[TestEvent](nil))
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewMemoryStore()
+			publisher := New(WithStore(store))
+			Publish(publisher, TestEvent{ID: 1})
+			bus := New(WithStore(store))
+			const id = "typed-nil-filter"
+			err := tt.subscribe(bus, id)
+			if err == nil || !strings.Contains(err.Error(), "filter predicate cannot be nil") {
+				t.Fatalf("typed-nil replay filter error = %v", err)
+			}
+			if got := HandlerCount[TestEvent](bus); got != 0 {
+				t.Fatalf("typed-nil replay filter registered %d handler(s)", got)
+			}
+			if _, found, loadErr := store.LookupOffset(context.Background(), id); loadErr != nil || found {
+				t.Fatalf("typed-nil replay filter checkpoint = found:%v err:%v", found, loadErr)
+			}
+
+			var calls int
+			if err := SubscribeWithReplay(context.Background(), bus, id, func(TestEvent) { calls++ }); err != nil {
+				t.Fatalf("retry after typed-nil validation: %v", err)
+			}
+			if calls != 1 {
+				t.Fatalf("retry deliveries = %d, want 1", calls)
+			}
+		})
 	}
 }
 
@@ -1781,6 +2186,81 @@ func TestSubscribeWithReplayOptionsAppliedOnce(t *testing.T) {
 	}
 }
 
+func TestSubscribeWithReplayRejectsNonDurableOptions(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opt  SubscribeOption
+	}{
+		{name: "async", opt: Async()},
+		{name: "once", opt: Once()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := NewMemoryStore()
+			bus := New(WithStore(store))
+			Publish(bus, TestEvent{ID: 1})
+
+			var received int
+			err := SubscribeWithReplay(context.Background(), bus, "unsupported-"+tc.name,
+				func(TestEvent) { received++ }, tc.opt)
+			if err == nil || !strings.Contains(err.Error(), "cannot be used with SubscribeWithReplay") {
+				t.Fatalf("expected unsupported option error, got %v", err)
+			}
+			if received != 0 || HandlerCount[TestEvent](bus) != 0 {
+				t.Fatalf("unsupported option had side effects: received=%d handlers=%d",
+					received, HandlerCount[TestEvent](bus))
+			}
+		})
+	}
+}
+
+func TestSubscribeWithReplayRecoversHistoricalHandlerPanic(t *testing.T) {
+	store := NewMemoryStore()
+	var recovered any
+	var observedStart bool
+	var observedError error
+	obs := &testObservability{
+		onHandlerStart: func(ctx context.Context, eventType string, async bool) context.Context {
+			if eventType != testEventTypeName() || async {
+				t.Errorf("historical handler start = (%q, async=%v)", eventType, async)
+			}
+			observedStart = true
+			return ctx
+		},
+		onHandlerComplete: func(_ context.Context, eventType string, _ time.Duration, err error) {
+			if eventType != testEventTypeName() {
+				t.Errorf("historical handler complete type = %q", eventType)
+			}
+			observedError = err
+		},
+	}
+	bus := New(
+		WithStore(store),
+		WithPanicHandler(func(_ any, _ reflect.Type, value any) { recovered = value }),
+		WithObservability(obs),
+	)
+	Publish(bus, TestEvent{ID: 1})
+
+	err := SubscribeWithReplay(context.Background(), bus, "panic-replay", func(TestEvent) {
+		panic("historical handler failed")
+	})
+	if err == nil || !strings.Contains(err.Error(), "handler panic: historical handler failed") {
+		t.Fatalf("expected recovered replay panic error, got %v", err)
+	}
+	if recovered != "historical handler failed" {
+		t.Fatalf("panic handler received %v", recovered)
+	}
+	if !observedStart || observedError == nil ||
+		!strings.Contains(observedError.Error(), "historical handler failed") {
+		t.Fatalf("historical handler observability = (started=%v, err=%v)", observedStart, observedError)
+	}
+	if HandlerCount[TestEvent](bus) != 0 {
+		t.Fatal("panicking replay handler was registered for live delivery")
+	}
+	if offset, loadErr := store.LoadOffset(context.Background(), "panic-replay"); loadErr != nil || offset != OffsetOldest {
+		t.Fatalf("panic advanced durable offset to %q (err=%v)", offset, loadErr)
+	}
+}
+
 // TestSubscribeWithReplayNilBusAndHandler verifies nil arguments return
 // errors like the other subscribe entry points instead of panicking.
 func TestSubscribeWithReplayNilBusAndHandler(t *testing.T) {
@@ -1796,6 +2276,11 @@ func TestSubscribeWithReplayNilBusAndHandler(t *testing.T) {
 	err = SubscribeWithReplay[TestEvent](context.Background(), bus, "nil-handler", nil)
 	if err == nil || !strings.Contains(err.Error(), "handler cannot be nil") {
 		t.Errorf("Expected nil handler error, got: %v", err)
+	}
+
+	err = SubscribeContextWithReplay[TestEvent](context.Background(), bus, "nil-context-handler", nil)
+	if err == nil || !strings.Contains(err.Error(), "handler cannot be nil") {
+		t.Errorf("Expected nil context handler error, got: %v", err)
 	}
 }
 
@@ -1929,6 +2414,36 @@ func TestMemoryStoreOffsetNewest(t *testing.T) {
 	})
 }
 
+func TestMemoryStoreCompareOffsets(t *testing.T) {
+	store := NewMemoryStore()
+	for _, tc := range []struct {
+		name    string
+		left    Offset
+		right   Offset
+		want    int
+		wantErr bool
+	}{
+		{name: "oldest before first", left: OffsetOldest, right: "00000000000000000001", want: -1},
+		{name: "equal", left: "00000000000000000001", right: "00000000000000000001", want: 0},
+		{name: "later after earlier", left: "00000000000000000002", right: "00000000000000000001", want: 1},
+		{name: "symbolic left", left: OffsetNewest, right: "00000000000000000001", wantErr: true},
+		{name: "symbolic right", left: "00000000000000000001", right: OffsetNewest, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := store.CompareOffsets(tc.left, tc.right)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("CompareOffsets(%q, %q) unexpectedly succeeded", tc.left, tc.right)
+				}
+				return
+			}
+			if err != nil || got != tc.want {
+				t.Fatalf("CompareOffsets(%q, %q) = (%d, %v), want (%d, nil)", tc.left, tc.right, got, err, tc.want)
+			}
+		})
+	}
+}
+
 // TestSubscribeWithReplaySequentialNoOverlap verifies that Sequential()
 // mutual exclusion holds during the replay passes: once the live
 // subscription registers (before the catch-up pass), a concurrent Publish
@@ -1970,9 +2485,25 @@ func TestSubscribeWithReplaySequentialNoOverlap(t *testing.T) {
 		}
 	}()
 
-	err := SubscribeWithReplay(context.Background(), bus, "seq-overlap", handler, Sequential())
+	subscribeDone := make(chan error, 1)
+	go func() {
+		subscribeDone <- SubscribeWithReplay(context.Background(), bus, "seq-overlap", handler, Sequential())
+	}()
+	var err error
+	select {
+	case err = <-subscribeDone:
+	case <-time.After(5 * time.Second):
+		close(stop)
+		wg.Wait()
+		t.Fatal("SubscribeWithReplay chased a continuously advancing local tail")
+	}
 	close(stop)
 	wg.Wait()
+	// Concurrent local publishes may still be in the tracked catch-up drain
+	// when setup returns. Clear drops that work and Wait proves no coordinator
+	// goroutine leaks into later tests.
+	Clear[TestEvent](bus)
+	bus.Wait()
 
 	if err != nil {
 		t.Fatalf("SubscribeWithReplay failed: %v", err)

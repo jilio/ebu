@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"sync"
 
@@ -126,11 +127,12 @@ func (c *TypedCollection[T]) Get(key string) (T, bool, error) {
 // keyPrefix returns the composite-key prefix that scopes this collection's
 // entities within its Store.
 func (c *TypedCollection[T]) keyPrefix() string {
-	return c.entityType + "/"
+	return CompositeKey(c.entityType, "")
 }
 
 // All returns all entities in this collection.
-// The keys in the returned map are composite keys (type/key).
+// The keys in the returned map are CompositeKey-encoded keys (type/key for
+// components without reserved characters).
 //
 // Only entities under this collection's type prefix are returned: several
 // collections may share one Store, and each must see (and mutate — see
@@ -521,9 +523,25 @@ func (m *Materializer) Replay(ctx context.Context, bus *eventbus.EventBus, from 
 	return bus.ReplayWithUpcast(ctx, from, m.Apply)
 }
 
+const (
+	materializerSnapshotVersion = 1
+	snapshotKeyCodecPercentV1   = "percent-v1"
+)
+
+// materializerSnapshot versions both the overall snapshot shape and the key
+// codec. Composite keys are persistent data: changing their encoding without
+// a marker would let a newer materializer accept an older snapshot, restore
+// unreachable keys, and then skip the compacted history covered by its offset.
+type materializerSnapshot struct {
+	Version     int                                   `json:"version"`
+	KeyCodec    string                                `json:"key_codec"`
+	Collections map[string]map[string]json.RawMessage `json:"collections"`
+}
+
 // SaveSnapshotTo serializes every registered collection and saves the result
 // to s under snapshotID, tagged with the offset of the last applied event.
-// The blob format is {"entityType": {"compositeKey": <entity JSON>}}.
+// The blob format is
+// {"version":1,"key_codec":"percent-v1","collections":{"entityType":{"compositeKey":<entity JSON>}}}.
 //
 // It returns an error if no event has been applied yet (LastOffset is empty):
 // such a snapshot would claim OffsetOldest, and a later TruncateBefore based
@@ -580,19 +598,111 @@ func (m *Materializer) captureSnapshot(snapshotID string) (eventbus.Offset, json
 		return "", nil, fmt.Errorf("state: refusing to save snapshot %q: no events applied yet (snapshot would claim OffsetOldest)", snapshotID)
 	}
 
-	blob := make(map[string]map[string]json.RawMessage, len(collections))
+	snapshot := materializerSnapshot{
+		Version:     materializerSnapshotVersion,
+		KeyCodec:    snapshotKeyCodecPercentV1,
+		Collections: make(map[string]map[string]json.RawMessage, len(collections)),
+	}
 	for entityType, c := range collections {
 		entities, err := c.snapshot()
 		if err != nil {
 			return "", nil, err
 		}
-		blob[entityType] = entities
+		snapshot.Collections[entityType] = entities
+	}
+	if err := validatePercentV1SnapshotKeys(snapshot.Collections); err != nil {
+		return "", nil, fmt.Errorf("state: refusing to save snapshot %q: %w", snapshotID, err)
 	}
 
-	// blob contains only string keys and json.RawMessage values produced by
+	// snapshot contains only string keys and json.RawMessage values produced by
 	// json.Marshal, so encoding cannot fail.
-	encoded, _ := json.Marshal(blob)
+	encoded, _ := json.Marshal(snapshot)
 	return offset, encoded, nil
+}
+
+// decodeSnapshotCollections validates the snapshot/key-codec marker before
+// returning any data to the mutating restore path. Versionless snapshots are
+// the legacy type->composite-key map. They remain safe only when every entity
+// type and key excludes the reserved '%' and '/' characters, because those
+// composite keys are byte-for-byte identical under both codecs.
+func decodeSnapshotCollections(blob json.RawMessage) (map[string]map[string]json.RawMessage, error) {
+	var topLevel map[string]json.RawMessage
+	if err := json.Unmarshal(blob, &topLevel); err != nil {
+		return nil, fmt.Errorf("unmarshal snapshot envelope: %w", err)
+	}
+	if topLevel == nil {
+		return nil, fmt.Errorf("snapshot envelope must be a JSON object")
+	}
+
+	// A current snapshot has a scalar version. A legacy collection may itself
+	// be named "version"; its value is an object, so keep treating that shape as
+	// legacy rather than reserving a previously-valid entity type name.
+	if rawVersion, ok := topLevel["version"]; ok {
+		var legacyVersionCollection map[string]json.RawMessage
+		if err := json.Unmarshal(rawVersion, &legacyVersionCollection); err != nil {
+			var snapshot materializerSnapshot
+			if err := json.Unmarshal(blob, &snapshot); err != nil {
+				return nil, fmt.Errorf("unmarshal versioned snapshot: %w", err)
+			}
+			if snapshot.Version != materializerSnapshotVersion ||
+				snapshot.KeyCodec != snapshotKeyCodecPercentV1 || snapshot.Collections == nil {
+				return nil, fmt.Errorf("unsupported snapshot format version=%d key_codec=%q", snapshot.Version, snapshot.KeyCodec)
+			}
+			if err := validatePercentV1SnapshotKeys(snapshot.Collections); err != nil {
+				return nil, err
+			}
+			return snapshot.Collections, nil
+		}
+	}
+
+	var legacy map[string]map[string]json.RawMessage
+	if err := json.Unmarshal(blob, &legacy); err != nil {
+		return nil, fmt.Errorf("unmarshal legacy snapshot: %w", err)
+	}
+	if err := validateLegacySnapshotKeys(legacy); err != nil {
+		return nil, err
+	}
+	return legacy, nil
+}
+
+func validatePercentV1SnapshotKeys(collections map[string]map[string]json.RawMessage) error {
+	for entityType, entities := range collections {
+		if entities == nil {
+			return fmt.Errorf("versioned snapshot collection %q must be a JSON object, not null", entityType)
+		}
+		prefix := CompositeKey(entityType, "")
+		for compositeKey := range entities {
+			if !strings.HasPrefix(compositeKey, prefix) || strings.Count(compositeKey, "/") != 1 {
+				return fmt.Errorf("versioned snapshot composite key %q does not match collection %q under key codec %q", compositeKey, entityType, snapshotKeyCodecPercentV1)
+			}
+
+			encodedKey := strings.TrimPrefix(compositeKey, prefix)
+			decodedKey, err := url.PathUnescape(encodedKey)
+			if err != nil || encodeKeyComponent(decodedKey) != encodedKey {
+				return fmt.Errorf("versioned snapshot composite key %q is not canonical under key codec %q", compositeKey, snapshotKeyCodecPercentV1)
+			}
+		}
+	}
+	return nil
+}
+
+func validateLegacySnapshotKeys(collections map[string]map[string]json.RawMessage) error {
+	for entityType, entities := range collections {
+		if entities == nil {
+			return fmt.Errorf("legacy snapshot collection %q must be a JSON object, not null", entityType)
+		}
+		if strings.ContainsAny(entityType, "%/") {
+			return fmt.Errorf("legacy snapshot entity type %q uses a reserved key-codec character; migrate it explicitly, or discard and rebuild from OffsetOldest only if the complete source history is still available", entityType)
+		}
+		prefix := entityType + "/"
+		for compositeKey := range entities {
+			key, ok := strings.CutPrefix(compositeKey, prefix)
+			if !ok || strings.ContainsAny(key, "%/") {
+				return fmt.Errorf("legacy snapshot composite key %q in collection %q is unsafe under key codec %q; migrate it explicitly, or discard and rebuild from OffsetOldest only if the complete source history is still available", compositeKey, entityType, snapshotKeyCodecPercentV1)
+			}
+		}
+	}
+	return nil
 }
 
 // LoadSnapshotFrom restores the materializer from the snapshot saved under
@@ -607,10 +717,20 @@ func (m *Materializer) captureSnapshot(snapshotID string) (eventbus.Offset, json
 // When no snapshot exists it returns OffsetOldest with the collections
 // untouched, so the caller's Replay naturally rebuilds from the beginning.
 // Snapshot data for entity types with no registered collection is dropped
-// silently.
+// silently. A snapshot that omits any currently registered collection is
+// rejected before mutation: accepting its offset would skip the omitted
+// projection's earlier history, permanently so if that history was compacted.
+// Register every collection before loading, and explicitly migrate an older
+// snapshot when adding a collection. Versionless snapshots from the legacy
+// composite-key codec are accepted only when all entity types and keys contain
+// neither '%' nor '/'; otherwise loading fails before any collection or
+// LastOffset is changed. Versioned snapshots are likewise rejected before
+// mutation unless every composite key is canonical for its declared key codec
+// and collection.
 //
-// If restoring fails, the materializer is left empty with LastOffset reset to
-// OffsetOldest, so a full replay from OffsetOldest rebuilds the state.
+// If validation succeeds but mutating restore then fails, the materializer is
+// left empty with LastOffset reset to OffsetOldest, so a full replay from
+// OffsetOldest rebuilds the state.
 func (m *Materializer) LoadSnapshotFrom(ctx context.Context, s eventbus.EventStoreSnapshotter, snapshotID string) (eventbus.Offset, error) {
 	m.applyMu.Lock()
 	defer m.applyMu.Unlock()
@@ -623,13 +743,18 @@ func (m *Materializer) LoadSnapshotFrom(ctx context.Context, s eventbus.EventSto
 		return eventbus.OffsetOldest, nil // No snapshot: replay from the beginning.
 	}
 
-	var decoded map[string]map[string]json.RawMessage
-	if err := json.Unmarshal(blob, &decoded); err != nil {
-		return eventbus.OffsetOldest, fmt.Errorf("state: unmarshal snapshot %q: %w", snapshotID, err)
+	decoded, err := decodeSnapshotCollections(blob)
+	if err != nil {
+		return eventbus.OffsetOldest, fmt.Errorf("state: decode snapshot %q: %w", snapshotID, err)
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	for entityType := range m.collections {
+		if _, ok := decoded[entityType]; !ok {
+			return eventbus.OffsetOldest, fmt.Errorf("state: snapshot %q is missing registered collection %q; rebuild from OffsetOldest only if the complete source history is available, or migrate the snapshot before loading if history was compacted", snapshotID, entityType)
+		}
+	}
 
 	// clearAll empties every registered collection; on restore failure it
 	// leaves the materializer empty rather than partially restored, so a

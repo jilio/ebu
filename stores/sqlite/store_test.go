@@ -428,6 +428,40 @@ func TestSubscriptionOffset(t *testing.T) {
 
 	ctx := context.Background()
 
+	t.Run("lookup distinguishes missing from stored oldest", func(t *testing.T) {
+		offset, found, err := store.LookupOffset(ctx, "lookup-oldest")
+		if err != nil {
+			t.Fatalf("LookupOffset(missing) error = %v", err)
+		}
+		if found || offset != eventbus.OffsetOldest {
+			t.Fatalf("LookupOffset(missing) = (%q, %v), want (%q, false)", offset, found, eventbus.OffsetOldest)
+		}
+
+		if err := store.SaveOffset(ctx, "lookup-oldest", eventbus.OffsetOldest); err != nil {
+			t.Fatalf("SaveOffset(OffsetOldest) error = %v", err)
+		}
+		offset, found, err = store.LookupOffset(ctx, "lookup-oldest")
+		if err != nil {
+			t.Fatalf("LookupOffset(stored oldest) error = %v", err)
+		}
+		if !found || offset != paddedOffset(0) {
+			t.Fatalf("LookupOffset(stored oldest) = (%q, %v), want (%q, true)", offset, found, paddedOffset(0))
+		}
+	})
+
+	t.Run("lookup returns stored concrete offset", func(t *testing.T) {
+		if err := store.SaveOffset(ctx, "lookup-concrete", eventbus.Offset("42")); err != nil {
+			t.Fatalf("SaveOffset(concrete) error = %v", err)
+		}
+		offset, found, err := store.LookupOffset(ctx, "lookup-concrete")
+		if err != nil {
+			t.Fatalf("LookupOffset(concrete) error = %v", err)
+		}
+		if !found || offset != paddedOffset(42) {
+			t.Fatalf("LookupOffset(concrete) = (%q, %v), want (%q, true)", offset, found, paddedOffset(42))
+		}
+	})
+
 	t.Run("returns OffsetOldest for unknown subscription", func(t *testing.T) {
 		offset, err := store.LoadOffset(ctx, "unknown")
 		if err != nil {
@@ -492,6 +526,24 @@ func TestSubscriptionOffset(t *testing.T) {
 			t.Fatal("expected error for invalid offset")
 		}
 	})
+}
+
+func TestLookupOffsetClosedStore(t *testing.T) {
+	store, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close error = %v", err)
+	}
+
+	offset, found, err := store.LookupOffset(context.Background(), "projection")
+	if err == nil {
+		t.Fatal("LookupOffset on a closed store succeeded")
+	}
+	if found || offset != eventbus.OffsetOldest {
+		t.Fatalf("LookupOffset on closed store = (%q, %v, %v), want (%q, false, error)", offset, found, err, eventbus.OffsetOldest)
+	}
 }
 
 func TestOffsetNewest(t *testing.T) {
@@ -619,6 +671,38 @@ func TestOffsetNewest(t *testing.T) {
 			t.Fatal("expected error when database is closed")
 		}
 	})
+}
+
+func TestCompareOffsets(t *testing.T) {
+	store := &SQLiteStore{}
+	for _, tc := range []struct {
+		name    string
+		left    eventbus.Offset
+		right   eventbus.Offset
+		want    int
+		wantErr string
+	}{
+		{name: "oldest before first", left: eventbus.OffsetOldest, right: paddedOffset(1), want: -1},
+		{name: "legacy after padded", left: "10", right: paddedOffset(2), want: 1},
+		{name: "legacy equals padded", left: "2", right: paddedOffset(2), want: 0},
+		{name: "invalid left", left: "invalid", right: paddedOffset(2), wantErr: "parse left offset"},
+		{name: "invalid right", left: paddedOffset(2), right: "invalid", wantErr: "parse right offset"},
+		{name: "symbolic left", left: eventbus.OffsetNewest, right: paddedOffset(2), wantErr: "symbolic offset"},
+		{name: "symbolic right", left: paddedOffset(2), right: eventbus.OffsetNewest, wantErr: "symbolic offset"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := store.CompareOffsets(tc.left, tc.right)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("CompareOffsets(%q, %q) error = %v, want %q", tc.left, tc.right, err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil || got != tc.want {
+				t.Fatalf("CompareOffsets(%q, %q) = (%d, %v), want (%d, nil)", tc.left, tc.right, got, err, tc.want)
+			}
+		})
+	}
 }
 
 func TestConcurrentAccess(t *testing.T) {

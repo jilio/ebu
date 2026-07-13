@@ -422,7 +422,7 @@ func main() {
     }
 
     // Unsubscribe the handler
-    eventbus.Unsubscribe(bus, metricHandler)
+    eventbus.Unsubscribe[MetricEvent](bus, metricHandler)
 
     // This won't be handled
     eventbus.Publish(bus, MetricEvent{Name: "memory_usage", Value: 62.3})
@@ -453,7 +453,7 @@ eventType := eventbus.EventType(OrderCreatedEvent{})
 // Returns: "main.OrderCreatedEvent"
 
 // Useful in replay scenarios
-bus.Replay(ctx, 0, func(event *eventbus.StoredEvent) error {
+bus.Replay(ctx, eventbus.OffsetOldest, func(event *eventbus.StoredEvent) error {
     switch event.Type {
     case eventbus.EventType(OrderCreatedEvent{}):
         var order OrderCreatedEvent
@@ -549,7 +549,7 @@ func main() {
     bus.Wait()
 
     // Replay and handle different versions
-    bus.Replay(ctx, 0, func(event *eventbus.StoredEvent) error {
+    bus.Replay(ctx, eventbus.OffsetOldest, func(event *eventbus.StoredEvent) error {
         switch event.Type {
         case "user.created.v1":
             var v1 UserCreatedV1

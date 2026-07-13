@@ -83,6 +83,10 @@ bus := eventbus.New(eventbus.WithStore(store))
 // Note: All data is lost when the process exits
 ```
 
+`MemoryStore` owns its event envelopes: it copies mutable `Data` and `Metadata`
+on append and returns fresh copies from both `Read` and `ReadStream`. Reusing an
+input event or modifying a read result cannot rewrite its stored history.
+
 **When to use:**
 - Development and testing
 - Short-lived processes
@@ -120,23 +124,26 @@ The envelope makes at-least-once delivery workable in practice:
 - **`ID`** is a ULID minted once per publish, *before* the first `Append`
   attempt — a store that retries a failed append writes the same ID, so
   consumers can deduplicate on it. Handlers of live events can read it with
-  `EventIDFromContext(ctx)`.
+  `EventIDFromContext(ctx)`; context-aware resumable handlers get the same ID
+  through `SubscribeContextWithReplay`.
 - **`Origin`** is the publishing bus instance's unique ID (`bus.OriginID()`),
   letting consumers of a shared log tell their own events apart from a
   peer process's.
 - **`Metadata`** carries correlation/causation IDs or any other tags:
   attach with `ContextWithMetadata(ctx, map[string]string{...})` at publish,
   read back via `StoredEvent.Metadata` or `MetadataFromContext(ctx)` in
-  live handlers.
+  live and context-aware replay handlers.
 
 All three fields are optional on the wire (`omitempty`, nullable columns), so
 streams written by earlier ebu versions or external producers read back with
 empty envelope fields.
 
-`OffsetNewest` resolves, at call time, to the concrete current tail in every
-bundled store: reading from it returns no historical events and a concrete
-resumable offset, and `SaveOffset` persists the concrete tail rather than
-the symbolic `"$"`.
+`OffsetNewest` is a query sentinel, not a durable offset. Every `EventStore`
+must resolve it efficiently at call time: `Read` returns no historical events
+and returns the current concrete tail as `nextOffset` (or `OffsetOldest` for an
+empty stream), without scanning or returning the stream's history. Persist that
+concrete `nextOffset`, never the symbolic `"$"`. `ReadStream` likewise yields
+no events and terminates; live following belongs to `EventStoreTailer`.
 
 ## Available Storage Backends
 
@@ -270,6 +277,17 @@ bus.Replay(ctx, eventbus.OffsetOldest, func(event *eventbus.StoredEvent) error {
 })
 ```
 
+For any event written to durable storage, implement `TypeNamer` with an
+immutable, globally unique name. The default reflection name includes only
+the declared package name, not its full import path, so it may change during a
+refactor or collide with an unrelated package. A persistent bus rejects
+conflicting Go types across append attempts, subscriptions, and typed upcast
+endpoints. An `Append` error can be ambiguous—a remote store may commit before
+its acknowledgement is lost—so the bus retains that type's wire-name claim
+once the call is attempted. The same Go type can retry, but a colliding type is
+rejected for the bus's lifetime. This is per bus; producers in other processes
+must still coordinate globally unique names.
+
 ### Replay with Upcasting
 
 Automatically transform old event versions during replay:
@@ -277,7 +295,8 @@ Automatically transform old event versions during replay:
 ```go
 // Old V1 events are automatically upcasted to V2
 bus.ReplayWithUpcast(ctx, eventbus.OffsetOldest, func(event *eventbus.StoredEvent) error {
-    // event.Type and event.Data are already transformed
+    // event.Type and event.Data are transformed. ID, Origin, Metadata,
+    // Offset, and Timestamp are preserved from the original envelope.
     if event.Type == eventbus.EventType(UserCreatedV2{}) {
         var user UserCreatedV2
         json.Unmarshal(event.Data, &user)
@@ -286,6 +305,33 @@ bus.ReplayWithUpcast(ctx, eventbus.OffsetOldest, func(event *eventbus.StoredEven
     return nil
 })
 ```
+
+For raw, string-keyed migrations registered with `RegisterUpcastFunc` or
+`WithUpcast`, the callback must return exactly the `toType` declared at
+registration. The registry owns the chain topology; returning a different or
+empty type fails replay with `*UpcastContractError` instead of silently
+rewriting the chain or delivering the original schema:
+
+```go
+err := eventbus.RegisterUpcastFunc(bus, "user.created.v1", "user.created.v2",
+    func(data json.RawMessage) (json.RawMessage, string, error) {
+        migrated, err := migrateUserCreated(data)
+        return migrated, "user.created.v2", err // Must match the declared toType.
+    })
+if err != nil {
+    log.Fatal(err)
+}
+
+err = bus.ReplayWithUpcast(ctx, eventbus.OffsetOldest, replayHandler)
+var contractErr *eventbus.UpcastContractError
+if errors.As(err, &contractErr) {
+    log.Printf("invalid upcast %s -> %s: returned %s",
+        contractErr.FromType, contractErr.DeclaredType, contractErr.ReturnedType)
+}
+```
+
+Typed `RegisterUpcast` derives both endpoints and the returned type from its Go
+signature, so this runtime contract check is specific to raw callbacks.
 
 ### Replay from Specific Offset
 
@@ -304,7 +350,7 @@ bus.Replay(ctx, nextOffset, func(event *eventbus.StoredEvent) error {
 
 ## Resumable Subscriptions
 
-Subscribe with automatic offset tracking - never miss or duplicate events:
+Subscribe with automatic offset tracking and at-least-once delivery:
 
 ```go
 type EmailNotification struct {
@@ -317,10 +363,11 @@ func main() {
     store := eventbus.NewMemoryStore()
     bus := eventbus.New(eventbus.WithStore(store))
 
-    // Subscribe with offset tracking
-    err := eventbus.SubscribeWithReplay(ctx, bus, "email-sender",
-        func(event EmailNotification) {
-            sendEmail(event.To, event.Subject, event.Body)
+    // Subscribe with offset tracking and the persisted event envelope.
+    err := eventbus.SubscribeContextWithReplay(ctx, bus, "email-sender",
+        func(deliveryCtx context.Context, event EmailNotification) {
+            eventID, _ := eventbus.EventIDFromContext(deliveryCtx)
+            sendEmailOnce(eventID, event.To, event.Subject, event.Body)
             // Offset is automatically saved after successful handling
         })
 
@@ -328,8 +375,9 @@ func main() {
         log.Fatal(err)
     }
 
-    // After restart, the subscription resumes from last offset
-    // No events are missed or duplicated!
+    // After restart, the subscription resumes from its last checkpoint.
+    // A crash between the side effect and checkpoint can redeliver one or
+    // more events, so the handler must be idempotent.
 }
 ```
 
@@ -339,6 +387,54 @@ func main() {
 2. **Normal Operation**: New events are handled as they're published
 3. **After Crash**: On restart, resumes from last successfully processed offset
 4. **Offset Tracking**: Offset is saved after each successful event handling
+
+Resumable subscriptions consume `EventStore` toward a concrete, bounded tail
+barrier in their live phase too, using finite requested batch targets. A store
+may exceed a target only when it must return an indivisible chunk to preserve a
+safe resume token. When such a chunk crosses the captured barrier without
+exposing that exact token, `EventStoreOffsetComparer` lets the coordinator stop
+at the chunk's actual resume token. The handler may receive that one indivisible
+chunk's concurrent post-barrier events, but the drain will not chase later
+chunks. The handler receives a fresh decode of the persisted JSON plus its
+stored envelope—not pointer identity, unexported/`json:"-"` fields, or other
+transient properties of the object passed to `Publish`. An append failure that
+leaves no durable record therefore produces no resumable delivery. An `Append`
+error may instead follow a successful remote commit; that record can still be
+delivered now or during a later replay. Use ordinary `Subscribe` when the exact
+in-memory, best-effort callback contract is required.
+
+In default delivery mode, every persisted publish wakes active resumable
+coordinators across concrete handler shards. This is necessary when a stored V1
+event upcasts into a V2 subscription (and when a publish context was cancelled
+after a store accepted the record): the coordinator scans the durable envelope
+rather than relying on the publisher's original Go type. `WithLogDelivery`
+keeps this wake behind `Follow`, preserving its log-only delivery boundary.
+
+The coordinator will not let a newer offset pass a blocked or panicking older
+event. Concurrent and same-type reentrant publishes are coalesced to avoid
+deadlock, so under contention a publisher may return before this particular
+resumable handler drains its event; `bus.Wait()` and `Shutdown` wait for the
+scheduled drain. Setup completes its fixed initial tail synchronously. When a
+local signal is already pending at handoff, the tracked background drain
+performs the second catch-up pass, so continuous local publishing cannot starve
+`SubscribeWithReplay` from returning; call `bus.Wait()` when that concurrent
+catch-up must be complete before the next operation. A live drain failure keeps
+its wake-up pending and retries with capped exponential backoff; clearing the
+subscription cancels any delayed retry.
+
+`Async()` and `Once()` are rejected for resumable subscriptions: safe durable
+checkpointing requires synchronous handler completion, and one-time delivery
+has no coherent restart behavior. `LoadOffset` errors abort subscription setup
+instead of being mistaken for a new subscription. Handler panics are recovered,
+reported through the configured panic/observability hooks, and abort replay
+without advancing the failing event's offset.
+
+Subscription IDs must be non-empty. After setup succeeds, an ID remains
+reserved for the `EventBus`'s lifetime; create a new bus to restart it. Failed
+setup releases the reservation so the same ID can be retried on that bus. The
+same bus also rejects an overlapping durable `Follow` owner; `Follow` releases
+its active reservation when the call returns. The bus cannot coordinate another
+process, so use one process per ID unless the store adds an external lease.
 
 ### Multiple Subscriptions
 
@@ -369,12 +465,17 @@ fields):
 ```go
 // EventStore is the core interface (2 methods)
 type EventStore interface {
-    // Append stores an event and returns its assigned offset
+    // Append stores an event and returns a store-issued resume token.
+    // Tokens need not be numeric or unique per event; a chunk may share one.
+    // An error can be ambiguous: the remote commit may already exist.
+    // Use Event.ID as the idempotency key for internal retries.
     Append(ctx context.Context, event *Event) (Offset, error)
 
     // Read returns events starting after the given offset
-    // Use OffsetOldest to read from the beginning
-    // Use limit > 0 to limit results, or 0 for no limit
+    // Use OffsetOldest to read from the beginning. OffsetNewest must
+    // efficiently return no events and the current concrete tail.
+    // A positive limit is a requested batch target; a store may exceed it
+    // only to keep an indivisible resume-token unit intact. Zero means no limit.
     Read(ctx context.Context, from Offset, limit int) ([]*StoredEvent, Offset, error)
 }
 
@@ -384,15 +485,46 @@ type SubscriptionStore interface {
     LoadOffset(ctx context.Context, subscriptionID string) (Offset, error)
 }
 
+// SubscriptionStoreLookup is optional but required when a durable Follow
+// combines a custom checkpoint store with a first-run FollowFrom value other
+// than OffsetOldest. OffsetOldest is itself a valid saved token, so LoadOffset
+// alone cannot distinguish it from an absent checkpoint.
+type SubscriptionStoreLookup interface {
+    LookupOffset(ctx context.Context, subscriptionID string) (offset Offset, found bool, err error)
+}
+
 // EventStoreStreamer is optional, for memory-efficient streaming
 type EventStoreStreamer interface {
     ReadStream(ctx context.Context, from Offset) iter.Seq2[*StoredEvent, error]
 }
+
+// EventStoreOffsetComparer is required only when one indivisible Read unit
+// can cross a concrete tail without exposing that exact token in its result.
+type EventStoreOffsetComparer interface {
+    // Compare concrete, same-store tokens: negative, zero, or positive.
+    // OffsetOldest is valid; OffsetNewest must return an error.
+    CompareOffsets(left, right Offset) (int, error)
+}
 ```
 
-The new interface uses opaque string offsets instead of integer positions, allowing
-for better compatibility with remote storage backends that may use non-sequential
-identifiers.
+The interface uses opaque string offsets instead of integer positions, allowing
+for remote storage backends with non-sequential identifiers. A custom store must
+still implement the `OffsetNewest` sentinel contract above; resumable
+subscriptions use that concrete tail as a bounded replay handoff. Do not compare
+opaque tokens inside the bus or generic application code. When a store's
+smallest resume-safe unit can cross the handoff without returning its exact
+token, implement `EventStoreOffsetComparer` with that store protocol's ordering
+rule. The coordinator will finish that one crossing unit and stop at its actual
+resume token. Stores whose reads always expose the exact captured token do not
+need the optional interface.
+
+Every `StoredEvent.Offset` returned by `Read` or yielded by `Tail` must also be
+safe to checkpoint immediately after that event. Resuming from it may redeliver
+an already completed event or chunk, but must never skip a later event. If a
+protocol exposes only chunk boundaries, give non-last members the read-from
+(chunk-start) token and only the last member the chunk-end token. Do not attach
+the chunk-end token to every member: a crash after the first handler would then
+skip the unfinished suffix.
 
 ### PostgreSQL Example
 
@@ -400,6 +532,7 @@ identifiers.
 import (
     "context"
     "database/sql"
+    "fmt"
     "strconv"
 
     eventbus "github.com/jilio/ebu"
@@ -451,10 +584,32 @@ func (p *PostgresStore) Append(ctx context.Context, event *eventbus.Event) (even
     return eventbus.Offset(strconv.FormatInt(position, 10)), nil
 }
 
+func (p *PostgresStore) tailOffset(ctx context.Context) (eventbus.Offset, error) {
+    var position int64
+    err := p.db.QueryRowContext(ctx,
+        "SELECT COALESCE(MAX(position), 0) FROM events").Scan(&position)
+    if err != nil {
+        return eventbus.OffsetOldest, err
+    }
+    if position == 0 {
+        return eventbus.OffsetOldest, nil
+    }
+    return eventbus.Offset(strconv.FormatInt(position, 10)), nil
+}
+
 func (p *PostgresStore) Read(ctx context.Context, from eventbus.Offset, limit int) ([]*eventbus.StoredEvent, eventbus.Offset, error) {
+    if from == eventbus.OffsetNewest {
+        tail, err := p.tailOffset(ctx)
+        return nil, tail, err
+    }
+
     var fromPos int64
     if from != eventbus.OffsetOldest {
-        fromPos, _ = strconv.ParseInt(string(from), 10, 64)
+        parsed, err := strconv.ParseInt(string(from), 10, 64)
+        if err != nil {
+            return nil, from, fmt.Errorf("parse event offset %q: %w", from, err)
+        }
+        fromPos = parsed
     }
 
     var query string
@@ -492,7 +647,22 @@ func (p *PostgresStore) Read(ctx context.Context, from eventbus.Offset, limit in
 }
 
 func (p *PostgresStore) SaveOffset(ctx context.Context, subscriptionID string, offset eventbus.Offset) error {
-    position, _ := strconv.ParseInt(string(offset), 10, 64)
+    if offset == eventbus.OffsetNewest {
+        tail, err := p.tailOffset(ctx)
+        if err != nil {
+            return err
+        }
+        offset = tail
+    }
+
+    var position int64
+    if offset != eventbus.OffsetOldest {
+        parsed, err := strconv.ParseInt(string(offset), 10, 64)
+        if err != nil {
+            return fmt.Errorf("parse subscription offset %q: %w", offset, err)
+        }
+        position = parsed
+    }
     _, err := p.db.ExecContext(ctx, `
         INSERT INTO subscriptions (subscription_id, position)
         VALUES ($1, $2)
@@ -675,19 +845,26 @@ func TestSubscriptionResumption(t *testing.T) {
 
     // Subscribe and process 5 events
     count := 0
-    eventbus.SubscribeWithReplay(ctx, bus, "test",
+    err := eventbus.SubscribeWithReplay(ctx, bus, "test",
         func(event TestEvent) {
             count++
             if count == 5 {
                 panic("simulate crash")
             }
         })
+    if err == nil {
+        t.Fatal("expected recovered handler panic")
+    }
 
-    // Resume subscription - should start from position 5
-    eventbus.SubscribeWithReplay(ctx, bus, "test",
+    // Resume subscription. The event whose handler panicked was not
+    // checkpointed, so it is delivered again (at-least-once).
+    err = eventbus.SubscribeWithReplay(ctx, bus, "test",
         func(event TestEvent) {
-            // Processes events 5-9
+            // Process the remaining history idempotently.
         })
+    if err != nil {
+        t.Fatal(err)
+    }
 }
 ```
 
@@ -764,7 +941,7 @@ Event persistence in ebu provides:
 - ✅ Multiple backends - MemoryStore, SQLite, Durable-Streams, or custom
 - ✅ Remote storage - Native support for distributed event storage
 - ✅ Flexible - Implement `EventStore` interface for any backend
-- ✅ Reliable - Resumable subscriptions never miss events
+- ✅ Reliable - Resumable subscriptions provide at-least-once delivery
 - ✅ Powerful - Full replay and event sourcing support
 - ✅ Production-ready - Error handling, timeouts, and monitoring
 

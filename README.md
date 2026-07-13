@@ -182,7 +182,7 @@ sub.Unsubscribe() // removes exactly this registration; idempotent
 // Or unsubscribe by handler reference
 handler := func(event UserEvent) { /* ... */ }
 eventbus.Subscribe(bus, handler)
-eventbus.Unsubscribe(bus, handler)
+eventbus.Unsubscribe[UserEvent](bus, handler)
 // Note: Unsubscribe matches by code pointer. Keep a reference to the
 // exact handler you registered — two closures made from the same function
 // literal are indistinguishable. Handles have no such ambiguity.
@@ -191,7 +191,7 @@ eventbus.Unsubscribe(bus, handler)
 eventbus.Clear[UserEvent](bus)
 
 // Clear all handlers
-bus.ClearAll()
+eventbus.ClearAll(bus)
 ```
 
 ## Advanced Features
@@ -214,10 +214,11 @@ bus.Replay(ctx, eventbus.OffsetOldest, func(event *eventbus.StoredEvent) error {
     return nil
 })
 
-// Subscribe with automatic offset tracking
-eventbus.SubscribeWithReplay(ctx, bus, "email-sender",
-    func(event EmailEvent) {
-        sendEmail(event)
+// Subscribe with automatic offset tracking and envelope access
+eventbus.SubscribeContextWithReplay(ctx, bus, "email-sender",
+    func(deliveryCtx context.Context, event EmailEvent) {
+        eventID, _ := eventbus.EventIDFromContext(deliveryCtx)
+        sendEmailOnce(eventID, event)
         // Offset saved automatically after success
     })
 ```
@@ -230,21 +231,46 @@ eventbus.SubscribeWithReplay(ctx, bus, "email-sender",
   (`WithPersistenceErrorHandler`). Monitor it in production.
 - **Strict mode**: with `eventbus.WithStrictPersistence()`, a failed persist
   *skips* delivery instead — handlers never observe an event the log did not
-  record, so replay can never diverge from what live handlers saw. Use it
-  when the store is the source of truth (event sourcing, shared logs).
+  record. An `Append` error can arrive after a remote commit, so that record
+  may still appear during replay even though immediate delivery was skipped.
+  Use strict mode when the store is the source of truth (event sourcing,
+  shared logs).
 - **Publishers can observe the outcome**: `eventbus.TryPublish` /
   `eventbus.TryPublishContext` return the persistence error (nil on success
-  or when no store is configured), so a request handler can fail the request
-  when its event was not durably recorded.
+  or when no store is configured), so a request handler can respond to the
+  failure. Treat an `Append` error as indeterminate: fail or reconcile the
+  request using the event ID, because the remote commit may already exist.
 - **Every persisted event carries an envelope**: a ULID `ID` (minted once per
   publish — store-level retries reuse it, making it a reliable dedup key), the
   publishing bus's `Origin`, and optional publisher `Metadata` attached via
   `eventbus.ContextWithMetadata(ctx, map[string]string{...})`. Live handlers
   can read the ID with `eventbus.EventIDFromContext(ctx)`.
 - **`SubscribeWithReplay` is at-least-once**: each handled event saves its own
-  offset after the handler returns. If the process crashes between handling
-  and the offset save, that event is redelivered on the next start — make
-  replay handlers idempotent.
+  offset after the handler returns, in log order. A blocked or panicking event
+  prevents newer checkpoints from passing it. If the process crashes between
+  handling and the offset save, that event is redelivered on the next start —
+  make replay handlers idempotent. Use `SubscribeContextWithReplay` and
+  `EventIDFromContext` when the idempotency key must be the persisted event ID.
+- **Resumable handlers consume the log in every phase**: live values are
+  freshly decoded from durable JSON and carry the stored envelope. Transient
+  fields/pointer identity are not preserved, and an event absent from the store
+  is not delivered to a resumable handler. If `Append` committed but its
+  acknowledgement failed, the durable record can still be delivered. A
+  persisted publish wakes resumable coordinators across concrete type shards,
+  so an older wire type that upcasts into the subscribed type—and a commit
+  made with an already-cancelled publish context—cannot remain stranded. Each
+  drain captures a concrete tail. If a shared-offset chunk must cross that
+  boundary, the store's optional offset comparer stops after the one crossing
+  chunk instead of chasing concurrent appends. Ordinary `Subscribe` retains
+  exact in-memory values and the configured best-effort delivery behavior.
+- **Concurrent/reentrant wake-ups are coalesced**: under contention a
+  `Publish` can return before its resumable handler drains the event;
+  `bus.Wait()` / `Shutdown` waits for scheduled drain work. Uncontended
+  resumable delivery remains inline, and ordinary handlers are unchanged. If
+  a signal is already pending at setup handoff, `SubscribeWithReplay` returns
+  after its fixed initial replay and the tracked drain completes catch-up in
+  the background, preventing a hot local producer from starving setup. A live
+  drain failure retains its wake-up and retries with capped backoff.
 - **Poison events**: by default a stored event that fails to decode aborts the
   replay (and, because its offset is never saved, aborts it again on every
   restart). Pass `eventbus.WithReplayErrorPolicy(eventbus.ReplaySkip)` to skip
@@ -252,11 +278,19 @@ eventbus.SubscribeWithReplay(ctx, bus, "email-sender",
   `PersistenceErrorHandler` (as its `*StoredEvent`, so the payload can be
   parked elsewhere), its offset is saved so the skip is durable across
   restarts, and replay continues.
-- **`Async()` + `SubscribeWithReplay`**: offset saves for an async
-  subscription run concurrently and can complete out of publish order, so a
-  crash may redeliver a little more history than with a synchronous handler.
-  Still at-least-once — but prefer synchronous replay handlers, or make them
-  idempotent on `StoredEvent.ID`.
+- **Durable options are explicit**: `SubscribeWithReplay` and
+  `SubscribeContextWithReplay` reject `Async()` and `Once()`. A durable offset
+  can only be checkpointed after synchronous completion, and one-time delivery
+  has no unambiguous meaning across restarts.
+- **Checkpoint load failures abort**: an unavailable `SubscriptionStore` is
+  not treated as a brand-new subscription, preventing accidental replay of the
+  full side-effect history.
+- **Successful subscription IDs are unique for a bus's lifetime**: empty IDs
+  and reuse after successful setup on the same `EventBus` are rejected; create
+  a new bus to restart that subscription. Failed setup releases its ID so the
+  call can be retried on the same bus. An active durable `Follow` call also owns
+  its ID exclusively, but releases it when the call returns. Across processes,
+  run only one owner for a given ID unless your store provides external leasing.
 - **Validation before replay**: `SubscribeWithReplay` validates all arguments
   and options (including the `WithFilter` predicate's type) before the replay
   pass — a call that returns a validation error has delivered nothing and
@@ -324,12 +358,16 @@ eventbus.Publish(bus, OrderCreated{ID: "o-1"}) // peers receive it too
 - Stores implementing `EventStoreTailer` (durable-streams) push events via
   live long-poll/SSE; others are polled (`FollowPollInterval`).
 - `FollowWithSubscriptionID("name")` makes the follower durable: it resumes
-  from its saved offset after a restart.
+  from its saved offset after a restart. Its first concrete boundary is saved
+  before polling/tailing begins, so cancellation before the first event cannot
+  move a later `FollowFrom(OffsetNewest)` past downtime events.
 - Duplicates from the log's at-least-once layers are dropped by event ID
   (`FollowDedupWindow`).
 - `eventbus.New(eventbus.WithStore(store), eventbus.WithLogDelivery())`
   makes the log the *only* delivery path: every process — including the
-  publisher — observes the same events in the same order.
+  publisher — observes the same events in the same order. Its default follower
+  starts at the beginning so events appended before `Follow` starts are not
+  lost; use a durable subscription ID to avoid replaying history on restart.
 
 See [**Distributed Guide**](docs/DISTRIBUTED.md) for delivery modes,
 failure behavior, and current limitations.
@@ -447,9 +485,20 @@ func (e UserCreatedEvent) EventTypeName() string {
     return "user.created.v1"
 }
 
-// Now EventType() returns "user.created.v1" instead of package-qualified name
+// Now EventType() returns "user.created.v1" instead of a reflection name
 eventbus.Publish(bus, UserCreatedEvent{UserID: "123"})
 ```
+
+Use an immutable, globally unique `EventTypeName` for every event that enters a
+persistent or shared log. The reflection fallback contains the declared Go
+package name, not its full import path, so it is neither refactor-stable nor
+globally unique. A persistent bus keeps one transactional name-to-Go-type
+registry across append attempts, subscriptions, and typed upcast endpoints;
+conflicts fail before another ambiguous event reaches the stream. Once
+`EventStore.Append` is called, its claim remains reserved even if the call
+returns an error: a remote store may have committed the event before its
+acknowledgement timed out. Retrying the same Go type is safe; a colliding type
+remains rejected for that bus's lifetime.
 
 Benefits:
 - **Stable event names** across package reorganization
@@ -463,6 +512,7 @@ See [TypeNamer examples](docs/EXAMPLES.md#custom-event-type-names-typenamer) for
 - 📖 [**Complete Examples**](docs/EXAMPLES.md) - Comprehensive usage examples
 - 💾 [**Persistence Guide**](docs/PERSISTENCE.md) - Event storage and replay patterns
 - 🔗 [**Distributed Guide**](docs/DISTRIBUTED.md) - Cross-process delivery with Follow
+- 📝 [**Changelog**](CHANGELOG.md) - Release notes and migration-relevant changes
 - 📚 [**API Reference**](https://godoc.org/github.com/jilio/ebu) - Complete API documentation
 
 ## Storage Backends
@@ -508,7 +558,7 @@ state.RegisterCollection(mat, users)
 mat.Replay(ctx, bus, eventbus.OffsetOldest)
 
 // Access materialized state
-user, ok := users.Get("user:1")  // User{Name: "Alice Smith", ...}
+user, ok, err := users.Get("user:1")  // User{Name: "Alice Smith", ...}
 ```
 
 Features:
@@ -517,6 +567,8 @@ Features:
 - **Materializer**: Build typed state from event streams
 - **Control messages**: `SnapshotStart`, `SnapshotEnd`, `Reset`
 - **JSON interoperability**: Compatible with durable-streams ecosystem
+- **Unambiguous keys**: `/` and `%` inside entity types or keys are escaped,
+  preventing collection-prefix collisions in shared stores
 
 ## Best Practices
 
