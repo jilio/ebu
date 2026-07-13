@@ -3,7 +3,7 @@ module github.com/jilio/ebu/otel
 go 1.25.12
 
 require (
-	github.com/jilio/ebu v0.16.0
+	github.com/jilio/ebu v0.17.0
 	go.opentelemetry.io/otel v1.43.0
 	go.opentelemetry.io/otel/metric v1.43.0
 	go.opentelemetry.io/otel/sdk v1.43.0
