@@ -29,6 +29,26 @@
 // Combined with the offset semantics above, delivery is at-least-once
 // end-to-end; consumers must deduplicate if exactly-once processing is
 // required.
+//
+// # Snapshots and retention
+//
+// The store implements eventbus.EventStoreSnapshotter on a companion stream
+// (`<streamPath>.snap`, created lazily; that path is reserved). Each
+// SaveSnapshot appends one record atomically; LoadSnapshot returns the newest
+// record for the id (last-write-wins). Protocol offsets stay valid for the
+// lifetime of a stream, so a snapshot's offset remains a correct resume point
+// even after the server drops older events.
+//
+// The store deliberately does NOT implement eventbus.EventStoreTruncator:
+// the Durable Streams protocol has no client-initiated trim — retention is a
+// server-side policy ("servers MAY implement retention policies that drop
+// data older than a certain age while the stream continues"), and offsets on
+// a remote append-only stream are not deletable positions (see the
+// EventStoreTruncator contract). Bound both the main stream and the
+// companion stream with the server's retention/TTL configuration. A read
+// below the server's earliest retained position fails with the protocol's
+// 410 Gone, which this store treats as permanent; recover by loading a
+// snapshot and resuming from its offset.
 package durablestream
 
 import (
@@ -62,6 +82,10 @@ type Store struct {
 	// dropped after any send failure (it may be bound to a stale context or
 	// stale stream metadata).
 	writer *durablestream.StreamWriter
+
+	// snap tracks the lazily created snapshot companion stream (see
+	// snapshot.go).
+	snap snapState
 }
 
 // Ensure Store implements the EventStore and EventStoreTailer interfaces.

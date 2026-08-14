@@ -1085,16 +1085,18 @@ func TestStore_ConcurrentAppends(t *testing.T) {
 }
 
 // newFlakyServer wraps a real durable-streams handler and fails requests on
-// demand: failHead/failPost/failGet hold the number of upcoming
-// HEAD/POST/GET requests to reject with failStatus (503 unless set).
+// demand: failHead/failPost/failGet/failPut hold the number of upcoming
+// HEAD/POST/GET/PUT requests to reject with failStatus (503 unless set).
 type flakyServer struct {
 	*httptest.Server
 	heads      atomic.Int32
 	posts      atomic.Int32
 	gets       atomic.Int32
+	puts       atomic.Int32
 	failHead   atomic.Int32
 	failPost   atomic.Int32
 	failGet    atomic.Int32
+	failPut    atomic.Int32
 	failStatus atomic.Int32
 }
 
@@ -1132,6 +1134,13 @@ func newFlakyServer() *flakyServer {
 			fs.gets.Add(1)
 			if fs.failGet.Load() > 0 {
 				fs.failGet.Add(-1)
+				fs.fail(w)
+				return
+			}
+		case http.MethodPut:
+			fs.puts.Add(1)
+			if fs.failPut.Load() > 0 {
+				fs.failPut.Add(-1)
 				fs.fail(w)
 				return
 			}

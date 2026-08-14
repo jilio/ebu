@@ -221,6 +221,16 @@ Durable-streams features:
 - Compatible with any durable-streams server implementation
 - Configurable timeouts and HTTP client
 - Server-assigned opaque offsets
+- Projection snapshots (`EventStoreSnapshotter`) on a companion stream
+
+Snapshots live on a reserved companion stream (`<stream>.snap`): each
+`SaveSnapshot` appends one record atomically, and `LoadSnapshot` returns the
+newest record for the id (last-write-wins), so a cold-starting follower can
+`LoadSnapshotFrom` + `FollowFrom(offset)` instead of replaying the whole
+history. The store does **not** implement `EventStoreTruncator`: the Durable
+Streams protocol has no client-initiated trim — bounding both the main stream
+and the companion stream is the server's retention policy (see the package
+documentation).
 
 ## Replay Patterns
 
