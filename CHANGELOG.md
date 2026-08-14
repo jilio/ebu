@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`Mirror`.** A new core primitive that continuously copies one
+  `EventStore` into another with the stored envelope preserved verbatim:
+  `ID`, `Origin`, `Type`, `Data`, `Metadata`, and `Timestamp` are appended to
+  the destination exactly as read from the source, with no type registry,
+  decoding, or upcasts involved — the mirroring process does not need the
+  producers' event types and never skips an unregistered type. Progress is
+  durable and required: `Mirror` resumes from the offset saved under its
+  subscription ID and checkpoints after each forwarded event, starting from
+  `OffsetOldest` on the first run. Delivery into the destination is
+  at-least-once — a crash between append and checkpoint re-forwards that
+  event, with IDs preserved so downstream consumers deduplicate as usual;
+  `MirrorDedupWindow` absorbs re-reads within one call. Failures are reported
+  to `MirrorOnError` and retried after `MirrorPollInterval`; `MirrorOnForward`
+  observes each forwarded event for metrics. `MirrorResetOnSourceRewind` opts
+  into recovery when a rebuilt/restored source leaves the checkpoint past the
+  source tail (requires the source to implement `EventStoreOffsetComparer`):
+  the mirror resets to the start instead of stalling silently, at the cost of
+  re-appended history. Sources implementing `EventStoreTailer` are tailed;
+  others are polled.
+
 ## [0.17.0] - 2026-07-13
 
 ### Added
