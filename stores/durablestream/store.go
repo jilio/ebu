@@ -44,11 +44,18 @@
 // server-side policy ("servers MAY implement retention policies that drop
 // data older than a certain age while the stream continues"), and offsets on
 // a remote append-only stream are not deletable positions (see the
-// EventStoreTruncator contract). Bound both the main stream and the
-// companion stream with the server's retention/TTL configuration. A read
-// below the server's earliest retained position fails with the protocol's
-// 410 Gone, which this store treats as permanent; recover by loading a
-// snapshot and resuming from its offset.
+// EventStoreTruncator contract).
+//
+// Retention rules of thumb: the MAIN stream may be head-trimmed by server
+// retention once snapshots cover the trimmed prefix — a read below the
+// earliest retained position fails with the protocol's 410 Gone (permanent
+// here); recover by loading a snapshot and resuming from its offset. The
+// COMPANION stream must NOT be head-trimmed: LoadSnapshot reads it from the
+// beginning and the protocol offers no earliest-offset discovery, so a
+// partially trimmed companion stream makes surviving records unreachable
+// (LoadSnapshot fails loudly rather than reporting a false miss). Expiring
+// the companion stream whole (stream TTL) is safe — it reads as "no
+// snapshot", and the next SaveSnapshot re-creates it.
 package durablestream
 
 import (
@@ -58,6 +65,7 @@ import (
 	"fmt"
 	"iter"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -113,6 +121,14 @@ func NewWithContext(ctx context.Context, baseURL string, streamPath string, opts
 	}
 	if streamPath == "" {
 		return nil, fmt.Errorf("durablestream: streamPath is required")
+	}
+	if strings.HasSuffix(streamPath, snapStreamSuffix) {
+		// The ".snap" suffix names the snapshot companion stream of the store
+		// at the base path (see EventStoreSnapshotter in snapshot.go). An
+		// event store there would silently interleave its envelopes with that
+		// store's snapshot records — neither side would notice, both would be
+		// corrupted. Reject at construction instead.
+		return nil, fmt.Errorf("durablestream: streamPath %q uses the reserved snapshot companion suffix %q", streamPath, snapStreamSuffix)
 	}
 
 	cfg := defaultConfig()

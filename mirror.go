@@ -83,9 +83,22 @@ func MirrorOnError(fn func(error)) MirrorOption {
 // restored from an older copy: a checkpoint past the source's current tail
 // would otherwise read as "at the tail" forever and the mirror would silently
 // stop forwarding. With this option the mirror compares its checkpoint against
-// the source tail — at startup, and again whenever the source looks idle — and
-// when the checkpoint is ahead it resets to OffsetOldest and re-reads the
-// source from the beginning, reporting the reset to MirrorOnError.
+// the source tail and, when the checkpoint is ahead, resets to OffsetOldest
+// and re-reads the source from the beginning, reporting the reset to
+// MirrorOnError.
+//
+// When the comparison runs: at startup; on the poll path, on every read that
+// makes no progress; on the tail path, at every tail restart (a tail that
+// ends or yields an error — a source whose Tail treats an ahead-of-tail
+// offset as a permanently blocked idle long-poll is not detected mid-run).
+//
+// What it can and cannot detect: the reset fires only while the restored
+// source's tail is still behind the saved checkpoint. A source that was
+// restored AND then refilled past the checkpoint is indistinguishable from
+// ordinary progress by offsets alone — the mirror resumes at the checkpoint
+// and the replaced events below it are not re-forwarded. Detecting that
+// requires out-of-band versioning (for example, a per-rebuild log name or
+// epoch), which is the caller's design decision, not an offset property.
 //
 // Requires the source store to implement EventStoreOffsetComparer; Mirror
 // fails at startup otherwise. Off by default because the reset re-appends the
@@ -133,7 +146,12 @@ func MirrorResetOnSourceRewind() MirrorOption {
 //     not advance past a failed event.
 //
 // Mirror does not coordinate writers: run one mirror per subscriptionID, and
-// enforce that across processes with an external lease or a single owner.
+// enforce that yourself — unlike Follow, Mirror is not bound to a bus, so it
+// cannot detect a second concurrent mirror on the same ID even in the same
+// process. Two concurrent mirrors interleave checkpoint saves; the result is
+// re-forwarded duplicates in the destination (each mirror only checkpoints a
+// prefix it has itself forwarded), never skipped events. Across processes,
+// use an external lease or a single owner.
 func Mirror(ctx context.Context, src, dst EventStore, subscriptionID string, offsets SubscriptionStore, opts ...MirrorOption) error {
 	if src == nil || dst == nil {
 		return fmt.Errorf("eventbus: mirror requires both a source and a destination store")
@@ -246,12 +264,13 @@ pollLoop:
 			return err
 		}
 
-		events, next, err := m.src.Read(ctx, m.offset, batchSize)
+		readFrom := m.offset
+		events, next, err := m.src.Read(ctx, readFrom, batchSize)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			m.report(fmt.Errorf("mirror: read after offset %s: %w", m.offset, err))
+			m.report(fmt.Errorf("mirror: read after offset %s: %w", readFrom, err))
 			if err := sleepCtx(ctx, m.cfg.pollInterval); err != nil {
 				return err
 			}
@@ -273,9 +292,14 @@ pollLoop:
 			m.advance(ctx, stored.Offset)
 		}
 
-		if next == m.offset {
-			// At the tail — or holding a checkpoint the source no longer knows.
-			// Only an explicit tail comparison tells the two apart.
+		if next == readFrom {
+			// The read made no progress: the mirror is at the tail — or holds a
+			// checkpoint the source no longer knows; only an explicit tail
+			// comparison tells the two apart. (Compared against the offset the
+			// batch was read from, not the per-event advances above: a full
+			// batch whose last event carries the batch's resume token is
+			// progress, and the next read must follow immediately — sleeping
+			// per batch would cap bulk replication at batchSize/pollInterval.)
 			if err := m.maybeReconcile(ctx); err != nil {
 				return err
 			}
@@ -284,9 +308,11 @@ pollLoop:
 			}
 			continue
 		}
-		// A store may advance beyond the last returned envelope (for example, an
-		// empty chunk). Persist that concrete resume token too.
-		m.advance(ctx, next)
+		if next != m.offset {
+			// A store may advance beyond the last returned envelope (for
+			// example, an empty chunk). Persist that concrete resume token too.
+			m.advance(ctx, next)
+		}
 	}
 }
 

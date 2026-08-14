@@ -11,17 +11,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Durable-streams snapshots.** The durable-streams store now implements
   `EventStoreSnapshotter` on a reserved companion stream (`<stream>.snap`,
-  created lazily): each `SaveSnapshot` appends one record atomically and
+  created lazily; the constructor now rejects stream paths ending in that
+  suffix so an event stream cannot silently interleave with snapshot
+  records): each `SaveSnapshot` appends one record atomically and
   `LoadSnapshot` returns the newest record for the id (last-write-wins,
   matching the SQLite store's upsert), enabling bounded cold starts —
   `LoadSnapshotFrom` + `FollowFrom(offset)` instead of replaying the full
   history over the network. Protocol offsets stay valid for the lifetime of
   a stream, so a snapshot's offset remains a correct resume point across
-  server-side retention of the main stream. The store deliberately does not
-  implement `EventStoreTruncator`: the Durable Streams protocol has no
-  client-initiated trim — retention of both streams is server policy — and
-  the `EventStoreTruncator` contract already forbids the interface for
-  remote append-only brokers.
+  server-side retention of the main stream. The companion stream itself must
+  not be head-trimmed (the protocol has no earliest-offset discovery;
+  `LoadSnapshot` fails loudly on a trimmed head), but whole-stream expiry is
+  safe: it reads as "no snapshot" and the next save re-creates the stream.
+  The store deliberately does not implement `EventStoreTruncator`: the
+  Durable Streams protocol has no client-initiated trim — retention is
+  server policy — and the `EventStoreTruncator` contract already forbids the
+  interface for remote append-only brokers.
 
 - **`Mirror`.** A new core primitive that continuously copies one
   `EventStore` into another with the stored envelope preserved verbatim:

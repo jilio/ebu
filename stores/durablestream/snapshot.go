@@ -97,6 +97,17 @@ func (s *Store) SaveSnapshot(ctx context.Context, snapshotID string, atOffset ev
 		cancel()
 		if err != nil {
 			lastErr = fmt.Errorf("durablestream: save snapshot %q: %w", snapshotID, err)
+			if errors.Is(err, durablestream.ErrNotFound) && ctx.Err() == nil {
+				// The companion stream disappeared after we cached its
+				// creation (expired or deleted server-side). Re-create it and
+				// retry within the attempt budget instead of failing every
+				// save until process restart.
+				s.snap.created = false
+				if cerr := s.ensureSnapStream(ctx); cerr != nil {
+					return fmt.Errorf("durablestream: create snapshot stream: %w", cerr)
+				}
+				continue
+			}
 			if ctx.Err() != nil || !isRetryable(err) {
 				return lastErr
 			}
@@ -115,7 +126,10 @@ func (s *Store) SaveSnapshot(ctx context.Context, snapshotID string, atOffset ev
 //
 // The read is proportional to the number of snapshots ever saved on this
 // stream (the companion log is append-only); periodic snapshotting keeps that
-// small, and server-side retention may bound it further.
+// small. Do not bound the companion stream by head-trimming retention — a
+// trimmed head makes the surviving records unreachable (no earliest-offset
+// discovery in the protocol) and LoadSnapshot fails loudly; whole-stream
+// expiry is safe and reads as "no snapshot".
 func (s *Store) LoadSnapshot(ctx context.Context, snapshotID string) (eventbus.Offset, json.RawMessage, error) {
 	snapPath := s.path + snapStreamSuffix
 
@@ -144,8 +158,26 @@ func (s *Store) LoadSnapshot(ctx context.Context, snapshotID string) (eventbus.O
 			cancel()
 			if err != nil {
 				if errors.Is(err, durablestream.ErrNotFound) {
-					// No snapshot has ever been saved for this stream.
+					// The companion stream is absent: never created, expired,
+					// or deleted while we were paging through it. A record
+					// already found on an earlier page is still the best
+					// available snapshot; with nothing found, this is a miss.
+					if found {
+						return atOffset, blob, nil
+					}
 					return eventbus.OffsetOldest, nil, nil
+				}
+				if errors.Is(err, durablestream.ErrGone) {
+					// The companion stream's head was trimmed by server-side
+					// retention. The protocol offers no way to discover the
+					// earliest retained offset, so records that survived the
+					// trim are unreachable from here; a record from an earlier
+					// page is still usable, otherwise fail loudly rather than
+					// report "no snapshot" while newer records survive.
+					if found {
+						return atOffset, blob, nil
+					}
+					return eventbus.OffsetOldest, nil, fmt.Errorf("durablestream: load snapshot %q: companion stream %q was head-trimmed by server retention and its surviving records are unreachable (the protocol has no earliest-offset discovery); do not head-trim snapshot companion streams — expire them whole instead: %w", snapshotID, snapPath, err)
 				}
 				lastErr = fmt.Errorf("durablestream: load snapshot %q: %w", snapshotID, err)
 				if ctx.Err() != nil || !isRetryable(err) {
@@ -173,6 +205,16 @@ func (s *Store) LoadSnapshot(ctx context.Context, snapshotID string) (eventbus.O
 				continue
 			}
 			if record.SnapshotID != snapshotID {
+				continue
+			}
+			if eventbus.Offset(record.AtOffset) == eventbus.OffsetNewest {
+				// A symbolic offset is never a durable position (SaveSnapshot
+				// rejects it on write, and every sibling checkpoint-load path
+				// rejects it on read). The companion stream is externally
+				// writable, so treat such a record as malformed and keep the
+				// previous good one rather than let a caller resume at "$"
+				// and silently skip history.
+				s.handleSnapshotDecodeError(i, raw, fmt.Errorf("symbolic at_offset %q is not a durable position", eventbus.OffsetNewest))
 				continue
 			}
 			// Later records supersede earlier ones: last write wins.

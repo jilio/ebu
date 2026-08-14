@@ -223,14 +223,18 @@ Durable-streams features:
 - Server-assigned opaque offsets
 - Projection snapshots (`EventStoreSnapshotter`) on a companion stream
 
-Snapshots live on a reserved companion stream (`<stream>.snap`): each
-`SaveSnapshot` appends one record atomically, and `LoadSnapshot` returns the
-newest record for the id (last-write-wins), so a cold-starting follower can
+Snapshots live on a reserved companion stream (`<stream>.snap` — the
+constructor rejects stream paths with that suffix): each `SaveSnapshot`
+appends one record atomically, and `LoadSnapshot` returns the newest record
+for the id (last-write-wins), so a cold-starting follower can
 `LoadSnapshotFrom` + `FollowFrom(offset)` instead of replaying the whole
 history. The store does **not** implement `EventStoreTruncator`: the Durable
-Streams protocol has no client-initiated trim — bounding both the main stream
-and the companion stream is the server's retention policy (see the package
-documentation).
+Streams protocol has no client-initiated trim — retention is the server's
+policy. The main stream may be head-trimmed once snapshots cover the trimmed
+prefix; the companion stream must **not** be head-trimmed (no earliest-offset
+discovery in the protocol — `LoadSnapshot` fails loudly on a trimmed head),
+though expiring it whole is safe and reads as "no snapshot". See the package
+documentation for details.
 
 ## Replay Patterns
 

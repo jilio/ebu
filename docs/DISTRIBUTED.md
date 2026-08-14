@@ -166,10 +166,16 @@ A rebuilt source (restored from backup, recreated stream) can leave the saved
 checkpoint *past* the source's new tail, which reads as "at the tail" forever
 — the mirror would silently stop. `MirrorResetOnSourceRewind()` opts into
 recovery: the mirror compares its checkpoint against the source tail (at
-startup and when idle, via the source's `EventStoreOffsetComparer`) and resets
-to `OffsetOldest` when the checkpoint is ahead, reporting the reset. It is off
-by default because the reset re-appends the surviving source history — 
-duplicates the destination's consumers must absorb by ID.
+startup, on non-progressing polls, and at tail restarts, via the source's
+`EventStoreOffsetComparer`) and resets to `OffsetOldest` when the checkpoint
+is ahead, reporting the reset. It is off by default because the reset
+re-appends the surviving source history — duplicates the destination's
+consumers must absorb by ID. Two honest limits: a `Tail` source that treats
+an ahead-of-tail offset as a blocked idle long-poll (rather than ending the
+tail) is only checked at startup; and a source restored *and refilled past*
+the checkpoint is indistinguishable from ordinary progress by offsets alone —
+guard that case with out-of-band versioning (a per-rebuild stream name or
+epoch).
 
 Like durable followers, `Mirror` does not coordinate writers across
 processes: run one mirror per subscription ID, enforced by an external lease

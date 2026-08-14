@@ -422,6 +422,172 @@ func TestSnapshotLoadGivesUpOnPersistentFailure(t *testing.T) {
 	}
 }
 
+func TestNewRejectsReservedSnapSuffix(t *testing.T) {
+	srv := newTestServer()
+	defer srv.Close()
+
+	_, err := ds.New(srv.URL+"/v1/stream", "orders.snap")
+	if err == nil || !strings.Contains(err.Error(), "reserved snapshot companion suffix") {
+		t.Fatalf("got %v, want reserved-suffix rejection", err)
+	}
+}
+
+// newSnapPageServer serves a paginated companion stream: page 1 returns the
+// given records, later pages answer with failStatus. The main-stream PUT
+// succeeds so ds.New works.
+func newSnapPageServer(page1 string, failStatus int) *httptest.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/stream/", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			w.WriteHeader(http.StatusCreated)
+		case http.MethodGet:
+			if r.URL.Query().Get("offset") == "" {
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Stream-Next-Offset", "p2")
+				// Deliberately not up-to-date: the loader must fetch page 2.
+				w.Write([]byte(page1))
+				return
+			}
+			http.Error(w, http.StatusText(failStatus), failStatus)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+	return httptest.NewServer(mux)
+}
+
+func TestSnapshotLoadKeepsFoundRecordWhenLaterPageFails(t *testing.T) {
+	page1 := `[{"snapshot_id":"users","at_offset":"1_0","blob":{"v":1}}]`
+
+	t.Run("stream deleted mid-read", func(t *testing.T) {
+		srv := newSnapPageServer(page1, http.StatusNotFound)
+		defer srv.Close()
+		store := newSnapshotStore(t, srv.URL, "snap-page-404")
+		atOffset, blob, err := store.LoadSnapshot(context.Background(), "users")
+		if err != nil {
+			t.Fatalf("LoadSnapshot() error = %v", err)
+		}
+		if atOffset != "1_0" || string(blob) != `{"v":1}` {
+			t.Errorf("got (%q, %s), want the page-1 record", atOffset, blob)
+		}
+	})
+
+	t.Run("head trimmed mid-read", func(t *testing.T) {
+		srv := newSnapPageServer(page1, http.StatusGone)
+		defer srv.Close()
+		store := newSnapshotStore(t, srv.URL, "snap-page-410")
+		atOffset, blob, err := store.LoadSnapshot(context.Background(), "users")
+		if err != nil {
+			t.Fatalf("LoadSnapshot() error = %v", err)
+		}
+		if atOffset != "1_0" || string(blob) != `{"v":1}` {
+			t.Errorf("got (%q, %s), want the page-1 record", atOffset, blob)
+		}
+	})
+}
+
+func TestSnapshotLoadFailsLoudlyOnTrimmedHead(t *testing.T) {
+	// 410 on the very first page with nothing found: surviving records are
+	// unreachable, so this must be a loud error, not a false miss.
+	srv := newFlakyServer()
+	defer srv.Close()
+	store := newSnapshotStore(t, srv.URL, "snap-trimmed")
+	ctx := context.Background()
+
+	if err := store.SaveSnapshot(ctx, "users", "1_0", json.RawMessage(`{}`)); err != nil {
+		t.Fatalf("SaveSnapshot() error = %v", err)
+	}
+	srv.failStatus.Store(http.StatusGone)
+	srv.failGet.Store(100)
+	_, _, err := store.LoadSnapshot(ctx, "users")
+	if err == nil || !strings.Contains(err.Error(), "head-trimmed") {
+		t.Fatalf("got %v, want loud head-trimmed error", err)
+	}
+}
+
+func TestSnapshotSaveRecreatesDeletedCompanionStream(t *testing.T) {
+	srv := newTestServer()
+	defer srv.Close()
+	store := newSnapshotStore(t, srv.URL, "snap-recreate")
+	ctx := context.Background()
+
+	if err := store.SaveSnapshot(ctx, "users", "1_0", json.RawMessage(`{"v":1}`)); err != nil {
+		t.Fatalf("SaveSnapshot(1) error = %v", err)
+	}
+	// The companion stream disappears server-side (operator cleanup or TTL).
+	if err := store.Client().Delete(ctx, "snap-recreate.snap"); err != nil {
+		t.Fatalf("delete companion stream: %v", err)
+	}
+	// The next save must re-create it instead of failing until restart.
+	if err := store.SaveSnapshot(ctx, "users", "2_0", json.RawMessage(`{"v":2}`)); err != nil {
+		t.Fatalf("SaveSnapshot(2) after companion deletion error = %v", err)
+	}
+
+	atOffset, blob, err := store.LoadSnapshot(ctx, "users")
+	if err != nil {
+		t.Fatalf("LoadSnapshot() error = %v", err)
+	}
+	if atOffset != "2_0" || string(blob) != `{"v":2}` {
+		t.Errorf("got (%q, %s), want (2_0, {\"v\":2})", atOffset, blob)
+	}
+}
+
+func TestSnapshotSaveRecreateFailureSurfaces(t *testing.T) {
+	srv := newFlakyServer()
+	defer srv.Close()
+	store := newSnapshotStore(t, srv.URL, "snap-recreate-fail")
+	ctx := context.Background()
+
+	if err := store.SaveSnapshot(ctx, "users", "1_0", json.RawMessage(`{}`)); err != nil {
+		t.Fatalf("SaveSnapshot(1) error = %v", err)
+	}
+	if err := store.Client().Delete(ctx, "snap-recreate-fail.snap"); err != nil {
+		t.Fatalf("delete companion stream: %v", err)
+	}
+	// Re-creation itself fails permanently: the save must surface that.
+	srv.failStatus.Store(http.StatusBadRequest)
+	srv.failPut.Store(100)
+	err := store.SaveSnapshot(ctx, "users", "2_0", json.RawMessage(`{}`))
+	if err == nil || !strings.Contains(err.Error(), "create snapshot stream") {
+		t.Fatalf("got %v, want create snapshot stream failure", err)
+	}
+}
+
+func TestSnapshotLoadSkipsSymbolicOffsetRecord(t *testing.T) {
+	srv := newTestServer()
+	defer srv.Close()
+
+	var decodeErrs int
+	store := newSnapshotStore(t, srv.URL, "snap-symbolic",
+		ds.WithDecodeErrorHandler(func(err error, raw []byte) { decodeErrs++ }))
+	ctx := context.Background()
+
+	if err := store.SaveSnapshot(ctx, "users", "1_0", json.RawMessage(`{"v":1}`)); err != nil {
+		t.Fatalf("SaveSnapshot() error = %v", err)
+	}
+	// A corrupt/foreign record claiming the symbolic tail as its offset: it
+	// must be skipped like any malformed record, keeping the good one.
+	writer, err := store.Client().Writer(ctx, "snap-symbolic.snap")
+	if err != nil {
+		t.Fatalf("companion writer: %v", err)
+	}
+	if err := writer.Send([]byte(`{"snapshot_id":"users","at_offset":"$","blob":{"v":666}}`), nil); err != nil {
+		t.Fatalf("append symbolic record: %v", err)
+	}
+
+	atOffset, blob, err := store.LoadSnapshot(ctx, "users")
+	if err != nil {
+		t.Fatalf("LoadSnapshot() error = %v", err)
+	}
+	if atOffset != "1_0" || string(blob) != `{"v":1}` {
+		t.Errorf("got (%q, %s), want the good (1_0) record", atOffset, blob)
+	}
+	if decodeErrs == 0 {
+		t.Error("symbolic-offset record was not reported to the decode error handler")
+	}
+}
+
 func TestSnapshotLoadPermanentFailure(t *testing.T) {
 	srv := newFlakyServer()
 	defer srv.Close()

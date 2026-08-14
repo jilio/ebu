@@ -595,6 +595,34 @@ func TestMirrorDedupWindowZeroDisables(t *testing.T) {
 	}
 }
 
+// TestMirrorBulkCopyDoesNotSleepBetweenBatches pins the poll loop's progress
+// rule: a full batch whose resume token advanced is progress, and the next
+// read follows immediately. With a poll interval of an hour, copying multiple
+// batches within the test deadline is only possible if no per-batch sleep
+// happens (the regression this guards: comparing next against the per-event
+// advanced offset instead of the batch's read-from offset).
+func TestMirrorBulkCopyDoesNotSleepBetweenBatches(t *testing.T) {
+	src := NewMemoryStore()
+	dst := NewMemoryStore()
+	offsets := NewMemoryStore()
+
+	const n = 250 // > 2 poll batches (batch size 100)
+	for i := 0; i < n; i++ {
+		if _, err := src.Append(context.Background(), &Event{
+			ID:   fmt.Sprintf("bulk-%03d", i),
+			Type: "t",
+			Data: json.RawMessage(`1`),
+		}); err != nil {
+			t.Fatalf("seed append %d: %v", i, err)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runMirror(ctx, src, dst, "bulk", offsets, MirrorPollInterval(time.Hour))
+	mirrorWaitFor(t, func() bool { return mirrorCount(t, dst) == n })
+	mirrorShutdown(t, cancel, done)
+}
+
 // --- store contract corners ------------------------------------------------
 
 func TestMirrorPersistsEmptyChunkAdvance(t *testing.T) {
