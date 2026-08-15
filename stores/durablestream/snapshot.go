@@ -5,9 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sync"
 
-	"github.com/ahimsalabs/durable-streams-go/durablestream"
+	durablestreams "github.com/durable-streams/durable-streams/packages/client-go"
 	eventbus "github.com/jilio/ebu"
 )
 
@@ -16,7 +15,13 @@ var _ eventbus.EventStoreSnapshotter = (*Store)(nil)
 
 // snapStreamSuffix names the companion stream that holds snapshots for a
 // store's main stream. The companion path (`<streamPath>.snap`) is reserved:
-// do not create an ordinary event stream there.
+// do not create an ordinary event stream there. The reservation cannot be
+// verified server-side — stream creation is idempotent per media type
+// (content-type parameters are ignored by conforming servers), so a
+// pre-existing event stream at the companion path is indistinguishable from
+// a snapshot log at creation time. The constructor's suffix rejection
+// prevents this library from creating the collision, and LoadSnapshot
+// reports any foreign records it skips (see handleSnapshotDecodeError).
 const snapStreamSuffix = ".snap"
 
 // snapshotRecord is the wire format of one snapshot on the companion stream.
@@ -24,13 +29,6 @@ type snapshotRecord struct {
 	SnapshotID string          `json:"snapshot_id"`
 	AtOffset   string          `json:"at_offset"`
 	Blob       json.RawMessage `json:"blob"`
-}
-
-// snapState tracks lazy creation of the companion stream, shared by all
-// SaveSnapshot calls on this Store.
-type snapState struct {
-	mu      sync.Mutex
-	created bool
 }
 
 // SaveSnapshot implements eventbus.EventStoreSnapshotter by appending a
@@ -109,28 +107,28 @@ func (s *Store) SaveSnapshot(ctx context.Context, snapshotID string, atOffset ev
 			s.snap.created = true
 		}
 
-		// A fresh writer per attempt: snapshots are infrequent, and a cached
-		// writer could be bound to stale stream metadata. The attempt context
-		// bounds both the writer's HEAD and the send.
-		attemptCtx, cancel := context.WithTimeout(ctx, s.cfg.timeout)
-		writer, err := s.client.Writer(attemptCtx, snapPath)
-		if err == nil {
-			err = writer.Send(data, nil)
-		}
-		cancel()
-		if err != nil {
-			lastErr = err
-			if errors.Is(err, durablestream.ErrNotFound) && !recreated && ctx.Err() == nil {
-				// The companion stream disappeared after we cached its
-				// creation (expired or deleted server-side). Re-create and
-				// resend without consuming a send attempt, so recovery also
-				// works when the 404 lands on the final attempt. At most once:
-				// a second 404 after a successful re-create is a real failure.
-				recreated = true
-				s.snap.created = false
-				attempt--
+		// One append per attempt, bounded by the per-attempt timeout.
+		err := s.sendSnapshotRecord(ctx, data)
+		if err != nil && errors.Is(err, durablestreams.ErrStreamNotFound) && !recreated && ctx.Err() == nil {
+			// The companion stream disappeared after we cached its creation
+			// (expired or deleted server-side). Re-create and resend inline —
+			// no attempt consumed, no repeated backoff — so recovery also
+			// works when the 404 lands on the final attempt. At most once: a
+			// second 404 after a successful re-create is a real failure.
+			recreated = true
+			s.snap.created = false
+			if cerr := s.createSnapStream(ctx); cerr != nil {
+				lastErr = fmt.Errorf("create companion stream %q: %w", snapPath, cerr)
+				if ctx.Err() != nil || !isRetryable(cerr) {
+					return fmt.Errorf("durablestream: save snapshot %q: %w", snapshotID, lastErr)
+				}
 				continue
 			}
+			s.snap.created = true
+			err = s.sendSnapshotRecord(ctx, data)
+		}
+		if err != nil {
+			lastErr = err
 			if ctx.Err() != nil || !isRetryable(err) {
 				return fmt.Errorf("durablestream: save snapshot %q: %w", snapshotID, lastErr)
 			}
@@ -139,6 +137,15 @@ func (s *Store) SaveSnapshot(ctx context.Context, snapshotID string, atOffset ev
 		return nil
 	}
 	return fmt.Errorf("durablestream: save snapshot %q: giving up after %d attempts: %w", snapshotID, s.cfg.retryAttempts, lastErr)
+}
+
+// sendSnapshotRecord performs one append round trip, bounded by the
+// per-attempt timeout.
+func (s *Store) sendSnapshotRecord(ctx context.Context, data []byte) error {
+	attemptCtx, cancel := context.WithTimeout(ctx, s.cfg.timeout)
+	defer cancel()
+	_, err := s.snapStream.Append(attemptCtx, data)
+	return err
 }
 
 // LoadSnapshot implements eventbus.EventStoreSnapshotter: it reads the
@@ -162,10 +169,11 @@ func (s *Store) LoadSnapshot(ctx context.Context, snapshotID string) (eventbus.O
 		blob     json.RawMessage
 	)
 
-	offset := durablestream.ZeroOffset
+	offset := eventbus.OffsetOldest
 	for {
-		var result *durablestream.StreamData
+		var result *durablestreams.Chunk
 		var lastErr error
+		done := false
 		for attempt := 1; attempt <= s.cfg.retryAttempts; attempt++ {
 			if attempt > 1 {
 				if err := backoff(ctx, s.cfg.retryBaseDelay, attempt-1); err != nil {
@@ -176,11 +184,20 @@ func (s *Store) LoadSnapshot(ctx context.Context, snapshotID string) (eventbus.O
 				return eventbus.OffsetOldest, nil, fmt.Errorf("durablestream: load snapshot %q: %w", snapshotID, err)
 			}
 
+			// One iterator per attempt, consumed for one chunk, with its own
+			// timeout window.
 			attemptCtx, cancel := context.WithTimeout(ctx, s.cfg.timeout)
-			res, err := s.client.Reader(snapPath, offset).Read(attemptCtx)
+			it := s.snapStream.Read(attemptCtx, durablestreams.WithOffset(toWireOffset(offset)))
+			res, err := it.Next()
+			it.Close()
 			cancel()
 			if err != nil {
-				if errors.Is(err, durablestream.ErrNotFound) {
+				if errors.Is(err, durablestreams.Done) {
+					// Caught up: nothing after offset.
+					done = true
+					break
+				}
+				if errors.Is(err, durablestreams.ErrStreamNotFound) {
 					// The companion stream is absent: never created, expired,
 					// or deleted while we were paging through it. A record
 					// already found on an earlier page is still the best
@@ -190,7 +207,7 @@ func (s *Store) LoadSnapshot(ctx context.Context, snapshotID string) (eventbus.O
 					}
 					return eventbus.OffsetOldest, nil, nil
 				}
-				if errors.Is(err, durablestream.ErrGone) {
+				if errors.Is(err, durablestreams.ErrOffsetGone) {
 					// The companion stream's head was trimmed by server-side
 					// retention. The protocol offers no way to discover the
 					// earliest retained offset, so any records that survived
@@ -208,6 +225,9 @@ func (s *Store) LoadSnapshot(ctx context.Context, snapshotID string) (eventbus.O
 				continue
 			}
 			result = res
+			break
+		}
+		if done {
 			break
 		}
 		if result == nil {
@@ -254,12 +274,19 @@ func (s *Store) LoadSnapshot(ctx context.Context, snapshotID string) (eventbus.O
 			found = true
 			atOffset = eventbus.Offset(record.AtOffset)
 			blob = record.Blob
+			// A nil blob marshals as the JSON literal null; normalize it back
+			// so blob == nil discrimination behaves like the SQLite store's
+			// (which stores and returns nil).
+			if len(blob) == 0 || string(blob) == "null" {
+				blob = nil
+			}
 		}
 
-		if result.UpToDate || result.NextOffset == offset {
+		next := eventbus.Offset(result.NextOffset)
+		if result.UpToDate || next == offset {
 			break
 		}
-		offset = result.NextOffset
+		offset = next
 	}
 
 	if !found {
@@ -275,10 +302,7 @@ func (s *Store) LoadSnapshot(ctx context.Context, snapshotID string) (eventbus.O
 func (s *Store) createSnapStream(ctx context.Context) error {
 	attemptCtx, cancel := context.WithTimeout(ctx, s.cfg.timeout)
 	defer cancel()
-	_, err := s.client.Create(attemptCtx, s.path+snapStreamSuffix, &durablestream.CreateOptions{
-		ContentType: "application/json",
-	})
-	return err
+	return s.snapStream.Create(attemptCtx, durablestreams.WithContentType("application/json"))
 }
 
 // handleSnapshotDecodeError reports a malformed snapshot record that is being

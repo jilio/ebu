@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
@@ -163,7 +165,7 @@ func TestTailMissingStreamYieldsError(t *testing.T) {
 		t.Fatalf("New() error = %v", err)
 	}
 	// Point at a stream that was never created by deleting it first.
-	if err := store.Client().Delete(context.Background(), "tail-error-test"); err != nil {
+	if err := store.Client().Stream(store.StreamURL()).Delete(context.Background()); err != nil {
 		t.Fatalf("Delete() error = %v", err)
 	}
 
@@ -182,5 +184,85 @@ func TestTailMissingStreamYieldsError(t *testing.T) {
 	}
 	if errors.Is(tailErr, context.DeadlineExceeded) {
 		t.Fatalf("tail should fail fast on a permanent error, got %v", tailErr)
+	}
+}
+
+// TestTailRecoversFromTransientReadFailure pins the retry-and-rebuild path: a
+// transient 503 mid-tail must not end the tail — the iterator is rebuilt at
+// the last chunk boundary and events published afterwards still arrive.
+func TestTailRecoversFromTransientReadFailure(t *testing.T) {
+	srv := newFlakyServer()
+	defer srv.Close()
+
+	store, err := ds.New(srv.URL+"/v1/stream", "tail-transient", ds.WithRetry(3, time.Millisecond))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if _, err := store.Append(ctx, &eventbus.Event{Type: "tail.before", Data: json.RawMessage(`{}`)}); err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+	srv.failGet.Store(1) // first tail read 503s; the tail must recover
+
+	got := make(chan string, 4)
+	go func() {
+		for event, err := range store.Tail(ctx, eventbus.OffsetOldest) {
+			if err != nil {
+				t.Errorf("Tail yielded error: %v", err)
+				return
+			}
+			got <- event.Type
+		}
+	}()
+
+	want := func(expected string) {
+		t.Helper()
+		select {
+		case ty := <-got:
+			if ty != expected {
+				t.Fatalf("got event %q, want %q", ty, expected)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for %q", expected)
+		}
+	}
+	want("tail.before")
+
+	if _, err := store.Append(ctx, &eventbus.Event{Type: "tail.after", Data: json.RawMessage(`{}`)}); err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+	want("tail.after")
+}
+
+// TestReadCaughtUpWithoutOffsetHeader pins readChunk's fallback: a server
+// whose caught-up response carries no next-offset header must still resolve
+// the read to the request offset instead of rewinding to the start.
+func TestReadCaughtUpWithoutOffsetHeader(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/stream/", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			w.WriteHeader(http.StatusCreated)
+		case http.MethodGet:
+			w.WriteHeader(http.StatusNoContent) // caught up, no headers at all
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	store, err := ds.New(srv.URL+"/v1/stream", "no-offset-header")
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	events, next, err := store.Read(context.Background(), "0000000007", 0)
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	if len(events) != 0 || next != "0000000007" {
+		t.Fatalf("got (%d events, %q), want (0 events, request offset back)", len(events), next)
 	}
 }

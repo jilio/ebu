@@ -59,11 +59,15 @@ func (s *mirrorTailerComparerStore) CompareOffsets(left, right Offset) (int, err
 }
 
 // mirrorLegacyOffsets is a SubscriptionStore WITHOUT SubscriptionStoreLookup.
+// saveErr makes SaveOffset fail after savesBeforeErr successful saves.
 type mirrorLegacyOffsets struct {
-	mu      sync.Mutex
-	offsets map[string]Offset
-	saveErr error
-	loadErr error
+	mu             sync.Mutex
+	offsets        map[string]Offset
+	saves          int
+	savesBeforeErr int
+	saveErr        error
+	loadErr        error
+	history        []Offset
 }
 
 func newMirrorLegacyOffsets() *mirrorLegacyOffsets {
@@ -73,11 +77,19 @@ func newMirrorLegacyOffsets() *mirrorLegacyOffsets {
 func (s *mirrorLegacyOffsets) SaveOffset(_ context.Context, id string, offset Offset) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.saveErr != nil {
+	if s.saveErr != nil && s.saves >= s.savesBeforeErr {
 		return s.saveErr
 	}
+	s.saves++
 	s.offsets[id] = offset
+	s.history = append(s.history, offset)
 	return nil
+}
+
+func (s *mirrorLegacyOffsets) savedHistory() []Offset {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]Offset(nil), s.history...)
 }
 
 func (s *mirrorLegacyOffsets) LoadOffset(_ context.Context, id string) (Offset, error) {
@@ -523,7 +535,9 @@ func TestMirrorReportsFailedOffsetSave(t *testing.T) {
 	dst := NewMemoryStore()
 	offsets := newMirrorLegacyOffsets()
 	offsets.saveErr = errors.New("save boom")
+	offsets.savesBeforeErr = 1 // the first save proves the store, later ones fail
 	mirrorSeed(t, src, "save-1")
+	mirrorSeed(t, src, "save-2")
 
 	collector := &errorCollector{}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -532,9 +546,119 @@ func TestMirrorReportsFailedOffsetSave(t *testing.T) {
 		MirrorOnError(collector.add),
 	)
 	// Events still flow: the checkpoint is redundant with the events.
-	mirrorWaitFor(t, func() bool { return mirrorCount(t, dst) == 1 })
+	mirrorWaitFor(t, func() bool { return mirrorCount(t, dst) == 2 })
 	mirrorWaitFor(t, func() bool { return collector.contains("save offset") })
 	mirrorShutdown(t, cancel, done)
+}
+
+// TestMirrorFirstCheckpointSaveFailureIsFatalOnEmptyChunk covers the fatal
+// path through the empty-chunk resume-token advance.
+func TestMirrorFirstCheckpointSaveFailureIsFatalOnEmptyChunk(t *testing.T) {
+	src := &mirrorScriptStore{
+		readFn: func(_ context.Context, from Offset, _ int) ([]*StoredEvent, Offset, error) {
+			if from == OffsetOldest {
+				return nil, "05", nil // empty chunk: the resume token advances
+			}
+			return nil, from, nil
+		},
+	}
+	offsets := newMirrorLegacyOffsets()
+	offsets.saveErr = errors.New("incompatible token")
+
+	done := runMirror(context.Background(), src, NewMemoryStore(), "fatal-chunk", offsets, MirrorPollInterval(2*time.Millisecond))
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "initial checkpoint save failed") {
+			t.Fatalf("got %v, want fatal initial checkpoint error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Mirror did not fail fast on the first checkpoint save")
+	}
+}
+
+// TestMirrorTailCancelDuringInPlaceRetry covers cancellation while the tail
+// path is backing off between in-place append retries.
+func TestMirrorTailCancelDuringInPlaceRetry(t *testing.T) {
+	e1 := &StoredEvent{Offset: "01", ID: "t-1", Type: "t", Data: json.RawMessage(`1`)}
+	src := mirrorScriptedTailer(nil, []any{e1})
+	collector := &errorCollector{}
+	dst := &mirrorScriptStore{
+		appendFn: func(context.Context, *Event) (Offset, error) {
+			return OffsetOldest, errors.New("append boom")
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runMirror(ctx, src, dst, "tail-retry-cancel", NewMemoryStore(),
+		MirrorPollInterval(time.Hour), MirrorOnError(collector.add))
+	mirrorWaitFor(t, func() bool { return collector.contains("append boom") })
+	mirrorShutdown(t, cancel, done)
+}
+
+// TestMirrorRewindResetSaveFailureIsReported covers the reset path whose
+// direct SaveOffset fails: the reset is reported, and so is the failed save.
+func TestMirrorRewindResetSaveFailureIsReported(t *testing.T) {
+	offsets := newMirrorLegacyOffsets()
+	if err := offsets.SaveOffset(context.Background(), "reset-save", "40"); err != nil {
+		t.Fatalf("seed checkpoint: %v", err)
+	}
+	offsets.saveErr = errors.New("save boom")
+
+	src := mirrorRewindFixture(func(int) ([]*StoredEvent, Offset, error) {
+		return nil, "30", nil // tail permanently behind the checkpoint
+	})
+
+	collector := &errorCollector{}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runMirror(ctx, src, NewMemoryStore(), "reset-save", offsets,
+		MirrorPollInterval(2*time.Millisecond),
+		MirrorResetOnSourceRewind(),
+		MirrorOnError(collector.add))
+	mirrorWaitFor(t, func() bool {
+		return collector.contains("source log was rebuilt") && collector.contains("save offset")
+	})
+	mirrorShutdown(t, cancel, done)
+}
+
+// TestMirrorFirstCheckpointSaveFailureIsFatalOnTail is the tail-path variant
+// of the misconfiguration fail-fast.
+func TestMirrorFirstCheckpointSaveFailureIsFatalOnTail(t *testing.T) {
+	e1 := &StoredEvent{Offset: "01", ID: "t-1", Type: "t", Data: json.RawMessage(`1`)}
+	src := mirrorScriptedTailer(nil, []any{e1})
+	offsets := newMirrorLegacyOffsets()
+	offsets.saveErr = errors.New("incompatible token")
+
+	done := runMirror(context.Background(), src, NewMemoryStore(), "fatal-tail", offsets, MirrorPollInterval(2*time.Millisecond))
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "initial checkpoint save failed") {
+			t.Fatalf("got %v, want fatal initial checkpoint error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Mirror did not fail fast on the first checkpoint save")
+	}
+}
+
+// TestMirrorFirstCheckpointSaveFailureIsFatal pins the misconfiguration
+// fail-fast: a checkpoint store that cannot store the source's offset tokens
+// fails the very first save, and Mirror must end with an error instead of
+// running healthily while every restart would re-copy the whole source.
+func TestMirrorFirstCheckpointSaveFailureIsFatal(t *testing.T) {
+	src := NewMemoryStore()
+	dst := NewMemoryStore()
+	offsets := newMirrorLegacyOffsets()
+	offsets.saveErr = errors.New("incompatible token")
+	mirrorSeed(t, src, "fatal-1")
+
+	done := runMirror(context.Background(), src, dst, "fatal", offsets, MirrorPollInterval(2*time.Millisecond))
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "initial checkpoint save failed") {
+			t.Fatalf("got %v, want fatal initial checkpoint error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Mirror did not fail fast on the first checkpoint save")
+	}
 }
 
 // --- deduplication ---------------------------------------------------------
@@ -621,6 +745,100 @@ func TestMirrorBulkCopyDoesNotSleepBetweenBatches(t *testing.T) {
 	done := runMirror(ctx, src, dst, "bulk", offsets, MirrorPollInterval(time.Hour))
 	mirrorWaitFor(t, func() bool { return mirrorCount(t, dst) == n })
 	mirrorShutdown(t, cancel, done)
+}
+
+// TestMirrorInPlaceRetryDoesNotReforwardPrefix pins the retry strategy: a
+// failed append retries that event in place instead of re-reading the batch,
+// so the already forwarded prefix is never re-appended — proven with the
+// dedup window disabled entirely.
+func TestMirrorInPlaceRetryDoesNotReforwardPrefix(t *testing.T) {
+	batch := []*StoredEvent{
+		{Offset: "01", ID: "a", Type: "t", Data: json.RawMessage(`1`)},
+		{Offset: "02", ID: "b", Type: "t", Data: json.RawMessage(`2`)},
+		{Offset: "03", ID: "c", Type: "t", Data: json.RawMessage(`3`)},
+	}
+	src := &mirrorScriptStore{
+		readFn: func(_ context.Context, from Offset, _ int) ([]*StoredEvent, Offset, error) {
+			if from == OffsetOldest {
+				return batch, "03", nil
+			}
+			return nil, from, nil
+		},
+	}
+
+	inner := NewMemoryStore()
+	var mu sync.Mutex
+	cFailures := 0
+	dst := &mirrorScriptStore{
+		appendFn: func(ctx context.Context, event *Event) (Offset, error) {
+			if event.ID == "c" {
+				mu.Lock()
+				cFailures++
+				n := cFailures
+				mu.Unlock()
+				if n <= 2 {
+					return OffsetOldest, errors.New("append boom")
+				}
+			}
+			return inner.Append(ctx, event)
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runMirror(ctx, src, dst, "inplace", NewMemoryStore(),
+		MirrorPollInterval(2*time.Millisecond), MirrorDedupWindow(0))
+	mirrorWaitFor(t, func() bool { return mirrorCount(t, inner) == 3 })
+	mirrorShutdown(t, cancel, done)
+
+	got, _, _ := inner.Read(context.Background(), OffsetOldest, 0)
+	counts := make(map[string]int)
+	for _, stored := range got {
+		counts[stored.ID]++
+	}
+	for _, id := range []string{"a", "b", "c"} {
+		if counts[id] != 1 {
+			t.Fatalf("event %q appended %d times, want exactly once (counts=%v)", id, counts[id], counts)
+		}
+	}
+}
+
+// TestMirrorCheckpointNeverMovesBackward pins the monotonicity guard: a chunk
+// can interleave an exact embedded offset with a lower chunk-start token, and
+// the durable checkpoint must keep the higher one.
+func TestMirrorCheckpointNeverMovesBackward(t *testing.T) {
+	batch := []*StoredEvent{
+		{Offset: "04", ID: "m-1", Type: "t", Data: json.RawMessage(`1`)}, // embedded offset
+		{Offset: "03", ID: "m-2", Type: "t", Data: json.RawMessage(`2`)}, // lower chunk-start token
+	}
+	src := &mirrorComparerStore{
+		mirrorScriptStore: mirrorScriptStore{
+			readFn: func(_ context.Context, from Offset, _ int) ([]*StoredEvent, Offset, error) {
+				if from == OffsetOldest {
+					return batch, "04", nil
+				}
+				return nil, from, nil
+			},
+		},
+		compareFn: func(left, right Offset) (int, error) {
+			return strings.Compare(string(left), string(right)), nil
+		},
+	}
+	dst := NewMemoryStore()
+	offsets := newMirrorLegacyOffsets()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runMirror(ctx, src, dst, "monotonic", offsets, MirrorPollInterval(2*time.Millisecond))
+	mirrorWaitFor(t, func() bool { return mirrorCount(t, dst) == 2 })
+	mirrorShutdown(t, cancel, done)
+
+	for _, saved := range offsets.savedHistory() {
+		if saved == "03" {
+			t.Fatalf("checkpoint moved backward: %v", offsets.savedHistory())
+		}
+	}
+	if offsets.saved("monotonic") != "04" {
+		t.Fatalf("final checkpoint = %q, want 04", offsets.saved("monotonic"))
+	}
 }
 
 // --- store contract corners ------------------------------------------------
@@ -883,6 +1101,44 @@ func TestMirrorRewindRecoversFromErroringSource(t *testing.T) {
 	got, _, _ := dst.Read(context.Background(), OffsetOldest, 0)
 	if got[0].ID != "reborn-1" {
 		t.Fatalf("destination = %+v, want reborn-1", got)
+	}
+}
+
+// TestMirrorRewindSingleGlitchDoesNotReset pins the two-check confirmation:
+// one transiently stale tail read (a lagging replica) must not destroy the
+// checkpoint and trigger a full re-append.
+func TestMirrorRewindSingleGlitchDoesNotReset(t *testing.T) {
+	dst := NewMemoryStore()
+	offsets := NewMemoryStore()
+	if err := offsets.SaveOffset(context.Background(), "glitch", "40"); err != nil {
+		t.Fatalf("seed checkpoint: %v", err)
+	}
+
+	src := mirrorRewindFixture(func(call int) ([]*StoredEvent, Offset, error) {
+		if call == 2 {
+			return nil, "30", nil // one stale tail read
+		}
+		return nil, "50", nil // otherwise healthy: checkpoint 40 <= tail 50
+	})
+
+	collector := &errorCollector{}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runMirror(ctx, src, dst, "glitch", offsets,
+		MirrorPollInterval(2*time.Millisecond),
+		MirrorResetOnSourceRewind(),
+		MirrorOnError(collector.add))
+
+	mirrorWaitFor(t, func() bool { return collector.contains("if the next check agrees") })
+	// Give several more reconcile cycles a chance to (wrongly) confirm.
+	time.Sleep(100 * time.Millisecond)
+	mirrorShutdown(t, cancel, done)
+
+	if collector.contains("source log was rebuilt") {
+		t.Fatal("a single stale tail read must not reset the checkpoint")
+	}
+	saved, _, err := offsets.LookupOffset(context.Background(), "glitch")
+	if err != nil || saved != "40" {
+		t.Fatalf("checkpoint = (%q, %v), want unchanged 40", saved, err)
 	}
 }
 

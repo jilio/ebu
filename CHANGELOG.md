@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Durable-streams store now uses the official protocol client.** The store
+  is rebuilt on `github.com/durable-streams/durable-streams/packages/client-go`
+  (the Go client from the protocol monorepo, zero dependencies), replacing
+  the third-party `ahimsalabs/durable-streams-go` — the module now pulls no
+  third-party code beyond the protocol authors' own client. The store's
+  public API and offset semantics are unchanged, with two visible effects:
+  `Store.Client()` now returns the official `*durablestreams.Client` (a new
+  `Store.StreamURL()` accessor complements it), and appends are independent
+  stateless POSTs — the previous writer-session caching and its append
+  serialization are gone, so concurrent appends no longer queue on one
+  mutex. Retries remain owned by the store's `WithRetry` policy; the
+  client's internal retries are disabled so one protocol call consumes
+  exactly one attempt.
+
+### Fixed
+
+- **`Follow` catch-up no longer sleeps between full batches.** The poll loop
+  compared the store's next-read token against the per-event advanced
+  cursor, so a full batch whose last event carries the batch's resume token
+  looked like "at the tail" and slept `FollowPollInterval` per batch,
+  capping catch-up at batch-size/poll-interval (~500 events/s at defaults).
+  Progress is now measured against the offset the batch was read from; a
+  read that genuinely makes no progress still waits.
+
 ### Added
 
 - **Durable-streams snapshots.** The durable-streams store now implements
@@ -39,17 +65,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   producers' event types and never skips an unregistered type. Progress is
   durable and required: `Mirror` resumes from the offset saved under its
   subscription ID and checkpoints after each forwarded event, starting from
-  `OffsetOldest` on the first run. Delivery into the destination is
-  at-least-once — a crash between append and checkpoint re-forwards that
-  event, with IDs preserved so downstream consumers deduplicate as usual;
-  `MirrorDedupWindow` absorbs re-reads within one call. Failures are reported
-  to `MirrorOnError` and retried after `MirrorPollInterval`; `MirrorOnForward`
-  observes each forwarded event for metrics. `MirrorResetOnSourceRewind` opts
-  into recovery when a rebuilt/restored source leaves the checkpoint past the
-  source tail (requires the source to implement `EventStoreOffsetComparer`):
-  the mirror resets to the start instead of stalling silently, at the cost of
-  re-appended history. Sources implementing `EventStoreTailer` are tailed;
-  others are polled.
+  `OffsetOldest` on the first run; a failure to persist the very first
+  checkpoint is fatal (the signature of a checkpoint store that cannot store
+  the source's offset tokens), and when the source implements
+  `EventStoreOffsetComparer` the checkpoint never moves backward. Delivery
+  into the destination is at-least-once — a crash between append and
+  checkpoint re-forwards that event, with IDs preserved so downstream
+  consumers deduplicate as usual; a failed append is retried in place (the
+  forwarded prefix of a batch is never re-read), and `MirrorDedupWindow`
+  absorbs chunk-token re-reads. Failures are reported to `MirrorOnError` and
+  retried after `MirrorPollInterval`; `MirrorOnForward` observes each
+  forwarded event for metrics. `MirrorResetOnSourceRewind` opts into
+  recovery when a rebuilt/restored source leaves the checkpoint past the
+  source tail (requires `EventStoreOffsetComparer`): the mirror resets to
+  the start instead of stalling silently — throttled, and only after two
+  consecutive checks agree, so one stale tail read cannot destroy the
+  checkpoint. Sources implementing `EventStoreTailer` are tailed; others are
+  polled.
 
 ## [0.17.0] - 2026-07-13
 

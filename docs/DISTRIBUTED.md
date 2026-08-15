@@ -155,8 +155,12 @@ What makes it a replicator rather than a follower:
 - **At-least-once into the destination.** The checkpoint is saved after each
   append, so a crash between the two re-forwards that event. IDs are
   preserved, so consumers of the destination deduplicate exactly as they
-  would on the source; `MirrorDedupWindow` (default 1024) additionally
-  absorbs re-reads within one call so transient retries do not duplicate.
+  would on the source. Within one call, a failed append retries that event
+  in place — the already forwarded prefix of a batch is never re-read — and
+  `MirrorDedupWindow` (default 1024) absorbs chunk-token re-reads after
+  restarts. When the source implements `EventStoreOffsetComparer`, the
+  checkpoint also never moves backward, even when a read redelivers earlier
+  events.
 - **Source order is preserved** — events append one at a time, in log order.
 - **One direction only.** Nothing marks an event as "already mirrored", so
   two mirrors forming a cycle copy events forever.
@@ -175,11 +179,14 @@ A rebuilt source (restored from backup, recreated stream) can leave the saved
 checkpoint *past* the source's new tail, which reads as "at the tail" forever
 — the mirror would silently stop. `MirrorResetOnSourceRewind()` opts into
 recovery: the mirror compares its checkpoint against the source tail (at
-startup, on non-progressing polls, and at tail restarts, via the source's
-`EventStoreOffsetComparer`) and resets to `OffsetOldest` when the checkpoint
-is ahead, reporting the reset. It is off by default because the reset
-re-appends the surviving source history — duplicates the destination's
-consumers must absorb by ID. Two honest limits: a `Tail` source that treats
+startup, on non-progressing polls and read errors, and at tail restarts, via
+the source's `EventStoreOffsetComparer`) and resets to `OffsetOldest` when
+the checkpoint is ahead, reporting the reset. Checks are throttled (roughly
+one per ten poll intervals) and the destructive reset requires two
+consecutive checks to agree, so one transiently stale tail read cannot
+destroy the checkpoint. It is off by default because the reset re-appends
+the surviving source history — duplicates the destination's consumers must
+absorb by ID. Two honest limits: a `Tail` source that treats
 an ahead-of-tail offset as a blocked idle long-poll (rather than ending the
 tail) is only checked at startup; and a source restored *and refilled past*
 the checkpoint is indistinguishable from ordinary progress by offsets alone —

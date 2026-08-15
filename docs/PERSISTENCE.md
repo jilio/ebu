@@ -190,7 +190,7 @@ SQLite store features:
 
 Remote storage using the [Durable Streams](https://electric-sql.com/blog/2025/12/09/announcing-durable-streams) protocol - an HTTP-based persistent stream primitive for reliable, resumable, real-time data streaming developed by [Electric](https://electric-sql.com).
 
-This implementation uses the [ahimsalabs/durable-streams-go](https://github.com/ahimsalabs/durable-streams-go) client library, which passes the official durable-streams conformance test suite:
+This implementation uses the official Go client from the protocol monorepo, [durable-streams/packages/client-go](https://github.com/durable-streams/durable-streams/tree/main/packages/client-go):
 
 ```go
 import (
@@ -217,7 +217,7 @@ eventbus.Publish(bus, UserCreatedEvent{UserID: "123"})
 
 Durable-streams features:
 - HTTP-based protocol for distributed systems
-- Full protocol conformance via tested client library
+- Official protocol client (zero dependencies)
 - Compatible with any durable-streams server implementation
 - Configurable timeouts and HTTP client
 - Server-assigned opaque offsets

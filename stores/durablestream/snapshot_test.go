@@ -10,9 +10,16 @@ import (
 	"testing"
 	"time"
 
+	durablestreams "github.com/durable-streams/durable-streams/packages/client-go"
 	eventbus "github.com/jilio/ebu"
 	ds "github.com/jilio/ebu/stores/durablestream"
 )
+
+// rawCompanionStream returns a raw protocol handle for a store's snapshot
+// companion stream, bypassing the store API (for corruption/deletion tests).
+func rawCompanionStream(store *ds.Store) *durablestreams.Stream {
+	return store.Client().Stream(store.StreamURL() + ".snap")
+}
 
 func newSnapshotStore(t *testing.T, baseURL, path string, opts ...ds.Option) *ds.Store {
 	t.Helper()
@@ -76,6 +83,27 @@ func TestSnapshotLoadMissing(t *testing.T) {
 			t.Errorf("got (%q, %s), want (OffsetOldest, nil)", atOffset, blob)
 		}
 	})
+}
+
+func TestSnapshotLoadEmptyCompanionStreamIsMiss(t *testing.T) {
+	srv := newTestServer()
+	defer srv.Close()
+	store := newSnapshotStore(t, srv.URL, "snap-empty-companion")
+	ctx := context.Background()
+
+	// A companion stream that exists but holds no records (e.g. created, then
+	// its history expired record-by-record is impossible — but a raw create
+	// is): the caught-up read must resolve to a clean miss.
+	if err := rawCompanionStream(store).Create(ctx, durablestreams.WithContentType("application/json")); err != nil {
+		t.Fatalf("create empty companion: %v", err)
+	}
+	atOffset, blob, err := store.LoadSnapshot(ctx, "users")
+	if err != nil {
+		t.Fatalf("LoadSnapshot() error = %v", err)
+	}
+	if atOffset != eventbus.OffsetOldest || blob != nil {
+		t.Errorf("got (%q, %s), want (OffsetOldest, nil)", atOffset, blob)
+	}
 }
 
 func TestSnapshotLastWriteWins(t *testing.T) {
@@ -244,13 +272,9 @@ func TestSnapshotPlusTailEqualsFullReplay(t *testing.T) {
 
 // corruptSnapStream appends a record that is valid JSON but cannot decode
 // into a snapshot record (a bare string), directly via the protocol client.
-func corruptSnapStream(t *testing.T, store *ds.Store, snapPath string) {
+func corruptSnapStream(t *testing.T, store *ds.Store) {
 	t.Helper()
-	writer, err := store.Client().Writer(context.Background(), snapPath)
-	if err != nil {
-		t.Fatalf("companion writer: %v", err)
-	}
-	if err := writer.Send([]byte(`"junk-record"`), nil); err != nil {
+	if _, err := rawCompanionStream(store).Append(context.Background(), []byte(`"junk-record"`)); err != nil {
 		t.Fatalf("append junk record: %v", err)
 	}
 }
@@ -267,7 +291,7 @@ func TestSnapshotSkipsMalformedRecords(t *testing.T) {
 	if err := store.SaveSnapshot(ctx, "users", "1_0", json.RawMessage(`{"v":1}`)); err != nil {
 		t.Fatalf("SaveSnapshot() error = %v", err)
 	}
-	corruptSnapStream(t, store, "snap-malformed.snap")
+	corruptSnapStream(t, store)
 	if err := store.SaveSnapshot(ctx, "users", "2_0", json.RawMessage(`{"v":2}`)); err != nil {
 		t.Fatalf("SaveSnapshot(2) error = %v", err)
 	}
@@ -295,7 +319,7 @@ func TestSnapshotLoggerFallbackForMalformed(t *testing.T) {
 	if err := store.SaveSnapshot(ctx, "users", "3_0", json.RawMessage(`{"ok":true}`)); err != nil {
 		t.Fatalf("SaveSnapshot() error = %v", err)
 	}
-	corruptSnapStream(t, store, "snap-logger.snap")
+	corruptSnapStream(t, store)
 
 	atOffset, _, err := store.LoadSnapshot(ctx, "users")
 	if err != nil {
@@ -443,7 +467,7 @@ func newSnapPageServer(page1 string, failStatus int) *httptest.Server {
 		case http.MethodPut:
 			w.WriteHeader(http.StatusCreated)
 		case http.MethodGet:
-			if r.URL.Query().Get("offset") == "" {
+			if durablestreams.Offset(r.URL.Query().Get("offset")).IsStart() {
 				w.Header().Set("Content-Type", "application/json")
 				w.Header().Set("Stream-Next-Offset", "p2")
 				// Deliberately not up-to-date: the loader must fetch page 2.
@@ -517,7 +541,7 @@ func TestSnapshotSaveRecreatesDeletedCompanionStream(t *testing.T) {
 		t.Fatalf("SaveSnapshot(1) error = %v", err)
 	}
 	// The companion stream disappears server-side (operator cleanup or TTL).
-	if err := store.Client().Delete(ctx, "snap-recreate.snap"); err != nil {
+	if err := rawCompanionStream(store).Delete(ctx); err != nil {
 		t.Fatalf("delete companion stream: %v", err)
 	}
 	// The next save must re-create it instead of failing until restart.
@@ -560,11 +584,7 @@ func TestSnapshotLoadReportsForeignRecords(t *testing.T) {
 	// An event envelope on the companion stream (pre-reservation stream or a
 	// raw protocol writer): decodes as a record with an empty snapshot_id.
 	// It must be skipped AND reported, never silently ignored.
-	writer, err := store.Client().Writer(ctx, "snap-foreign.snap")
-	if err != nil {
-		t.Fatalf("companion writer: %v", err)
-	}
-	if err := writer.Send([]byte(`{"type":"user.created","data":{"id":"u1"}}`), nil); err != nil {
+	if _, err := rawCompanionStream(store).Append(ctx, []byte(`{"type":"user.created","data":{"id":"u1"}}`)); err != nil {
 		t.Fatalf("append foreign envelope: %v", err)
 	}
 
@@ -592,11 +612,55 @@ func TestSnapshotSaveRecreatesWithSingleAttempt(t *testing.T) {
 	if err := store.SaveSnapshot(ctx, "users", "1_0", json.RawMessage(`{"v":1}`)); err != nil {
 		t.Fatalf("SaveSnapshot(1) error = %v", err)
 	}
-	if err := store.Client().Delete(ctx, "snap-recreate-one.snap"); err != nil {
+	if err := rawCompanionStream(store).Delete(ctx); err != nil {
 		t.Fatalf("delete companion stream: %v", err)
 	}
 	if err := store.SaveSnapshot(ctx, "users", "2_0", json.RawMessage(`{"v":2}`)); err != nil {
 		t.Fatalf("SaveSnapshot(2) with WithRetry(1) error = %v", err)
+	}
+
+	atOffset, _, err := store.LoadSnapshot(ctx, "users")
+	if err != nil || atOffset != "2_0" {
+		t.Fatalf("LoadSnapshot() = (%q, _, %v), want (2_0, _, nil)", atOffset, err)
+	}
+}
+
+func TestSnapshotNilBlobRoundTripsAsNil(t *testing.T) {
+	srv := newTestServer()
+	defer srv.Close()
+	store := newSnapshotStore(t, srv.URL, "snap-nil-blob")
+	ctx := context.Background()
+
+	if err := store.SaveSnapshot(ctx, "users", "1_0", nil); err != nil {
+		t.Fatalf("SaveSnapshot(nil) error = %v", err)
+	}
+	atOffset, blob, err := store.LoadSnapshot(ctx, "users")
+	if err != nil {
+		t.Fatalf("LoadSnapshot() error = %v", err)
+	}
+	if atOffset != "1_0" || blob != nil {
+		t.Fatalf("got (%q, %v), want (1_0, nil) — matching the SQLite store's nil round-trip", atOffset, blob)
+	}
+}
+
+// TestSnapshotSaveRecreateWithTransientCreateFailure drives the recovery
+// where the re-create itself fails transiently before succeeding on the next
+// attempt.
+func TestSnapshotSaveRecreateWithTransientCreateFailure(t *testing.T) {
+	srv := newFlakyServer()
+	defer srv.Close()
+	store := newSnapshotStore(t, srv.URL, "snap-recreate-flaky")
+	ctx := context.Background()
+
+	if err := store.SaveSnapshot(ctx, "users", "1_0", json.RawMessage(`{"v":1}`)); err != nil {
+		t.Fatalf("SaveSnapshot(1) error = %v", err)
+	}
+	if err := rawCompanionStream(store).Delete(ctx); err != nil {
+		t.Fatalf("delete companion stream: %v", err)
+	}
+	srv.failPut.Store(1) // the re-create 503s once, then succeeds
+	if err := store.SaveSnapshot(ctx, "users", "2_0", json.RawMessage(`{"v":2}`)); err != nil {
+		t.Fatalf("SaveSnapshot(2) error = %v", err)
 	}
 
 	atOffset, _, err := store.LoadSnapshot(ctx, "users")
@@ -614,7 +678,7 @@ func TestSnapshotSaveRecreateFailureSurfaces(t *testing.T) {
 	if err := store.SaveSnapshot(ctx, "users", "1_0", json.RawMessage(`{}`)); err != nil {
 		t.Fatalf("SaveSnapshot(1) error = %v", err)
 	}
-	if err := store.Client().Delete(ctx, "snap-recreate-fail.snap"); err != nil {
+	if err := rawCompanionStream(store).Delete(ctx); err != nil {
 		t.Fatalf("delete companion stream: %v", err)
 	}
 	// Re-creation itself fails permanently: the save must surface that.
@@ -640,11 +704,7 @@ func TestSnapshotLoadSkipsSymbolicOffsetRecord(t *testing.T) {
 	}
 	// A corrupt/foreign record claiming the symbolic tail as its offset: it
 	// must be skipped like any malformed record, keeping the good one.
-	writer, err := store.Client().Writer(ctx, "snap-symbolic.snap")
-	if err != nil {
-		t.Fatalf("companion writer: %v", err)
-	}
-	if err := writer.Send([]byte(`{"snapshot_id":"users","at_offset":"$","blob":{"v":666}}`), nil); err != nil {
+	if _, err := rawCompanionStream(store).Append(ctx, []byte(`{"snapshot_id":"users","at_offset":"$","blob":{"v":666}}`)); err != nil {
 		t.Fatalf("append symbolic record: %v", err)
 	}
 
