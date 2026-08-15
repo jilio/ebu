@@ -13,7 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `EventStoreSnapshotter` on a reserved companion stream (`<stream>.snap`,
   created lazily; the constructor now rejects stream paths ending in that
   suffix so an event stream cannot silently interleave with snapshot
-  records): each `SaveSnapshot` appends one record atomically and
+  records — a pre-existing deployment with a `.snap`-suffixed event stream
+  must copy it to a new path with the raw protocol client, or stay on
+  0.17.x, before upgrading): each `SaveSnapshot` appends one record
+  atomically and
   `LoadSnapshot` returns the newest record for the id (last-write-wins,
   matching the SQLite store's upsert), enabling bounded cold starts —
   `LoadSnapshotFrom` + `FollowFrom(offset)` instead of replaying the full

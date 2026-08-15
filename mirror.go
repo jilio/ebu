@@ -125,8 +125,14 @@ func MirrorResetOnSourceRewind() MirrorOption {
 // Progress is durable. The mirror resumes from the offset saved under
 // subscriptionID in offsets, and checkpoints after each forwarded event; on
 // the first run (no saved checkpoint) it starts from OffsetOldest, because a
-// mirror's job is the whole log. The checkpoint is a source offset; offsets
-// may be backed by src, dst, or a third store.
+// mirror's job is the whole log. The checkpoint is a SOURCE offset; offsets
+// may be backed by src, dst, or a third store, provided that store accepts
+// the source's offset tokens verbatim. A SubscriptionStore that parses or
+// validates offsets in its own native format (the bundled SQLite store's
+// SaveOffset accepts only its integer offsets) cannot checkpoint a source
+// with a different token format: every save fails, which is reported to
+// MirrorOnError but does not stop the mirror — the run looks healthy while
+// every restart silently starts over from OffsetOldest.
 //
 // Semantics:
 //   - Delivery into dst is at-least-once: a crash between Append and the
@@ -144,6 +150,12 @@ func MirrorResetOnSourceRewind() MirrorOption {
 //   - Runtime failures (read, append, checkpoint save) are reported to
 //     MirrorOnError and retried after MirrorPollInterval; the checkpoint does
 //     not advance past a failed event.
+//   - Source retention must not outpace the mirror. If the source drops
+//     events past the saved checkpoint (a remote stream head-trimmed by
+//     server-side retention), those events are unrecoverable and the mirror
+//     will not silently skip the gap: it keeps reporting the failing read
+//     and retrying. Recovery is an operator decision — clear or reseed the
+//     checkpoint to pick a new starting point.
 //
 // Mirror does not coordinate writers: run one mirror per subscriptionID, and
 // enforce that yourself — unlike Follow, Mirror is not bound to a bus, so it
@@ -224,15 +236,13 @@ func Mirror(ctx context.Context, src, dst EventStore, subscriptionID string, off
 		offset:       from,
 	}
 
-	// A rebuilt source is detectable before the first read; failing here makes
-	// store misbehavior a startup error rather than a silent stall.
-	if comparer != nil {
-		if err := m.reconcile(ctx); err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			return fmt.Errorf("eventbus: mirror %q: %w", subscriptionID, err)
-		}
+	// A rebuilt source is detectable before the first read. Like every later
+	// reconcile, the check is best-effort: a transient source error here is
+	// reported, not fatal — the same error one loop iteration later would be
+	// retried forever, and the check reruns on non-progressing polls, read
+	// errors, and tail restarts.
+	if err := m.maybeReconcile(ctx); err != nil {
+		return err
 	}
 
 	if tailer, ok := src.(EventStoreTailer); ok {
@@ -271,6 +281,13 @@ pollLoop:
 				return ctx.Err()
 			}
 			m.report(fmt.Errorf("mirror: read after offset %s: %w", readFrom, err))
+			// A rebuilt source may reject the stale checkpoint with an error
+			// rather than answer with an empty read, so the rewind check must
+			// run on this path too (runTail already reconciles after tail
+			// errors for the same reason).
+			if err := m.maybeReconcile(ctx); err != nil {
+				return err
+			}
 			if err := sleepCtx(ctx, m.cfg.pollInterval); err != nil {
 				return err
 			}

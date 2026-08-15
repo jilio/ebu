@@ -55,7 +55,16 @@
 // partially trimmed companion stream makes surviving records unreachable
 // (LoadSnapshot fails loudly rather than reporting a false miss). Expiring
 // the companion stream whole (stream TTL) is safe — it reads as "no
-// snapshot", and the next SaveSnapshot re-creates it.
+// snapshot", and the next SaveSnapshot re-creates it — but note it also
+// discards the newest snapshot, so the next cold start replays the full
+// main stream.
+//
+// Budget the companion stream deliberately: it grows by one full record per
+// save, and LoadSnapshot downloads all of it to return the newest record, so
+// cost is save cadence × blob size. Save on meaningful deltas rather than a
+// tight timer. A cheap LoadSnapshot needs protocol support (client trim, or
+// earliest-offset/last-record discovery); until servers offer that, this
+// client keeps LoadSnapshot correct rather than cheap.
 package durablestream
 
 import (

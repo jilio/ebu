@@ -147,7 +147,11 @@ What makes it a replicator rather than a follower:
   the given subscription ID) is a required argument — a mirror without one
   would re-copy the whole source on every restart. On the first run it starts
   from `OffsetOldest`: a mirror's job is the whole log. The checkpoint store
-  may be the source, the destination, or a third store.
+  may be the source, the destination, or a third store — but it must accept
+  the *source's* offset tokens verbatim (the bundled SQLite store's
+  `SaveOffset` parses its own integer format and cannot checkpoint an opaque
+  remote token; the failure is reported to `MirrorOnError`, and an ignored
+  one means every restart re-copies from the beginning).
 - **At-least-once into the destination.** The checkpoint is saved after each
   append, so a crash between the two re-forwards that event. IDs are
   preserved, so consumers of the destination deduplicate exactly as they
@@ -161,6 +165,11 @@ What makes it a replicator rather than a follower:
   `MirrorPollInterval`; the checkpoint never advances past a failed event;
   `Mirror` returns only on context cancellation or a startup failure. Sources
   implementing `EventStoreTailer` are tailed, others polled.
+- **Source retention must not outpace the mirror.** If the source drops
+  events past the saved checkpoint (server-side retention on a remote
+  stream), those events are unrecoverable; the mirror keeps reporting the
+  failing read rather than silently skipping the gap. Recovery — clearing or
+  reseeding the checkpoint — is an operator decision.
 
 A rebuilt source (restored from backup, recreated stream) can leave the saved
 checkpoint *past* the source's new tail, which reads as "at the tail" forever

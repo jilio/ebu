@@ -824,6 +824,68 @@ func TestMirrorRewindStartupReset(t *testing.T) {
 	}
 }
 
+// TestMirrorRewindRecoversFromErroringSource pins the read-error reconcile: a
+// rebuilt source may reject the stale checkpoint with an error rather than
+// answer with an empty read, and the rewind check must run on that path too.
+func TestMirrorRewindRecoversFromErroringSource(t *testing.T) {
+	dst := NewMemoryStore()
+	offsets := NewMemoryStore()
+	stale := Offset("05")
+	if err := offsets.SaveOffset(context.Background(), "err-rewind", stale); err != nil {
+		t.Fatalf("seed checkpoint: %v", err)
+	}
+
+	event := &StoredEvent{Offset: "01", ID: "reborn-1", Type: "t", Data: json.RawMessage(`1`)}
+	var mu sync.Mutex
+	tailCalls := 0
+	src := &mirrorComparerStore{
+		mirrorScriptStore: mirrorScriptStore{
+			readFn: func(_ context.Context, from Offset, _ int) ([]*StoredEvent, Offset, error) {
+				switch from {
+				case OffsetNewest:
+					mu.Lock()
+					tailCalls++
+					n := tailCalls
+					mu.Unlock()
+					if n == 1 {
+						return nil, "07", nil // startup: healthy, checkpoint <= tail
+					}
+					return nil, "02", nil // rebuilt tail, behind the checkpoint
+				case stale:
+					// The rebuild happened right after startup: the stale
+					// checkpoint now errors instead of reading as idle, so
+					// only the read-error path can trigger the reset.
+					return nil, from, errors.New("invalid offset")
+				case OffsetOldest:
+					return []*StoredEvent{event}, "01", nil
+				default:
+					return nil, from, nil
+				}
+			},
+		},
+		compareFn: func(left, right Offset) (int, error) {
+			return strings.Compare(string(left), string(right)), nil
+		},
+	}
+
+	collector := &errorCollector{}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runMirror(ctx, src, dst, "err-rewind", offsets,
+		MirrorPollInterval(2*time.Millisecond),
+		MirrorResetOnSourceRewind(),
+		MirrorOnError(collector.add))
+	mirrorWaitFor(t, func() bool { return mirrorCount(t, dst) == 1 })
+	mirrorShutdown(t, cancel, done)
+
+	if !collector.contains("source log was rebuilt") {
+		t.Fatal("reset after erroring read was not reported")
+	}
+	got, _, _ := dst.Read(context.Background(), OffsetOldest, 0)
+	if got[0].ID != "reborn-1" {
+		t.Fatalf("destination = %+v, want reborn-1", got)
+	}
+}
+
 func TestMirrorRewindStartupHealthyCheckpoint(t *testing.T) {
 	src := NewMemoryStore()
 	dst := NewMemoryStore()
@@ -889,47 +951,47 @@ func TestMirrorReconcileFailures(t *testing.T) {
 		return offsets
 	}
 
-	t.Run("startup tail read error", func(t *testing.T) {
-		src := mirrorRewindFixture(func(int) ([]*StoredEvent, Offset, error) {
+	// Startup reconcile failures are best-effort like every later one: they
+	// are reported, and the mirror keeps running (the same error one loop
+	// iteration later would be retried forever).
+	reportedNotFatal := func(t *testing.T, src EventStore, want string) {
+		t.Helper()
+		collector := &errorCollector{}
+		ctx, cancel := context.WithCancel(context.Background())
+		done := runMirror(ctx, src, dst, "m", checkpointed(),
+			MirrorPollInterval(2*time.Millisecond),
+			MirrorResetOnSourceRewind(),
+			MirrorOnError(collector.add))
+		mirrorWaitFor(t, func() bool { return collector.contains(want) })
+		mirrorShutdown(t, cancel, done)
+	}
+
+	t.Run("startup tail read error is reported, not fatal", func(t *testing.T) {
+		reportedNotFatal(t, mirrorRewindFixture(func(int) ([]*StoredEvent, Offset, error) {
 			return nil, OffsetOldest, errors.New("tail boom")
-		})
-		err := Mirror(context.Background(), src, dst, "m", checkpointed(), MirrorResetOnSourceRewind())
-		if err == nil || !strings.Contains(err.Error(), "resolve source tail") || !strings.Contains(err.Error(), "tail boom") {
-			t.Fatalf("got %v, want resolve source tail error", err)
-		}
+		}), "resolve source tail")
 	})
 
-	t.Run("startup tail returns events", func(t *testing.T) {
-		src := mirrorRewindFixture(func(int) ([]*StoredEvent, Offset, error) {
+	t.Run("tail returning events is reported", func(t *testing.T) {
+		reportedNotFatal(t, mirrorRewindFixture(func(int) ([]*StoredEvent, Offset, error) {
 			return []*StoredEvent{{Offset: "01"}}, "01", nil
-		})
-		err := Mirror(context.Background(), src, dst, "m", checkpointed(), MirrorResetOnSourceRewind())
-		if err == nil || !strings.Contains(err.Error(), "returned 1 event(s)") {
-			t.Fatalf("got %v, want events-on-tail error", err)
-		}
+		}), "returned 1 event(s)")
 	})
 
-	t.Run("startup tail stays symbolic", func(t *testing.T) {
-		src := mirrorRewindFixture(func(int) ([]*StoredEvent, Offset, error) {
+	t.Run("tail staying symbolic is reported", func(t *testing.T) {
+		reportedNotFatal(t, mirrorRewindFixture(func(int) ([]*StoredEvent, Offset, error) {
 			return nil, OffsetNewest, nil
-		})
-		err := Mirror(context.Background(), src, dst, "m", checkpointed(), MirrorResetOnSourceRewind())
-		if err == nil || !strings.Contains(err.Error(), "symbolic offset") {
-			t.Fatalf("got %v, want symbolic tail error", err)
-		}
+		}), "symbolic offset")
 	})
 
-	t.Run("startup compare error", func(t *testing.T) {
+	t.Run("compare error is reported", func(t *testing.T) {
 		src := mirrorRewindFixture(func(int) ([]*StoredEvent, Offset, error) {
 			return nil, "01", nil
 		})
 		src.compareFn = func(Offset, Offset) (int, error) {
 			return 0, errors.New("compare boom")
 		}
-		err := Mirror(context.Background(), src, dst, "m", checkpointed(), MirrorResetOnSourceRewind())
-		if err == nil || !strings.Contains(err.Error(), "compare checkpoint") {
-			t.Fatalf("got %v, want compare error", err)
-		}
+		reportedNotFatal(t, src, "compare checkpoint")
 	})
 
 	t.Run("startup reconcile with cancelled context", func(t *testing.T) {
@@ -959,6 +1021,44 @@ func TestMirrorReconcileFailures(t *testing.T) {
 			MirrorOnError(collector.add))
 		mirrorWaitFor(t, func() bool { return collector.contains("tail boom") })
 		mirrorShutdown(t, cancel, done)
+	})
+
+	t.Run("read-error reconcile with cancelled context", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		var mu sync.Mutex
+		tailCalls := 0
+		src := &mirrorComparerStore{
+			mirrorScriptStore: mirrorScriptStore{
+				readFn: func(_ context.Context, from Offset, _ int) ([]*StoredEvent, Offset, error) {
+					if from == OffsetNewest {
+						mu.Lock()
+						tailCalls++
+						n := tailCalls
+						mu.Unlock()
+						if n == 1 {
+							return nil, "05", nil // startup: healthy
+						}
+						cancel()
+						return nil, OffsetOldest, errors.New("tail boom")
+					}
+					return nil, from, errors.New("read boom") // forces the read-error path
+				},
+			},
+			compareFn: func(left, right Offset) (int, error) {
+				return strings.Compare(string(left), string(right)), nil
+			},
+		}
+		done := runMirror(ctx, src, dst, "m", checkpointed(),
+			MirrorPollInterval(2*time.Millisecond),
+			MirrorResetOnSourceRewind())
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("got %v, want context.Canceled", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("Mirror did not return")
+		}
 	})
 
 	t.Run("mid-run reconcile with cancelled context", func(t *testing.T) {

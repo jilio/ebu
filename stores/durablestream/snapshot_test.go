@@ -321,7 +321,8 @@ func TestSnapshotSaveRetriesTransientFailures(t *testing.T) {
 	store := newSnapshotStore(t, srv.URL, "snap-save-retry")
 	ctx := context.Background()
 
-	// One failed append POST; the retry succeeds.
+	// One failed append POST; the retry succeeds. (Creation and send share
+	// one attempt budget: each network call consumes one attempt.)
 	srv.failPost.Store(1)
 	if err := store.SaveSnapshot(ctx, "users", "1_0", json.RawMessage(`{}`)); err != nil {
 		t.Fatalf("SaveSnapshot() should succeed after retry, got %v", err)
@@ -376,8 +377,8 @@ func TestSnapshotCreateStreamFailure(t *testing.T) {
 	srv.failStatus.Store(http.StatusBadRequest)
 	srv.failPut.Store(100)
 	err := store.SaveSnapshot(context.Background(), "users", "1_0", json.RawMessage(`{}`))
-	if err == nil || !strings.Contains(err.Error(), "create snapshot stream") {
-		t.Fatalf("got %v, want create snapshot stream failure", err)
+	if err == nil || !strings.Contains(err.Error(), "create companion stream") {
+		t.Fatalf("got %v, want create companion stream failure", err)
 	}
 
 	// Transient create failures retry and then succeed.
@@ -473,16 +474,16 @@ func TestSnapshotLoadKeepsFoundRecordWhenLaterPageFails(t *testing.T) {
 		}
 	})
 
-	t.Run("head trimmed mid-read", func(t *testing.T) {
+	t.Run("head trimmed mid-read fails loudly despite an earlier record", func(t *testing.T) {
+		// A 410 mid-pagination means records NEWER than the earlier pages may
+		// survive beyond the trim point, unreachable; returning the earlier
+		// (stale) record silently would serve outdated state forever.
 		srv := newSnapPageServer(page1, http.StatusGone)
 		defer srv.Close()
 		store := newSnapshotStore(t, srv.URL, "snap-page-410")
-		atOffset, blob, err := store.LoadSnapshot(context.Background(), "users")
-		if err != nil {
-			t.Fatalf("LoadSnapshot() error = %v", err)
-		}
-		if atOffset != "1_0" || string(blob) != `{"v":1}` {
-			t.Errorf("got (%q, %s), want the page-1 record", atOffset, blob)
+		_, _, err := store.LoadSnapshot(context.Background(), "users")
+		if err == nil || !strings.Contains(err.Error(), "head-trimmed") {
+			t.Fatalf("got %v, want loud head-trimmed error", err)
 		}
 	})
 }
@@ -533,6 +534,77 @@ func TestSnapshotSaveRecreatesDeletedCompanionStream(t *testing.T) {
 	}
 }
 
+func TestSnapshotSaveRejectsEmptyID(t *testing.T) {
+	srv := newTestServer()
+	defer srv.Close()
+	store := newSnapshotStore(t, srv.URL, "snap-empty-id")
+
+	err := store.SaveSnapshot(context.Background(), "", "1_0", json.RawMessage(`{}`))
+	if err == nil || !strings.Contains(err.Error(), "snapshot ID cannot be empty") {
+		t.Fatalf("got %v, want empty-id rejection", err)
+	}
+}
+
+func TestSnapshotLoadReportsForeignRecords(t *testing.T) {
+	srv := newTestServer()
+	defer srv.Close()
+
+	var decodeErrs int
+	store := newSnapshotStore(t, srv.URL, "snap-foreign",
+		ds.WithDecodeErrorHandler(func(err error, raw []byte) { decodeErrs++ }))
+	ctx := context.Background()
+
+	if err := store.SaveSnapshot(ctx, "users", "1_0", json.RawMessage(`{"v":1}`)); err != nil {
+		t.Fatalf("SaveSnapshot() error = %v", err)
+	}
+	// An event envelope on the companion stream (pre-reservation stream or a
+	// raw protocol writer): decodes as a record with an empty snapshot_id.
+	// It must be skipped AND reported, never silently ignored.
+	writer, err := store.Client().Writer(ctx, "snap-foreign.snap")
+	if err != nil {
+		t.Fatalf("companion writer: %v", err)
+	}
+	if err := writer.Send([]byte(`{"type":"user.created","data":{"id":"u1"}}`), nil); err != nil {
+		t.Fatalf("append foreign envelope: %v", err)
+	}
+
+	atOffset, blob, err := store.LoadSnapshot(ctx, "users")
+	if err != nil {
+		t.Fatalf("LoadSnapshot() error = %v", err)
+	}
+	if atOffset != "1_0" || string(blob) != `{"v":1}` {
+		t.Errorf("got (%q, %s), want the genuine (1_0) record", atOffset, blob)
+	}
+	if decodeErrs == 0 {
+		t.Error("foreign record was not reported to the decode error handler")
+	}
+}
+
+// TestSnapshotSaveRecreatesWithSingleAttempt pins the recovery when the 404
+// lands on the final (here: only) attempt — the re-create must not consume a
+// send attempt, or WithRetry(1) could never recover.
+func TestSnapshotSaveRecreatesWithSingleAttempt(t *testing.T) {
+	srv := newTestServer()
+	defer srv.Close()
+	store := newSnapshotStore(t, srv.URL, "snap-recreate-one", ds.WithRetry(1, time.Millisecond))
+	ctx := context.Background()
+
+	if err := store.SaveSnapshot(ctx, "users", "1_0", json.RawMessage(`{"v":1}`)); err != nil {
+		t.Fatalf("SaveSnapshot(1) error = %v", err)
+	}
+	if err := store.Client().Delete(ctx, "snap-recreate-one.snap"); err != nil {
+		t.Fatalf("delete companion stream: %v", err)
+	}
+	if err := store.SaveSnapshot(ctx, "users", "2_0", json.RawMessage(`{"v":2}`)); err != nil {
+		t.Fatalf("SaveSnapshot(2) with WithRetry(1) error = %v", err)
+	}
+
+	atOffset, _, err := store.LoadSnapshot(ctx, "users")
+	if err != nil || atOffset != "2_0" {
+		t.Fatalf("LoadSnapshot() = (%q, _, %v), want (2_0, _, nil)", atOffset, err)
+	}
+}
+
 func TestSnapshotSaveRecreateFailureSurfaces(t *testing.T) {
 	srv := newFlakyServer()
 	defer srv.Close()
@@ -549,8 +621,8 @@ func TestSnapshotSaveRecreateFailureSurfaces(t *testing.T) {
 	srv.failStatus.Store(http.StatusBadRequest)
 	srv.failPut.Store(100)
 	err := store.SaveSnapshot(ctx, "users", "2_0", json.RawMessage(`{}`))
-	if err == nil || !strings.Contains(err.Error(), "create snapshot stream") {
-		t.Fatalf("got %v, want create snapshot stream failure", err)
+	if err == nil || !strings.Contains(err.Error(), "create companion stream") {
+		t.Fatalf("got %v, want create companion stream failure", err)
 	}
 }
 
@@ -619,7 +691,7 @@ func TestSnapshotCreateGivesUpOnTransientFailures(t *testing.T) {
 	// Every create attempt fails 503: retries exhaust and the save reports it.
 	srv.failPut.Store(100)
 	err := store.SaveSnapshot(context.Background(), "users", "1_0", json.RawMessage(`{}`))
-	if err == nil || !strings.Contains(err.Error(), "create snapshot stream") || !strings.Contains(err.Error(), "giving up") {
+	if err == nil || !strings.Contains(err.Error(), "create companion stream") || !strings.Contains(err.Error(), "giving up") {
 		t.Fatalf("got %v, want create giving-up failure", err)
 	}
 }
@@ -702,8 +774,8 @@ func TestSnapshotBackoffInterruptedByContext(t *testing.T) {
 		ctx, cancel := newCtx()
 		defer cancel()
 		err := store.SaveSnapshot(ctx, "users", "1_0", json.RawMessage(`{}`))
-		if err == nil || !strings.Contains(err.Error(), "create snapshot stream") {
-			t.Fatalf("got %v, want interrupted create", err)
+		if err == nil || !strings.Contains(err.Error(), "save snapshot") {
+			t.Fatalf("got %v, want interrupted save", err)
 		}
 	})
 
