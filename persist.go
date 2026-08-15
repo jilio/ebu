@@ -143,6 +143,11 @@ type SubscriptionStoreLookup interface {
 // bounding cold-start replay. The blob is opaque to ebu — callers define its
 // encoding. A store that does not implement this interface is simply not
 // compactable; callers fall back to a full replay from OffsetOldest.
+//
+// Implementations may reject snapshot IDs they cannot represent or
+// distinguish safely (a store whose snapshot log is externally writable
+// rejects the empty ID, which it could not tell apart from foreign data).
+// Portable callers should use non-empty IDs.
 type EventStoreSnapshotter interface {
 	// SaveSnapshot upserts the snapshot for snapshotID, recording that blob
 	// reflects the projection state as of (and including) atOffset. atOffset MUST

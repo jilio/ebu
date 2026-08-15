@@ -21,6 +21,7 @@ A lightweight, type-safe event bus for Go with generics support. Build decoupled
 - 🚀 **Zero dependencies** - Pure Go standard library (core package)
 - 💾 **Event persistence** - Built-in support for event storage and replay
 - 🔗 **Cross-process delivery** - `Follow` a shared store to span processes and machines
+- 🪞 **Log replication** - `Mirror` one store into another with envelopes preserved
 - 🌍 **Remote storage** - Native support for remote backends like [durable-streams](https://github.com/durable-streams/durable-streams)
 - 🔄 **Event upcasting** - Seamless event schema migration and versioning
 - ✅ **100% test coverage** - Thoroughly tested for reliability
@@ -368,6 +369,12 @@ eventbus.Publish(bus, OrderCreated{ID: "o-1"}) // peers receive it too
   publisher — observes the same events in the same order. Its default follower
   starts at the beginning so events appended before `Follow` starts are not
   lost; use a durable subscription ID to avoid replaying history on restart.
+
+To replicate a *log* rather than deliver to handlers, `eventbus.Mirror`
+tails one store and appends every event to another with the envelope
+preserved verbatim — a local write-ahead log shipped into a shared store, a
+store migration, a rebuilt replica. See the Distributed Guide's
+"Mirroring one log into another".
 
 See [**Distributed Guide**](docs/DISTRIBUTED.md) for delivery modes,
 failure behavior, and current limitations.

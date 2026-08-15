@@ -1,6 +1,4 @@
-github.com/ahimsalabs/durable-streams-go v0.0.0-20251220072926-9430608b4163 h1:AbU80hHRlHUFyLdHtmNyYs56f9iI6F9Z0CEZjFNRlC8=
-github.com/ahimsalabs/durable-streams-go v0.0.0-20251220072926-9430608b4163/go.mod h1:CRY4a4F3s64YLkAADqKNnEg3Nm4wUYe50QP8KLxpGpE=
-github.com/go4org/hashtriemap v0.0.0-20251130024219-545ba229f689 h1:0psnKZ+N2IP43/SZC8SKx6OpFJwLmQb9m9QyV9BC2f8=
-github.com/go4org/hashtriemap v0.0.0-20251130024219-545ba229f689/go.mod h1:OGmRfY/9QEK2P5zCRtmqfbCF283xPkU2dvVA4MvbvpI=
+github.com/durable-streams/durable-streams/packages/client-go v0.2.0 h1:s5QL0QEu06m954GVbV76Hl21sXCq2M9883PaoMI0oh4=
+github.com/durable-streams/durable-streams/packages/client-go v0.2.0/go.mod h1:G9l/FuZz1LWA1IhuCg6epPrMKU7Yd9805L4yC+0iuHc=
 github.com/jilio/ebu v0.17.0 h1:othm5FZ2bWkkukiCsFdff4yhB+VEqIjxsZk/9TOB/xk=
 github.com/jilio/ebu v0.17.0/go.mod h1:HudFk9G56WhAmSpucnJFC7nf6/uSpCcEZYS2sItng74=

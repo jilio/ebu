@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -13,19 +14,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ahimsalabs/durable-streams-go/durablestream"
-	"github.com/ahimsalabs/durable-streams-go/durablestream/memorystorage"
+	durablestreams "github.com/durable-streams/durable-streams/packages/client-go"
 	eventbus "github.com/jilio/ebu"
 	ds "github.com/jilio/ebu/stores/durablestream"
 )
 
-// newTestServer creates a test durable-streams server using the ahimsalabs handler.
+// newTestServer creates a minimal in-test durable-streams protocol server.
 func newTestServer() *httptest.Server {
-	storage := memorystorage.New()
-	handler := durablestream.NewHandler(storage, nil)
-	mux := http.NewServeMux()
-	mux.Handle("/v1/stream/", http.StripPrefix("/v1/stream/", handler))
-	return httptest.NewServer(mux)
+	return newProtoServer().Server
 }
 
 func TestNew(t *testing.T) {
@@ -890,6 +886,9 @@ func newChunkedServer(payloads []string, chunkSize int) *httptest.Server {
 				}
 				off = n
 			}
+			if off < 0 {
+				off = 0 // the protocol start-of-stream token parses negative
+			}
 			w.Header().Set("Content-Type", "application/json")
 			if off >= len(payloads) {
 				w.Header().Set("Stream-Next-Offset", strconv.Itoa(off))
@@ -1085,16 +1084,18 @@ func TestStore_ConcurrentAppends(t *testing.T) {
 }
 
 // newFlakyServer wraps a real durable-streams handler and fails requests on
-// demand: failHead/failPost/failGet hold the number of upcoming
-// HEAD/POST/GET requests to reject with failStatus (503 unless set).
+// demand: failHead/failPost/failGet/failPut hold the number of upcoming
+// HEAD/POST/GET/PUT requests to reject with failStatus (503 unless set).
 type flakyServer struct {
 	*httptest.Server
 	heads      atomic.Int32
 	posts      atomic.Int32
 	gets       atomic.Int32
+	puts       atomic.Int32
 	failHead   atomic.Int32
 	failPost   atomic.Int32
 	failGet    atomic.Int32
+	failPut    atomic.Int32
 	failStatus atomic.Int32
 }
 
@@ -1107,8 +1108,8 @@ func (fs *flakyServer) fail(w http.ResponseWriter) {
 }
 
 func newFlakyServer() *flakyServer {
-	storage := memorystorage.New()
-	handler := durablestream.NewHandler(storage, nil)
+	ps := &protoServer{streams: make(map[string]*protoStream)}
+	handler := http.HandlerFunc(ps.handle)
 
 	fs := &flakyServer{}
 	mux := http.NewServeMux()
@@ -1132,6 +1133,13 @@ func newFlakyServer() *flakyServer {
 			fs.gets.Add(1)
 			if fs.failGet.Load() > 0 {
 				fs.failGet.Add(-1)
+				fs.fail(w)
+				return
+			}
+		case http.MethodPut:
+			fs.puts.Add(1)
+			if fs.failPut.Load() > 0 {
+				fs.failPut.Add(-1)
 				fs.fail(w)
 				return
 			}
@@ -1232,11 +1240,14 @@ func TestAppend_RetryExhausted(t *testing.T) {
 	}
 }
 
-func TestAppend_WriterCacheReuse(t *testing.T) {
+// TestAppend_OnePostPerAppend pins the append cost model of the official
+// client: every append is exactly one stateless POST — no per-append HEAD,
+// no writer/session setup requests.
+func TestAppend_OnePostPerAppend(t *testing.T) {
 	srv := newFlakyServer()
 	defer srv.Close()
 
-	store, err := ds.New(srv.URL+"/v1/stream", "writer-cache", ds.WithRetry(3, 5*time.Millisecond))
+	store, err := ds.New(srv.URL+"/v1/stream", "append-cost", ds.WithRetry(3, 5*time.Millisecond))
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -1244,7 +1255,7 @@ func TestAppend_WriterCacheReuse(t *testing.T) {
 	ctx := context.Background()
 	for i := 0; i < 5; i++ {
 		event := &eventbus.Event{
-			Type: fmt.Sprintf("cached.%d", i),
+			Type: fmt.Sprintf("plain.%d", i),
 			Data: json.RawMessage(`{}`),
 		}
 		if _, err := store.Append(ctx, event); err != nil {
@@ -1252,22 +1263,23 @@ func TestAppend_WriterCacheReuse(t *testing.T) {
 		}
 	}
 
-	// The writer is created once (one HEAD) and reused for all appends.
-	if got := srv.heads.Load(); got != 1 {
-		t.Errorf("expected exactly 1 HEAD request for 5 appends (writer cached), got %d", got)
+	if got := srv.posts.Load(); got != 5 {
+		t.Errorf("expected exactly 5 POSTs for 5 appends, got %d", got)
+	}
+	if got := srv.heads.Load(); got != 0 {
+		t.Errorf("expected no HEAD requests for appends, got %d", got)
 	}
 
-	// A send failure invalidates the cached writer; the retry recreates it
-	// with a second HEAD.
+	// A transient send failure consumes one extra POST and nothing else.
 	srv.failPost.Store(1)
 	if _, err := store.Append(ctx, &eventbus.Event{
-		Type: "cached.recreated",
+		Type: "plain.retried",
 		Data: json.RawMessage(`{}`),
 	}); err != nil {
 		t.Fatalf("Append() after transient failure error = %v", err)
 	}
-	if got := srv.heads.Load(); got != 2 {
-		t.Errorf("expected writer to be recreated after send failure (2 HEADs total), got %d", got)
+	if got := srv.posts.Load(); got != 7 {
+		t.Errorf("expected 7 POSTs total (5 + 1 failed + 1 retried), got %d", got)
 	}
 
 	events := readAllFrom(t, store, eventbus.OffsetOldest)
@@ -1404,55 +1416,32 @@ func TestAppend_NonRetryableError(t *testing.T) {
 	}
 }
 
-func TestAppend_WriterErrorNonRetryable(t *testing.T) {
+// TestAppend_NotFoundIsPermanent pins the permanent-error path: a 404 on the
+// append POST (stream deleted server-side) is not retried.
+func TestAppend_NotFoundIsPermanent(t *testing.T) {
 	srv := newFlakyServer()
 	defer srv.Close()
 
-	store, err := ds.New(srv.URL+"/v1/stream", "writer-not-found", ds.WithRetry(3, time.Millisecond))
+	store, err := ds.New(srv.URL+"/v1/stream", "append-not-found", ds.WithRetry(3, time.Millisecond))
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
 
 	srv.failStatus.Store(http.StatusNotFound)
-	srv.failHead.Store(1)
+	srv.failPost.Store(1)
 
 	_, err = store.Append(context.Background(), &eventbus.Event{
 		Type: "no.stream",
 		Data: json.RawMessage(`{}`),
 	})
 	if err == nil {
-		t.Fatal("expected error when writer creation fails with 404")
+		t.Fatal("expected error when the append POST fails with 404")
 	}
-	if !strings.Contains(err.Error(), "get writer") {
-		t.Errorf("expected 'get writer' error, got: %v", err)
+	if !strings.Contains(err.Error(), "append") {
+		t.Errorf("expected append error, got: %v", err)
 	}
-	if got := srv.posts.Load(); got != 0 {
-		t.Errorf("expected no POST after writer creation failure, got %d", got)
-	}
-	if got := srv.heads.Load(); got != 1 {
-		t.Errorf("expected no retry of non-retryable HEAD failure (1 HEAD), got %d", got)
-	}
-}
-
-func TestAppend_WriterErrorRetryable(t *testing.T) {
-	srv := newFlakyServer()
-	defer srv.Close()
-
-	store, err := ds.New(srv.URL+"/v1/stream", "writer-retry", ds.WithRetry(3, time.Millisecond))
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-
-	srv.failHead.Store(1) // 503 on first HEAD, then recover
-
-	if _, err := store.Append(context.Background(), &eventbus.Event{
-		Type: "writer.retried",
-		Data: json.RawMessage(`{}`),
-	}); err != nil {
-		t.Fatalf("Append() should succeed after writer creation retry, got %v", err)
-	}
-	if got := srv.heads.Load(); got != 2 {
-		t.Errorf("expected 2 HEAD requests (1 failed + 1 retried), got %d", got)
+	if got := srv.posts.Load(); got != 1 {
+		t.Errorf("expected no retry of a non-retryable POST failure (1 POST), got %d", got)
 	}
 }
 
@@ -1552,6 +1541,10 @@ func newHangingServer(hangPut bool) (*httptest.Server, *atomic.Int32) {
 			w.WriteHeader(http.StatusCreated)
 			return
 		}
+		// Consume the body before hanging: with an unread body the server
+		// never arms its background connection read, so a client abort would
+		// not cancel r.Context() and srv.Close() would wait forever.
+		io.Copy(io.Discard, r.Body)
 		hung.Add(1)
 		<-r.Context().Done()
 	})
@@ -1646,9 +1639,13 @@ func newSequencedServer(t *testing.T, chunks map[string]chunkResponse) *httptest
 		case http.MethodPut:
 			w.WriteHeader(http.StatusCreated)
 		case http.MethodGet:
-			resp, ok := chunks[r.URL.Query().Get("offset")]
+			key := r.URL.Query().Get("offset")
+			if durablestreams.Offset(key).IsStart() {
+				key = ""
+			}
+			resp, ok := chunks[key]
 			if !ok {
-				t.Errorf("unexpected read offset %q", r.URL.Query().Get("offset"))
+				t.Errorf("unexpected read offset %q", key)
 				http.Error(w, "unexpected offset", http.StatusBadRequest)
 				return
 			}
@@ -2029,11 +2026,9 @@ func TestAppend_FirstCallerCancelDoesNotAbortLaterAppends(t *testing.T) {
 		t.Fatalf("Append() after first caller's cancel error = %v", err)
 	}
 
-	// The writer must have been reused, not dropped and recreated because
-	// its context died with the first caller.
-	if got := srv.heads.Load(); got != 1 {
-		t.Errorf("expected the cached writer to survive the first caller's cancel (1 HEAD), got %d", got)
-	}
+	// Appends are independent stateless POSTs: the first caller's cancelled
+	// context must leave no shared state behind that could abort or retry
+	// later appends.
 	if got := srv.posts.Load(); got != 2 {
 		t.Errorf("expected 2 POSTs with no retries, got %d", got)
 	}

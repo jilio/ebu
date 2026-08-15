@@ -109,6 +109,94 @@ registrations selected for a failed event are restored so the complete set can
 run again; they are removed only when the event attempt succeeds. Cancellation
 interrupts async-capacity waits and completion waits without checkpointing.
 
+## Mirroring one log into another
+
+`Follow` delivers events to *handlers*. `Mirror` delivers events to *another
+log*: it tails a source store and appends every event to a destination store
+with the envelope preserved verbatim — `ID`, `Origin`, `Type`, `Data`,
+`Metadata`, and `Timestamp` arrive byte-for-byte as stored, and the
+destination assigns its own offsets. Use it to ship a local write-ahead log
+into a shared store, run a store migration alongside live traffic, or rebuild
+a backup log on another machine.
+
+```go
+// Continuously replicate a local sqlite log into a remote stream.
+local, _ := sqlite.New("orders.db")
+remote, _ := durablestream.New("http://streams:4437/v1/stream", "orders")
+
+go func() {
+    err := eventbus.Mirror(ctx, local, remote, "orders-mirror", local,
+        eventbus.MirrorOnForward(func(e *eventbus.StoredEvent) {
+            lag.Observe(time.Since(e.Timestamp))
+        }),
+        eventbus.MirrorOnError(func(err error) { log.Print(err) }),
+    )
+    if err != nil && !errors.Is(err, context.Canceled) {
+        log.Printf("mirror stopped: %v", err)
+    }
+}()
+```
+
+What makes it a replicator rather than a follower:
+
+- **Raw envelopes.** No type registry, no decoding, no upcasts: the mirroring
+  process does not import the producers' event types, and unregistered types
+  are never skipped. The destination receives the source's history, not this
+  process's interpretation of it.
+- **Durable by construction.** The checkpoint (a *source* offset, saved under
+  the given subscription ID) is a required argument — a mirror without one
+  would re-copy the whole source on every restart. On the first run it starts
+  from `OffsetOldest`: a mirror's job is the whole log. The checkpoint store
+  may be the source, the destination, or a third store — but it must accept
+  the *source's* offset tokens verbatim (the bundled SQLite store's
+  `SaveOffset` parses its own integer format and cannot checkpoint an opaque
+  remote token; the failure is reported to `MirrorOnError`, and an ignored
+  one means every restart re-copies from the beginning).
+- **At-least-once into the destination.** The checkpoint is saved after each
+  append, so a crash between the two re-forwards that event. IDs are
+  preserved, so consumers of the destination deduplicate exactly as they
+  would on the source. Within one call, a failed append retries that event
+  in place — the already forwarded prefix of a batch is never re-read — and
+  `MirrorDedupWindow` (default 1024) absorbs chunk-token re-reads after
+  restarts. When the source implements `EventStoreOffsetComparer`, the
+  checkpoint also never moves backward, even when a read redelivers earlier
+  events.
+- **Source order is preserved** — events append one at a time, in log order.
+- **One direction only.** Nothing marks an event as "already mirrored", so
+  two mirrors forming a cycle copy events forever.
+- **Failure behavior mirrors `Follow`**: read, append, and checkpoint-save
+  errors are reported (`MirrorOnError`) and retried after
+  `MirrorPollInterval`; the checkpoint never advances past a failed event;
+  `Mirror` returns only on context cancellation or a startup failure. Sources
+  implementing `EventStoreTailer` are tailed, others polled.
+- **Source retention must not outpace the mirror.** If the source drops
+  events past the saved checkpoint (server-side retention on a remote
+  stream), those events are unrecoverable; the mirror keeps reporting the
+  failing read rather than silently skipping the gap. Recovery — clearing or
+  reseeding the checkpoint — is an operator decision.
+
+A rebuilt source (restored from backup, recreated stream) can leave the saved
+checkpoint *past* the source's new tail, which reads as "at the tail" forever
+— the mirror would silently stop. `MirrorResetOnSourceRewind()` opts into
+recovery: the mirror compares its checkpoint against the source tail (at
+startup, on non-progressing polls and read errors, and at tail restarts, via
+the source's `EventStoreOffsetComparer`) and resets to `OffsetOldest` when
+the checkpoint is ahead, reporting the reset. Checks are throttled (roughly
+one per ten poll intervals) and the destructive reset requires two
+consecutive checks to agree, so one transiently stale tail read cannot
+destroy the checkpoint. It is off by default because the reset re-appends
+the surviving source history — duplicates the destination's consumers must
+absorb by ID. Two honest limits: a `Tail` source that treats
+an ahead-of-tail offset as a blocked idle long-poll (rather than ending the
+tail) is only checked at startup; and a source restored *and refilled past*
+the checkpoint is indistinguishable from ordinary progress by offsets alone —
+guard that case with out-of-band versioning (a per-rebuild stream name or
+epoch).
+
+Like durable followers, `Mirror` does not coordinate writers across
+processes: run one mirror per subscription ID, enforced by an external lease
+or a single owner.
+
 ## At-least-once, and what to do about it
 
 Every layer of a shared log is at-least-once: appends may be retried, chunked

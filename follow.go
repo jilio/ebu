@@ -496,12 +496,13 @@ pollLoop:
 			return err
 		}
 
-		events, next, err := f.bus.store.Read(ctx, f.offset, batchSize)
+		readFrom := f.offset
+		events, next, err := f.bus.store.Read(ctx, readFrom, batchSize)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			f.reportError(fmt.Errorf("follow: read after offset %s: %w", f.offset, err))
+			f.reportError(fmt.Errorf("follow: read after offset %s: %w", readFrom, err))
 			if err := sleepCtx(ctx, f.cfg.pollInterval); err != nil {
 				return err
 			}
@@ -525,16 +526,24 @@ pollLoop:
 			f.advance(ctx, stored.Offset)
 		}
 
-		if next == f.offset {
-			// At the tail (or the store cannot advance): wait for new events.
+		if next == readFrom {
+			// The read made no progress: at the tail (or the store cannot
+			// advance) — wait for new events. Compared against the offset the
+			// batch was read from, not the per-event advances above: a full
+			// batch whose last event carries the batch's resume token is
+			// progress, and the next read must follow immediately — sleeping
+			// per batch would cap catch-up at batchSize/pollInterval.
 			if err := sleepCtx(ctx, f.cfg.pollInterval); err != nil {
 				return err
 			}
 			continue
 		}
-		// A store may advance beyond the last returned envelope (for example, an
-		// undecodable or empty chunk). Persist that concrete resume token too.
-		f.advance(ctx, next)
+		if next != f.offset {
+			// A store may advance beyond the last returned envelope (for example,
+			// an undecodable or empty chunk). Persist that concrete resume token
+			// too.
+			f.advance(ctx, next)
+		}
 	}
 }
 
