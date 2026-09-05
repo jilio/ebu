@@ -12,7 +12,7 @@ A lightweight, type-safe event bus for Go with generics support. Build decoupled
 ## Features
 
 - 🔒 **Type-safe** - Full compile-time type safety with generics
-- ⚡ **Fast** - ~200ns and 2 small allocations per publish; throughput stays flat under heavy concurrency
+- ⚡ **Fast** - Lean local dispatch; event naming and handler timing run only when needed
 - 🔄 **Async support** - Built-in async handlers with optional sequential processing
 - 🎯 **Simple API** - Clean, intuitive API with options pattern
 - 🧵 **Thread-safe** - Safe for concurrent use across goroutines
@@ -194,6 +194,10 @@ eventbus.Clear[UserEvent](bus)
 // Clear all handlers
 eventbus.ClearAll(bus)
 ```
+
+Unsubscribing does not cancel a handler already selected by an in-flight
+publication. Prefer subscription handles for closures: they identify the exact
+registration even when several closures share the same function body.
 
 ## Advanced Features
 
@@ -405,7 +409,7 @@ eventbus.Publish(bus, UserCreatedEvent{UserID: "123"})
 The `otel` package provides:
 - **Metrics**: Event counts, handler duration, error rates, persistence metrics
 - **Tracing**: Distributed tracing with spans for publish, handlers, and persistence
-- **Zero overhead**: Optional - no performance impact if not used
+- **Optional instrumentation**: No telemetry callbacks or handler timing when not configured
 - **Vendor-neutral**: Built on OpenTelemetry standards
 
 See [**examples/observability**](examples/observability) for a complete example.
@@ -589,13 +593,28 @@ Features:
 
 ## Performance
 
-- Type-based routing with zero reflection for direct handlers
-- ~200ns and 2 small allocations per publish (handler-slice copy + type hash)
-- Efficient sharding reduces lock contention; throughput stays flat from 1 to 1000 concurrent publishers
+- Type-based routing with typed handler adapters instead of `reflect.Call`
+- Local dispatch skips wire-name computation without persistence or observability,
+  and skips handler timing without observability
+- Sharded locks separate event types; publishers of the same type still share a
+  shard. Measure your workload with `go test -run '^$' -bench . -benchmem`;
+  allocation counts and throughput depend on payloads, subscribers, and Go version
 - Async handlers run in separate goroutines (bound them with `WithAsyncHandlerLimit`;
   caveat: with a limit set, don't publish async-handled events from inside async
   handlers — nested publishes can deadlock waiting for a slot the publishing
   handler occupies)
+
+To compare local dispatch before and after a change, run the same benchmark on
+both revisions with the same Go version and machine:
+
+```bash
+go test -run '^$' -bench '^BenchmarkMemoryAllocation$' -benchmem -benchtime=500ms -count=5
+```
+
+This benchmark uses an empty synchronous handler. Measure persistence,
+observability, and real handler work separately before extrapolating to an
+application. `EventTypeName()` must be a pure function of the type; the bus may
+omit its calls when no wire name is needed.
 
 ## Contributing
 

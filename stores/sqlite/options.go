@@ -82,9 +82,7 @@ func WithMetricsHook(hook MetricsHook) Option {
 //
 // Semantics: batched iteration re-queries the database between batches, so
 // it observes events appended while the iteration is in progress. This
-// differs from an unbatched stream (a single query held open across the
-// iteration), which is a point-in-time snapshot of the log; unbatched mode
-// is not selectable through this option.
+// means the iteration is not a point-in-time snapshot of the log.
 func WithStreamBatchSize(size int) Option {
 	return func(c *config) {
 		if size <= 0 {

@@ -186,6 +186,14 @@ SQLite store features:
 - Automatic schema migrations
 - Optional logging and metrics hooks
 
+`ReadStream` uses batched reads, with a default batch size of 1000. Set
+`WithStreamBatchSize(n)` to choose a positive batch size; zero and negative values
+select the default. Each batch opens a new query, so iteration may observe
+concurrent appends and is not a point-in-time snapshot. Breaking out of the range
+loop closes the current rows; cancellation and query/iteration failures are
+returned through the iterator. Ordinary `Read(ctx, from, 0)` still reads without
+a result limit.
+
 ### Durable-Streams Store
 
 Remote storage using the [Durable Streams](https://electric-sql.com/blog/2025/12/09/announcing-durable-streams) protocol - an HTTP-based persistent stream primitive for reliable, resumable, real-time data streaming developed by [Electric](https://electric-sql.com).

@@ -23,7 +23,7 @@ type LargeEvent struct {
 // Benchmark basic publish/subscribe operations
 func BenchmarkPublishSubscribe(b *testing.B) {
 	bus := New()
-	received := make(chan BenchmarkEvent, b.N)
+	received := make(chan BenchmarkEvent, 1)
 
 	Subscribe(bus, func(evt BenchmarkEvent) {
 		received <- evt
@@ -55,38 +55,29 @@ func BenchmarkPublishContext(b *testing.B) {
 }
 
 // Benchmark concurrent publishers
+// Keep handler work empty and distribute exactly b.N operations, including
+// the remainder when b.N is not divisible by the publisher count.
 func BenchmarkConcurrentPublish(b *testing.B) {
-	benchmarks := []int{1, 10, 100, 1000}
-
-	for _, numPublishers := range benchmarks {
+	for _, numPublishers := range []int{1, 10, 100, 1000} {
 		b.Run(fmt.Sprintf("publishers-%d", numPublishers), func(b *testing.B) {
 			bus := New()
-			received := make(chan BenchmarkEvent, b.N)
-
-			Subscribe(bus, func(evt BenchmarkEvent) {
-				select {
-				case received <- evt:
-				default:
-				}
-			})
-
+			Subscribe(bus, func(BenchmarkEvent) {})
+			b.ReportAllocs()
 			b.ResetTimer()
 			var wg sync.WaitGroup
-			eventsPerPublisher := b.N / numPublishers
-			if eventsPerPublisher == 0 {
-				eventsPerPublisher = 1
-			}
-
 			for p := 0; p < numPublishers; p++ {
+				count := b.N / numPublishers
+				if p < b.N%numPublishers {
+					count++
+				}
 				wg.Add(1)
-				go func(publisherID int) {
+				go func(count int) {
 					defer wg.Done()
-					for i := 0; i < eventsPerPublisher; i++ {
-						Publish(bus, BenchmarkEvent{ID: i, Value: fmt.Sprintf("pub-%d", publisherID)})
+					for i := 0; i < count; i++ {
+						Publish(bus, BenchmarkEvent{ID: i, Value: "test"})
 					}
-				}(p)
+				}(count)
 			}
-
 			wg.Wait()
 		})
 	}
@@ -94,35 +85,17 @@ func BenchmarkConcurrentPublish(b *testing.B) {
 
 // Benchmark multiple subscribers
 func BenchmarkMultipleSubscribers(b *testing.B) {
-	benchmarks := []int{1, 10, 100, 1000}
-
-	for _, numSubscribers := range benchmarks {
+	for _, numSubscribers := range []int{1, 10, 100, 1000} {
 		b.Run(fmt.Sprintf("subscribers-%d", numSubscribers), func(b *testing.B) {
 			bus := New()
-			var wg sync.WaitGroup
-			wg.Add(b.N * numSubscribers)
-
 			for s := 0; s < numSubscribers; s++ {
-				Subscribe(bus, func(evt BenchmarkEvent) {
-					wg.Done()
-				})
+				Subscribe(bus, func(BenchmarkEvent) {})
 			}
-
+			b.ReportAllocs()
 			b.ResetTimer()
-			done := make(chan bool)
-			go func() {
-				for i := 0; i < b.N; i++ {
-					Publish(bus, BenchmarkEvent{ID: i, Value: "test"})
-				}
-				close(done)
-			}()
-
-			// Wait for either completion or timeout
-			go func() {
-				wg.Wait()
-			}()
-
-			<-done
+			for i := 0; i < b.N; i++ {
+				Publish(bus, BenchmarkEvent{ID: i, Value: "test"})
+			}
 		})
 	}
 }
@@ -221,18 +194,19 @@ func BenchmarkLockContention(b *testing.B) {
 			// Start writers (publishers)
 			var wg sync.WaitGroup
 			eventsPerWriter := b.N / bm.writers
-			if eventsPerWriter == 0 {
-				eventsPerWriter = 1
-			}
 
 			for w := 0; w < bm.writers; w++ {
+				count := eventsPerWriter
+				if w < b.N%bm.writers {
+					count++
+				}
 				wg.Add(1)
-				go func() {
+				go func(count int) {
 					defer wg.Done()
-					for i := 0; i < eventsPerWriter; i++ {
+					for i := 0; i < count; i++ {
 						Publish(bus, BenchmarkEvent{ID: i, Value: "test"})
 					}
-				}()
+				}(count)
 			}
 
 			wg.Wait()

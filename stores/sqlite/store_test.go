@@ -1428,10 +1428,6 @@ func TestReadStream(t *testing.T) {
 	}
 	defer store.Close()
 
-	// Batched streaming is the default; exercise the unbatched,
-	// point-in-time snapshot path explicitly.
-	store.cfg.streamBatchSize = 0
-
 	ctx := context.Background()
 
 	for i := 1; i <= 10; i++ {
@@ -1579,7 +1575,6 @@ func TestReadStreamDBClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create store: %v", err)
 	}
-	store.cfg.streamBatchSize = 0 // exercise the unbatched error path
 
 	ctx := context.Background()
 
@@ -1601,43 +1596,6 @@ func TestReadStreamDBClosed(t *testing.T) {
 
 	if !gotError {
 		t.Error("expected error when database is closed")
-	}
-}
-
-func TestStreamRowsIterErr(t *testing.T) {
-	store, err := New(":memory:")
-	if err != nil {
-		t.Fatalf("failed to create store: %v", err)
-	}
-	defer store.Close()
-
-	ctx := context.Background()
-
-	mock := &mockRows{
-		data:    [][]any{},
-		iterErr: errors.New("iteration error"),
-	}
-
-	var eventCount int
-	var iterErr error
-	var gotError bool
-
-	store.StreamRows(ctx, mock, &eventCount, &iterErr, func(event *eventbus.StoredEvent, err error) bool {
-		if err != nil {
-			gotError = true
-			return false
-		}
-		return true
-	})
-
-	if !gotError {
-		t.Error("expected error from rows.Err()")
-	}
-	if iterErr == nil {
-		t.Error("expected iterErr to be set")
-	}
-	if !strings.Contains(iterErr.Error(), "iterate events") {
-		t.Errorf("expected 'iterate events' in error, got: %v", iterErr)
 	}
 }
 
@@ -1672,45 +1630,6 @@ func TestStreamBatchCloseErr(t *testing.T) {
 	}
 	if cont {
 		t.Error("expected cont to be false due to close error")
-	}
-}
-
-func TestStreamRowsScanErr(t *testing.T) {
-	store, err := New(":memory:")
-	if err != nil {
-		t.Fatalf("failed to create store: %v", err)
-	}
-	defer store.Close()
-
-	ctx := context.Background()
-
-	mock := &mockRows{
-		data: [][]any{
-			{int64(1), "test", []byte(`{}`), time.Now()},
-		},
-		scanErr: errors.New("scan error"),
-	}
-
-	var eventCount int
-	var iterErr error
-	var gotError bool
-
-	store.StreamRows(ctx, mock, &eventCount, &iterErr, func(event *eventbus.StoredEvent, err error) bool {
-		if err != nil {
-			gotError = true
-			return false
-		}
-		return true
-	})
-
-	if !gotError {
-		t.Error("expected error from rows.Scan()")
-	}
-	if iterErr == nil {
-		t.Error("expected iterErr to be set")
-	}
-	if !strings.Contains(iterErr.Error(), "scan event") {
-		t.Errorf("expected 'scan event' in error, got: %v", iterErr)
 	}
 }
 
@@ -2420,41 +2339,6 @@ func TestReadWithScanEventsError(t *testing.T) {
 	}
 }
 
-func TestReadStreamWithLoggerNonBatched(t *testing.T) {
-	logger := &testLogger{t: t}
-	store, err := New(":memory:", WithLogger(logger))
-	if err != nil {
-		t.Fatalf("failed to create store: %v", err)
-	}
-	defer store.Close()
-	store.cfg.streamBatchSize = 0 // exercise the unbatched logger path
-
-	ctx := context.Background()
-
-	// Add events
-	for i := 1; i <= 3; i++ {
-		event := &eventbus.Event{
-			Type:      "TestEvent",
-			Data:      json.RawMessage(`{}`),
-			Timestamp: time.Now(),
-		}
-		store.Append(ctx, event)
-	}
-
-	// Stream them all (non-batched mode) to trigger the logger path at line 396-398
-	var events []*eventbus.StoredEvent
-	for event, err := range store.ReadStream(ctx, eventbus.OffsetOldest) {
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		events = append(events, event)
-	}
-
-	if len(events) != 3 {
-		t.Errorf("expected 3 events, got %d", len(events))
-	}
-}
-
 func TestReadStreamWithMetricsHook(t *testing.T) {
 	metrics := &testMetricsHook{}
 	store, err := New(":memory:", WithMetricsHook(metrics))
@@ -2491,85 +2375,6 @@ func TestReadStreamWithMetricsHook(t *testing.T) {
 	if metrics.readCount == 0 {
 		t.Error("expected readCount > 0 from ReadStream")
 	}
-}
-
-func TestStreamRowsContextCancellation(t *testing.T) {
-	store, err := New(":memory:")
-	if err != nil {
-		t.Fatalf("failed to create store: %v", err)
-	}
-	defer store.Close()
-
-	// Create mock rows that will keep returning Next() = true
-	// but context will be cancelled mid-iteration
-	mock := &mockRowsWithCancel{
-		data: [][]any{
-			{int64(1), "test", []byte(`{}`), time.Now()},
-			{int64(2), "test", []byte(`{}`), time.Now()},
-		},
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	var eventCount int
-	var iterErr error
-	var gotContextError bool
-
-	// Cancel context during first iteration
-	store.StreamRows(ctx, mock, &eventCount, &iterErr, func(event *eventbus.StoredEvent, err error) bool {
-		if event != nil {
-			cancel() // Cancel after first event
-		}
-		if err != nil && errors.Is(err, context.Canceled) {
-			gotContextError = true
-			return false
-		}
-		return true
-	})
-
-	if !gotContextError {
-		t.Error("expected context.Canceled error in streamRows")
-	}
-}
-
-// mockRowsWithCancel is similar to mockRows but allows testing context cancellation
-type mockRowsWithCancel struct {
-	index  int
-	data   [][]any
-	closed bool
-}
-
-func (m *mockRowsWithCancel) Next() bool {
-	if m.index >= len(m.data) {
-		return false
-	}
-	m.index++
-	return true
-}
-
-func (m *mockRowsWithCancel) Scan(dest ...any) error {
-	row := m.data[m.index-1]
-	for i, d := range dest {
-		switch ptr := d.(type) {
-		case *int64:
-			*ptr = row[i].(int64)
-		case *string:
-			*ptr = row[i].(string)
-		case *[]byte:
-			*ptr = row[i].([]byte)
-		case *time.Time:
-			*ptr = row[i].(time.Time)
-		}
-	}
-	return nil
-}
-
-func (m *mockRowsWithCancel) Err() error {
-	return nil
-}
-
-func (m *mockRowsWithCancel) Close() error {
-	m.closed = true
-	return nil
 }
 
 func BenchmarkReadVsReadStream(b *testing.B) {
