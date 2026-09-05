@@ -126,23 +126,40 @@ bus.Wait()
 
 ### Graceful Shutdown
 
-Shutdown the event bus gracefully, waiting for async handlers to complete with timeout support:
+Stop producers first, then shut down the bus with a deadline:
 
 ```go
-// Shutdown with timeout
 ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 defer cancel()
 
 if err := bus.Shutdown(ctx); err != nil {
-    log.Printf("Shutdown timed out: %v", err)
+    log.Printf("Event bus shutdown: %v", err)
 }
 ```
 
-The `Shutdown` method:
-- Waits for all async handlers to complete
-- Respects context timeout and cancellation
-- Returns `context.DeadlineExceeded` if handlers don't finish in time
-- Returns `nil` on successful graceful shutdown
+`Shutdown` is terminal. It rejects new publishes, subscriptions, replay and
+follow calls with `eventbus.ErrClosed`, including nested publishes from a
+handler after shutdown begins. `Publish` and `PublishContext` discard this error;
+use `TryPublish` / `TryPublishContext` when the producer needs to handle rejection.
+Rejected publishes do not invoke hooks, handlers or persistence error callbacks.
+
+The bus cancels active `Follow` calls, waits for accepted operations (including
+synchronous `Append`, replay and handlers), async handlers and deferred replay
+drains, then calls the event store's `Close`, if available. Concurrent or repeated
+shutdown calls share one close and its result. `Wait` keeps its narrower behavior:
+it waits for async handlers and deferred replay drains without stopping admission.
+
+The context bounds your wait, including a slow `Close`. On cancellation or timeout,
+shutdown continues in the background; a later `Shutdown` call can wait for its
+result. A stuck operation or permanently failing replay drain can prevent
+completion. Do not wait for shutdown inside a handler, hook or store operation
+that shutdown itself must wait for.
+
+With log delivery, canceling `Follow` does **not** guarantee it consumed every
+accepted append. Use durable checkpoints to resume unfinished delivery. Direct
+calls through `GetStore`, separate subscription stores, and other users of a
+shared store have an application-owned lifetime: stop them before shutting down
+the bus. The bus only closes its configured event store.
 
 ### Context Support
 
