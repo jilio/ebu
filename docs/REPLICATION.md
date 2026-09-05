@@ -56,6 +56,7 @@ go func() { done <- r.Run(runCtx) }()
 `EventStoreOffsetComparer`. The bundled memory, SQLite and Durable Streams stores
 do. The checkpoint store must accept the source's tokens verbatim: SQLite source
 checkpoints can live in SQLite; opaque remote tokens cannot necessarily do so.
+ID and Generation must be valid UTF-8 strings.
 The tuple `(ID, Generation)` gets its own checkpoint namespace, separate from
 ordinary `Mirror` IDs. Constructing an object does not import an older plain
 Mirror checkpoint: a new relationship copies from `OffsetOldest`.

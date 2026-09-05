@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 var (
@@ -33,7 +34,8 @@ type ReplicationPosition struct {
 	Offset     Offset `json:"offset"`
 }
 
-// ReplicatorConfig binds one replication relationship. ID must identify the
+// ReplicatorConfig binds one replication relationship. ID and Generation must
+// be valid UTF-8 strings for unambiguous persisted/serialized identity. ID identifies the
 // source/destination pair. Generation is an application-owned immutable epoch:
 // change it after replacing, rebuilding or restoring EITHER log. Epoch changes
 // require a new Replicator and checkpoint namespace; they cannot be inferred
@@ -89,6 +91,9 @@ func NewReplicator(config ReplicatorConfig, opts ...MirrorOption) (*Replicator, 
 	}
 	if config.ID == "" || config.Generation == "" {
 		return nil, fmt.Errorf("eventbus: replication ID and generation are required")
+	}
+	if !utf8.ValidString(config.ID) || !utf8.ValidString(config.Generation) {
+		return nil, fmt.Errorf("eventbus: replication ID and generation must be valid UTF-8")
 	}
 	comparer, ok := config.Source.(EventStoreOffsetComparer)
 	if !ok {

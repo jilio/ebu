@@ -57,7 +57,7 @@ func replicationPoint(t *testing.T, r *Replicator, o Offset) ReplicationPosition
 }
 func TestReplicatorValidation(t *testing.T) {
 	src, dst := NewMemoryStore(), NewMemoryStore()
-	for _, name := range []string{"source", "destination", "checkpoints", "id", "generation", "comparer", "nil option", "bad option", "rewind"} {
+	for _, name := range []string{"source", "destination", "checkpoints", "id", "generation", "invalid ID", "invalid generation", "comparer", "nil option", "bad option", "rewind"} {
 		t.Run(name, func(t *testing.T) {
 			c := replicationConfig(src, dst)
 			var opts []MirrorOption
@@ -72,6 +72,10 @@ func TestReplicatorValidation(t *testing.T) {
 				c.ID = ""
 			case "generation":
 				c.Generation = ""
+			case "invalid ID":
+				c.ID = string([]byte{0xff})
+			case "invalid generation":
+				c.Generation = string([]byte{0xfe})
 			case "comparer":
 				c.Source = &mirrorScriptStore{}
 			case "nil option":
