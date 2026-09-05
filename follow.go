@@ -353,8 +353,18 @@ func (r *dedupRing) forget(id string) {
 // likewise reported and retried after FollowPollInterval. A non-durable
 // follower reports and skips a failed upcast without dispatching the original
 // schema. Follow itself returns on ctx cancellation or a startup/configuration
-// failure.
+// failure. Shutdown also cancels active followers and waits for them to exit;
+// it does not promise to consume the remaining log. Calls started after shutdown
+// begins return ErrClosed.
 func (bus *EventBus) Follow(ctx context.Context, opts ...FollowOption) error {
+	if !bus.beginOperation() {
+		return ErrClosed
+	}
+	defer bus.endOperation()
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(bus.stopContext, cancel)
+	defer stop()
+	defer cancel()
 	if bus.store == nil {
 		return fmt.Errorf("eventbus: Follow requires persistence (use WithStore option)")
 	}

@@ -406,8 +406,13 @@ func (bus *EventBus) persistEvent(ctx context.Context, eventType reflect.Type, e
 	return context.WithValue(ctx, offsetCtxKey{}, offset), nil
 }
 
-// Replay replays events from an offset
+// Replay replays events from an offset. Shutdown waits for accepted replays;
+// replays started after shutdown begins return ErrClosed.
 func (bus *EventBus) Replay(ctx context.Context, from Offset, handler func(*StoredEvent) error) error {
+	if !bus.beginOperation() {
+		return ErrClosed
+	}
+	defer bus.endOperation()
 	if bus.store == nil {
 		return fmt.Errorf("replay requires persistence (use WithStore option)")
 	}
@@ -702,6 +707,11 @@ func subscribeContextWithReplay[T any](
 	if bus == nil {
 		return fmt.Errorf("eventbus: bus cannot be nil")
 	}
+	if !bus.beginOperation() {
+		return ErrClosed
+	}
+	defer bus.endOperation()
+
 	if bus.store == nil {
 		return fmt.Errorf("SubscribeWithReplay requires persistence (use WithStore option)")
 	}

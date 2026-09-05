@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Prevent `Shutdown` from closing the event store while an accepted publish,
+  synchronous handler, replay, subscription setup or follower still uses it.
+- Close the event store exactly once across concurrent and repeated shutdown
+  calls, preserving the close error for subsequent callers.
+
+### Changed
+
+- Shutdown is terminal: new publish, subscription, replay and follow operations
+  return `ErrClosed`. Void publish helpers silently discard this error; rejected
+  operations do not run publish hooks or persistence error callbacks.
+- Shutdown cancels active followers and waits for accepted operations and deferred
+  replay work before closing. A deadline bounds the caller's wait (including a
+  blocking close); draining and eventual close continue after a timeout.
+- Document nested-publish rejection during draining, `Wait` semantics, shared
+  store ownership and the distinction between stopping Follow and consuming the
+  entire durable log.
+
 ## [0.18.1] - 2026-09-05
 
 ### Fixed

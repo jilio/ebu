@@ -121,6 +121,13 @@ type EventBus struct {
 	asyncCond  *sync.Cond
 	asyncCount int
 
+	// Lifecycle admission combines the stop bit and active-operation count.
+	lifecycleState atomic.Uint64
+	shutdownDone   chan struct{}
+	shutdownErr    error // published by closing shutdownDone
+	stopContext    context.Context
+	stopFollow     context.CancelFunc
+
 	// asyncSem, when non-nil, bounds the number of concurrently running
 	// async handler goroutines (see WithAsyncHandlerLimit).
 	asyncSem chan struct{}
@@ -307,6 +314,8 @@ func New(opts ...Option) *EventBus {
 		replayMarkers:  make(map[*internalHandler]struct{}),
 	}
 	bus.asyncCond = sync.NewCond(&bus.asyncMu)
+	bus.shutdownDone = make(chan struct{})
+	bus.stopContext, bus.stopFollow = context.WithCancel(context.Background())
 
 	// Initialize shards
 	for i := 0; i < numShards; i++ {
@@ -482,6 +491,11 @@ func SubscribeWithHandle[T any](bus *EventBus, handler Handler[T], opts ...Subsc
 		return nil, fmt.Errorf("eventbus: handler cannot be nil")
 	}
 
+	if !bus.beginOperation() {
+		return nil, ErrClosed
+	}
+	defer bus.endOperation()
+
 	eventType := reflect.TypeOf((*T)(nil)).Elem()
 	h, err := buildPayloadHandler(handler, eventType, opts)
 	if err != nil {
@@ -505,6 +519,11 @@ func SubscribeContextWithHandle[T any](bus *EventBus, handler ContextHandler[T],
 	if handler == nil {
 		return nil, fmt.Errorf("eventbus: handler cannot be nil")
 	}
+
+	if !bus.beginOperation() {
+		return nil, ErrClosed
+	}
+	defer bus.endOperation()
 
 	eventType := reflect.TypeOf((*T)(nil)).Elem()
 	h, err := buildContextHandler(handler, eventType, opts)
@@ -533,6 +552,11 @@ func Subscribe[T any](bus *EventBus, handler Handler[T], opts ...SubscribeOption
 		return fmt.Errorf("eventbus: handler cannot be nil")
 	}
 
+	if !bus.beginOperation() {
+		return ErrClosed
+	}
+	defer bus.endOperation()
+
 	eventType := reflect.TypeOf((*T)(nil)).Elem()
 	h, err := buildPayloadHandler(handler, eventType, opts)
 	if err != nil {
@@ -556,6 +580,11 @@ func SubscribeContext[T any](bus *EventBus, handler ContextHandler[T], opts ...S
 	if handler == nil {
 		return fmt.Errorf("eventbus: handler cannot be nil")
 	}
+
+	if !bus.beginOperation() {
+		return ErrClosed
+	}
+	defer bus.endOperation()
 
 	eventType := reflect.TypeOf((*T)(nil)).Elem()
 	h, err := buildContextHandler(handler, eventType, opts)
@@ -650,12 +679,14 @@ func Unsubscribe[T any, H any](bus *EventBus, handler H) error {
 }
 
 // Publish publishes an event to all registered handlers.
+// After Shutdown begins it silently discards the event; use TryPublish to detect rejection.
 // It panics if bus is nil.
 func Publish[T any](bus *EventBus, event T) {
 	PublishContext(bus, context.Background(), event)
 }
 
 // PublishContext publishes an event with context to all registered handlers.
+// After Shutdown begins it silently discards the event; use TryPublishContext to detect rejection.
 // It panics if bus is nil.
 //
 // When the bus has a store configured (WithStore), the event is persisted
@@ -675,7 +706,8 @@ func PublishContext[T any](bus *EventBus, ctx context.Context, event T) {
 // TryPublish is Publish with the reported persistence outcome returned: it
 // returns the marshal/Append error (nil on success or when no store is
 // configured). An Append error may be ambiguous if a remote commit succeeded
-// before its acknowledgement was lost. It panics if bus is nil.
+// before its acknowledgement was lost. After Shutdown begins it returns ErrClosed
+// without invoking callbacks. It panics if bus is nil.
 func TryPublish[T any](bus *EventBus, event T) error {
 	return publishContext(bus, context.Background(), event)
 }
@@ -691,6 +723,7 @@ func TryPublish[T any](bus *EventBus, event T) error {
 // the PersistenceErrorHandler, which remains the right channel for passive
 // monitoring; TryPublishContext is for publishers that must act on the failure
 // (e.g. fail the request that caused the publish).
+// It returns ErrClosed without invoking callbacks if shutdown has begun.
 // It panics if bus is nil.
 func TryPublishContext[T any](bus *EventBus, ctx context.Context, event T) error {
 	return publishContext(bus, ctx, event)
@@ -703,6 +736,10 @@ func publishContext[T any](bus *EventBus, ctx context.Context, event T) error {
 	if bus == nil {
 		panic("eventbus: Publish called with nil bus")
 	}
+	if !bus.beginOperation() {
+		return ErrClosed
+	}
+	defer bus.endOperation()
 
 	eventType := reflect.TypeOf(event)
 	var eventTypeName string
@@ -1367,33 +1404,6 @@ func WithAsyncHandlerLimit(n int) Option {
 		if n > 0 {
 			bus.asyncSem = make(chan struct{}, n)
 		}
-	}
-}
-
-// Shutdown gracefully shuts down the event bus, waiting for async handlers and
-// deferred resumable-subscription drains to complete.
-// It respects the context timeout/cancellation.
-// If the store implements io.Closer, its Close() method will be called after handlers complete.
-func (bus *EventBus) Shutdown(ctx context.Context) error {
-	done := make(chan struct{})
-	go func() {
-		bus.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		// Close store if it implements io.Closer
-		if bus.store != nil {
-			if closer, ok := bus.store.(interface{ Close() error }); ok {
-				if err := closer.Close(); err != nil {
-					return fmt.Errorf("failed to close store: %w", err)
-				}
-			}
-		}
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
 	}
 }
 

@@ -955,6 +955,26 @@ testBus.Replay(ctx, eventbus.OffsetOldest, func(event *eventbus.StoredEvent) err
 })
 ```
 
+## Shutdown and store lifetime
+
+`bus.Shutdown(ctx)` stops new bus operations, cancels active followers, and waits
+for accepted publishes, replay, subscription setup, handlers and deferred replay
+work before closing the event store. Calls begun after shutdown return
+`eventbus.ErrClosed`; the void publish helpers discard that error. A timeout ends
+only the caller's wait: the bus stays closed to new work and continues draining
+and closing in the background. Repeated calls wait for the same result.
+
+Cancellation of `Follow` is not a log catch-up barrier. In log-delivery mode an
+accepted append may still need delivery after restart; retain durable checkpoints
+for that recovery. Stop publishers before shutdown, including producers that
+publish from handlers.
+
+Raw store operations (`GetStore`, snapshotting, truncation, standalone `Mirror`)
+and other users of a shared store are outside bus lifecycle tracking. Stop and
+join those users before shutting down its owning bus. A separate
+`WithSubscriptionStore` is not closed by the bus. See the
+[shutdown contract](../README.md#graceful-shutdown) for timeout and callback rules.
+
 ## Summary
 
 Event persistence in ebu provides:
