@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Clear removed handler references for handle-based unsubscribe, function-based
+  unsubscribe, and completed `Once` subscriptions; remove empty subscriber entries
+  so the bus no longer retains closures after their last registration is removed.
+
+### Changed
+
+- Skip event wire-name computation for local publishing without observability,
+  and measure handler duration only when observability is enabled.
+- Remove unused internal handler metadata and the SQLite unbatched streaming path
+  that was inaccessible through public options. `ReadStream` keeps its existing
+  batched behavior, including cancellation, error reporting, and early termination.
+- Make concurrent benchmarks publish exactly the reported number of events and
+  separate dispatch from formatting/channel overhead. Replace a log-only timing
+  test with a deterministic check that concurrent publishers can enter `Append`.
+
 ## [0.18.0] - 2026-08-15
 
 ### Changed
