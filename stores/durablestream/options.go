@@ -26,6 +26,7 @@ type config struct {
 	retryAttempts      int
 	retryBaseDelay     time.Duration
 	decodeErrorHandler DecodeErrorHandler
+	strictDecoding     bool
 }
 
 func defaultConfig() *config {
@@ -109,4 +110,13 @@ func WithDecodeErrorHandler(handler DecodeErrorHandler) Option {
 	return func(c *config) {
 		c.decodeErrorHandler = handler
 	}
+}
+
+// WithStrictDecoding makes Read and Tail fail on an undecodable
+// event instead of skipping it. Use this for replication sources: skipping a
+// corrupt event would let a prefix barrier acknowledge incomplete history.
+// The default remains best-effort decoding for compatibility. Returned errors
+// include the event index; WithDecodeErrorHandler only observes skipped events.
+func WithStrictDecoding() Option {
+	return func(c *config) { c.strictDecoding = true }
 }

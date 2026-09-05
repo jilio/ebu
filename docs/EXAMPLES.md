@@ -11,6 +11,7 @@ Comprehensive examples demonstrating all features of the ebu event bus library.
 - [Panic Recovery](#panic-recovery)
 - [Global Hooks](#global-hooks)
 - [Dynamic Handler Management](#dynamic-handler-management)
+- [Hybrid Replication](#hybrid-replication)
 
 ## Basic Usage
 
@@ -623,3 +624,27 @@ func (e PaymentProcessedEvent) EventTypeName() string {
 6. **Clean up handlers** - Retain subscription handles and call `sub.Unsubscribe()` when done; use `Clear` to remove all handlers of a type
 7. **Set panic handlers** - Monitor and log handler failures
 8. **Test concurrency** - The bus is thread-safe, test your handlers too
+
+## Hybrid Replication
+
+The [Confirmed Replication Guide](REPLICATION.md) includes a complete
+`appendWithReplication` helper: ordinary operations return after the local append,
+while important operations call `Replicator.Wait` for a source position. It also
+shows a barrier after `TryPublishContext` using `Capture`, and explains how to
+retry confirmation after a timeout without reissuing a write.
+
+Run the executable, in-memory API example:
+
+```sh
+go test -run '^ExampleReplicator$' .
+```
+
+For a process-loss test using SQLite and HTTP, run from the repository workspace:
+
+```sh
+go run ./scripts/replication-smoke.go
+```
+
+The smoke test kills the source process after a confirmed barrier and recovers
+its prefix from the reopened destination. Production durability still depends on
+the destination's storage configuration; MemoryStore is only a demonstration.

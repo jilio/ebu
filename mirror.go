@@ -15,6 +15,7 @@ type mirrorConfig struct {
 	resetOnRewind bool
 	onForward     func(*StoredEvent)
 	onError       func(error)
+	progress      *Replicator
 }
 
 // MirrorPollInterval sets how long the mirror sleeps between Read calls when
@@ -202,6 +203,10 @@ func Mirror(ctx context.Context, src, dst EventStore, subscriptionID string, off
 		}
 	}
 
+	return mirrorRun(ctx, src, dst, subscriptionID, offsets, cfg)
+}
+
+func mirrorRun(ctx context.Context, src, dst EventStore, subscriptionID string, offsets SubscriptionStore, cfg *mirrorConfig) error {
 	// The comparer is used opportunistically whenever the source can order
 	// offsets (the checkpoint monotonicity guard in advance); the rewind
 	// option additionally requires it.
@@ -252,6 +257,12 @@ func Mirror(ctx context.Context, src, dst EventStore, subscriptionID string, off
 		saveProven: found,
 	}
 
+	if cfg.progress != nil {
+		if err := cfg.progress.initialize(ctx, from); err != nil {
+			return err
+		}
+	}
+
 	// A rebuilt source is detectable before the first read. Like every later
 	// reconcile, the check is best-effort: a transient source error here is
 	// reported, not fatal — the same error one loop iteration later would be
@@ -261,7 +272,7 @@ func Mirror(ctx context.Context, src, dst EventStore, subscriptionID string, off
 		return err
 	}
 
-	if tailer, ok := src.(EventStoreTailer); ok {
+	if tailer, ok := src.(EventStoreTailer); ok && cfg.progress == nil {
 		return m.runTail(ctx, tailer)
 	}
 	return m.runPoll(ctx)
@@ -361,7 +372,7 @@ func (m *mirror) runPoll(ctx context.Context) error {
 			if err := m.maybeReconcile(ctx); err != nil {
 				return err
 			}
-			if err := sleepCtx(ctx, m.cfg.pollInterval); err != nil {
+			if err := m.waitForPoll(ctx); err != nil {
 				return err
 			}
 			continue
@@ -373,6 +384,25 @@ func (m *mirror) runPoll(ctx context.Context) error {
 				return err
 			}
 		}
+	}
+}
+
+// A Replicator uses Read even for tail-capable stores: Tail cannot expose an
+// empty chunk's advanced cursor, so it cannot confirm every captured boundary.
+// An explicit waiter wakes idle polling without bypassing failure backoff.
+func (m *mirror) waitForPoll(ctx context.Context) error {
+	if m.cfg.progress == nil {
+		return sleepCtx(ctx, m.cfg.pollInterval)
+	}
+	timer := time.NewTimer(m.cfg.pollInterval)
+	defer timer.Stop()
+	select {
+	case <-m.cfg.progress.wake:
+		return nil
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -469,26 +499,48 @@ func (m *mirror) forward(ctx context.Context, stored *StoredEvent) error {
 // with a lower chunk-start token — persisting the lower one would re-append
 // an already checkpointed range after a crash.
 //
-// SaveOffset failures after the first proven save are reported and do not
-// stop the mirror (the position is redundant with the events themselves).
+// For plain Mirror, SaveOffset failures after the first proven save are reported
+// and do not stop copying. Replicator instead retries the save in place before
+// copying any further event or announcing confirmed progress.
 // A failure of the FIRST save is fatal: it is the signature of a checkpoint
 // store that cannot store the source's offset tokens at all, and continuing
 // would look healthy while every restart re-copies the whole source.
 func (m *mirror) advance(ctx context.Context, offset Offset) error {
-	if m.comparer != nil && m.offset != OffsetOldest {
-		if cmp, err := m.comparer.CompareOffsets(offset, m.offset); err == nil && cmp <= 0 {
+	if m.comparer != nil && (m.offset != OffsetOldest || m.cfg.progress != nil) {
+		cmp, err := m.comparer.CompareOffsets(offset, m.offset)
+		if err != nil && m.cfg.progress != nil {
+			return fmt.Errorf("replication: compare progress: %w", err)
+		}
+		if err == nil && cmp <= 0 {
 			return nil
 		}
 	}
-	m.offset = offset
-	if err := m.offsets.SaveOffset(ctx, m.subscription, offset); err != nil {
+	// Plain Mirror retains its best-effort checkpoint policy. Confirmed
+	// replication cannot advertise progress until the checkpoint save succeeds.
+	if m.cfg.progress == nil {
+		m.offset = offset
+	}
+	for {
+		err := m.offsets.SaveOffset(ctx, m.subscription, offset)
+		if err == nil {
+			break
+		}
 		if !m.saveProven {
 			return fmt.Errorf("eventbus: mirror %q: initial checkpoint save failed (does the offsets store accept the source's offset tokens?): %w", m.subscription, err)
 		}
 		m.report(fmt.Errorf("mirror: save offset for %q: %w", m.subscription, err))
-		return nil
+		if m.cfg.progress == nil {
+			return nil
+		}
+		if err := sleepCtx(ctx, m.cfg.pollInterval); err != nil {
+			return err
+		}
 	}
+	m.offset = offset
 	m.saveProven = true
+	if m.cfg.progress != nil {
+		m.cfg.progress.confirm(offset)
+	}
 	return nil
 }
 

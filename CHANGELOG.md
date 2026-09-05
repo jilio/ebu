@@ -5,10 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.19.0] - 2026-09-05
+
+### Added
+
+- `NewReplicator` and generation-scoped `ReplicationPosition` values for hybrid
+  write policies. Ordinary writes replicate asynchronously; `Position` or
+  `Capture` plus `Wait` establish a destination-acknowledged prefix barrier.
+  `Confirmed` exposes progress, and restart resumes a separately scoped checkpoint.
+  Batched reads observe empty-chunk cursor advances; waiting operations wake idle
+  polling without bypassing failure backoff.
+- Strict checkpoint handling for confirmed replication: no confirmation after
+  an ambiguous append or failed checkpoint save; concurrent waits are independent,
+  cancellation does not undo writes, and generation mismatches fail explicitly.
+- Durable Streams `WithStrictDecoding()` for replication sources that must return
+  malformed-envelope errors instead of silently skipping records.
+- Confirmed Replication guide, executable API example, and a process-loss smoke
+  test that kills a SQLite source and recovers the confirmed prefix independently.
 
 ### Fixed
 
+- Make async-capacity cancellation coverage deterministic: cancel from a filter
+  after admission so both live and durable Once rollback paths are exercised.
 - Prevent `Shutdown` from closing the event store while an accepted publish,
   synchronous handler, replay, subscription setup or follower still uses it.
 - Close the event store exactly once across concurrent and repeated shutdown
@@ -902,6 +920,8 @@ Initial release of ebu (Event BUs) - a lightweight, type-safe event bus for Go.
 - `ClearAll`: Remove all handlers
 - `WaitAsync`: Wait for async handlers to complete
 
+[0.19.0]: https://github.com/jilio/ebu/compare/v0.18.1...v0.19.0
+[0.18.1]: https://github.com/jilio/ebu/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/jilio/ebu/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/jilio/ebu/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/jilio/ebu/compare/v0.15.0...v0.16.0

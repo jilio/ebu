@@ -53,6 +53,10 @@ type EventStore interface {
 	// error does not prove the event is absent: a remote commit may succeed
 	// before its acknowledgement is lost. Implementations should use Event.ID
 	// to make internal retries idempotent.
+	// A replication barrier made from this offset assumes the returned boundary
+	// covers the appended event; stores must not return an earlier chunk-start
+	// boundary for Append. Durability of a successful Append is store-specific:
+	// replication cannot strengthen an in-memory or buffered acknowledgement.
 	Append(ctx context.Context, event *Event) (Offset, error)
 
 	// Read returns events starting after the given offset.
@@ -92,6 +96,11 @@ type EventStore interface {
 // either a StoredEvent.Offset or nextOffset. Resumable subscriptions then stop
 // immediately after the one unit that crossed their captured tail instead of
 // chasing concurrent appends.
+// Concrete boundaries must identify stable prefixes within one log generation:
+// appending more history must not change the meaning of an already issued tail
+// token. Several read events can share an earlier token for safe redelivery;
+// that does not make that token evidence of their inclusion in the prefix.
+// CompareOffsets must be safe to call concurrently.
 type EventStoreOffsetComparer interface {
 	CompareOffsets(left, right Offset) (int, error)
 }

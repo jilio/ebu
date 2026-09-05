@@ -955,6 +955,26 @@ testBus.Replay(ctx, eventbus.OffsetOldest, func(event *eventbus.StoredEvent) err
 })
 ```
 
+## Replication acknowledgement and durability
+
+`Replicator` can wait until a local append's entire prefix has been acknowledged
+by another EventStore and checkpointed. This supports an asynchronous default and
+per-operation confirmed writes without changing the local write format. Its
+positions are source offsets scoped by relationship ID and log generation.
+
+A successful destination Append carries that store's guarantees: MemoryStore is
+not durable, SQLite's WAL `synchronous=NORMAL` is not a destination-power-loss
+guarantee for the latest commit, and a remote acknowledgement depends on server
+storage configuration. Use a destination outside the source worker's failure
+domain and configure its acknowledgement policy explicitly. Replication cannot
+strengthen an acknowledgement returned too early by a backend.
+
+A Durable Streams source should enable `WithStrictDecoding()` for loss-sensitive
+copying: malformed envelopes then return indexed Read/Tail errors rather than
+being skipped. Default decoding behavior is unchanged. See
+[Confirmed Replication](REPLICATION.md) for the API, checkpoint compatibility,
+timeouts, generations, retention, duplicate handling and recovery requirements.
+
 ## Shutdown and store lifetime
 
 `bus.Shutdown(ctx)` stops new bus operations, cancels active followers, and waits
