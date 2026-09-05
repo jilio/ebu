@@ -186,6 +186,8 @@ type EventBus struct {
 // instead of the reflection-based name. EventTypeName must depend only on the
 // type, not instance fields: generic replay/follow registration may derive it
 // from a fresh zero value.
+// The bus may omit calls when the wire name is unused; callers must not rely
+// on EventTypeName being invoked for every publication.
 //
 // Persisted or distributed event types should implement TypeNamer. Go's
 // reflection fallback uses the declared package name (for example,
@@ -249,8 +251,8 @@ func EventType(event any) string {
 // Observability is an optional interface for metrics and tracing.
 // Implementations can track event publishing, handler execution, and errors.
 //
-// This interface is designed to be zero-cost when not used - if no
-// observability is configured, there is no performance overhead.
+// When observability is not configured, the bus skips telemetry callbacks and
+// handler timing. Persistent publishing still computes event names for storage.
 //
 // The context returned from each method can be used to propagate trace
 // spans and other context-specific data through the event processing pipeline.

@@ -23,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Make concurrent benchmarks publish exactly the reported number of events and
   separate dispatch from formatting/channel overhead. Replace a log-only timing
   test with a deterministic check that concurrent publishers can enter `Append`.
+- Document SQLite batching, subscription-handle cleanup, optional instrumentation,
+  and reproducible dispatch benchmarks in the guides and API comments.
 
 ## [0.18.0] - 2026-08-15
 

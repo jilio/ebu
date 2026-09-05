@@ -195,6 +195,10 @@ eventbus.Clear[UserEvent](bus)
 eventbus.ClearAll(bus)
 ```
 
+Unsubscribing does not cancel a handler already selected by an in-flight
+publication. Prefer subscription handles for closures: they identify the exact
+registration even when several closures share the same function body.
+
 ## Advanced Features
 
 ### Event Persistence
@@ -405,7 +409,7 @@ eventbus.Publish(bus, UserCreatedEvent{UserID: "123"})
 The `otel` package provides:
 - **Metrics**: Event counts, handler duration, error rates, persistence metrics
 - **Tracing**: Distributed tracing with spans for publish, handlers, and persistence
-- **Zero overhead**: Optional - no performance impact if not used
+- **Optional instrumentation**: No telemetry callbacks or handler timing when not configured
 - **Vendor-neutral**: Built on OpenTelemetry standards
 
 See [**examples/observability**](examples/observability) for a complete example.
@@ -599,6 +603,18 @@ Features:
   caveat: with a limit set, don't publish async-handled events from inside async
   handlers — nested publishes can deadlock waiting for a slot the publishing
   handler occupies)
+
+To compare local dispatch before and after a change, run the same benchmark on
+both revisions with the same Go version and machine:
+
+```bash
+go test -run '^$' -bench '^BenchmarkMemoryAllocation$' -benchmem -benchtime=500ms -count=5
+```
+
+This benchmark uses an empty synchronous handler. Measure persistence,
+observability, and real handler work separately before extrapolating to an
+application. `EventTypeName()` must be a pure function of the type; the bus may
+omit its calls when no wire name is needed.
 
 ## Contributing
 

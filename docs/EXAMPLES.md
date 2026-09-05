@@ -371,7 +371,7 @@ func setupGlobalLogging(bus *eventbus.EventBus) {
         log.Printf("[EVENT] Publishing %s: %+v", eventType.Name(), event)
     })
 
-    // Called after all handlers complete
+    // Called after synchronous handlers complete; async handlers may still run
     bus.SetAfterPublishHook(func(eventType reflect.Type, event any) {
         log.Printf("[EVENT] Completed %s", eventType.Name())
     })
@@ -408,21 +408,24 @@ type MetricEvent struct {
 func main() {
     bus := eventbus.New()
 
-    // Define a handler we can reference later
+    // Define a handler
     metricHandler := func(event MetricEvent) {
         fmt.Printf("Metric: %s = %.2f\n", event.Name, event.Value)
     }
 
-    // Subscribe the handler
-    eventbus.Subscribe(bus, metricHandler)
+    // Retain a handle for this exact registration
+    sub, err := eventbus.SubscribeWithHandle(bus, metricHandler)
+    if err != nil {
+        panic(err)
+    }
 
     // Check if there are handlers
     if eventbus.HasHandlers[MetricEvent](bus) {
         eventbus.Publish(bus, MetricEvent{Name: "cpu_usage", Value: 45.5})
     }
 
-    // Unsubscribe the handler
-    eventbus.Unsubscribe[MetricEvent](bus, metricHandler)
+    // Unsubscribe exactly this registration; repeated calls are safe
+    sub.Unsubscribe()
 
     // This won't be handled
     eventbus.Publish(bus, MetricEvent{Name: "memory_usage", Value: 62.3})
@@ -617,6 +620,6 @@ func (e PaymentProcessedEvent) EventTypeName() string {
 3. **Handle errors gracefully** - Prefer returning errors over panicking
 4. **Use async for I/O** - Keep synchronous handlers fast
 5. **Leverage context** - Use `PublishContext` for cancellable operations
-6. **Clean up handlers** - Use `Unsubscribe` or `Clear` when done
+6. **Clean up handlers** - Retain subscription handles and call `sub.Unsubscribe()` when done; use `Clear` to remove all handlers of a type
 7. **Set panic handlers** - Monitor and log handler failures
 8. **Test concurrency** - The bus is thread-safe, test your handlers too
