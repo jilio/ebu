@@ -609,7 +609,7 @@ func (s *SQLiteStore) Close() error {
 
 // ReadStream implements eventbus.EventStoreStreamer for memory-efficient event streaming.
 // It uses cursor-based iteration, keeping only one row in memory at a time.
-// By default events are fetched in batches (see WithStreamBatchSize), so a
+// Events are fetched in batches (see WithStreamBatchSize), so a
 // stream does not pin a pooled connection and its WAL read snapshot for the
 // whole iteration; as a consequence, batched iteration may observe events
 // appended while the iteration is in progress.
@@ -643,63 +643,7 @@ func (s *SQLiteStore) ReadStream(ctx context.Context, from eventbus.Offset) iter
 			return
 		}
 
-		// If batching is enabled, use cursor-based pagination
-		if s.cfg.streamBatchSize > 0 {
-			s.streamBatched(ctx, position, &eventCount, &iterErr, yield)
-			return
-		}
-
-		rows, err := s.readFromStmt.QueryContext(ctx, position)
-		if err != nil {
-			iterErr = fmt.Errorf("sqlite: read stream: %w", err)
-			yield(nil, iterErr)
-			return
-		}
-
-		s.streamRows(ctx, rows, &eventCount, &iterErr, yield)
-
-		if s.logger != nil {
-			s.logger.Debug("streamed events", "from", from, "count", eventCount)
-		}
-	}
-}
-
-// streamRows iterates over rows yielding events. Extracted for testability.
-func (s *SQLiteStore) streamRows(
-	ctx context.Context,
-	rows rowScanner,
-	eventCount *int,
-	iterErr *error,
-	yield func(*eventbus.StoredEvent, error) bool,
-) {
-	defer rows.Close()
-
-	for rows.Next() {
-		select {
-		case <-ctx.Done():
-			*iterErr = ctx.Err()
-			yield(nil, *iterErr)
-			return
-		default:
-		}
-
-		event, _, err := scanEvent(rows)
-		if err != nil {
-			*iterErr = err
-			yield(nil, *iterErr)
-			return
-		}
-
-		*eventCount++
-		if !yield(event, nil) {
-			return
-		}
-	}
-
-	if err := rows.Err(); err != nil {
-		*iterErr = fmt.Errorf("sqlite: iterate events: %w", err)
-		yield(nil, *iterErr)
-		return
+		s.streamBatched(ctx, position, &eventCount, &iterErr, yield)
 	}
 }
 

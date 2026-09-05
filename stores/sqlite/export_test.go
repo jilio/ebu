@@ -32,12 +32,6 @@ func RunMigrateV4(ctx context.Context, db *sql.DB) error {
 	return migrateV4(ctx, db)
 }
 
-// SetStreamBatchSize overrides the stream batch size (exported for testing).
-// A value <= 0 forces the unbatched, point-in-time snapshot stream path.
-func (s *SQLiteStore) SetStreamBatchSize(size int) {
-	s.cfg.streamBatchSize = size
-}
-
 // NewFromDB creates a store from an existing db connection (exported for testing)
 // This allows testing the error path in newFromDB when prepareStatements fails
 func NewFromDB(db *sql.DB) (*SQLiteStore, error) {
@@ -76,27 +70,13 @@ func (s *SQLiteStore) ScanEvents(rows RowScanner) ([]any, error) {
 	return result, nil
 }
 
-// StreamRowsYieldFunc is the yield function type for StreamRows
-type StreamRowsYieldFunc = func(*eventbus.StoredEvent, error) bool
-
-// StreamRows exposes streamRows for testing error paths
-func (s *SQLiteStore) StreamRows(
-	ctx context.Context,
-	rows RowScanner,
-	eventCount *int,
-	iterErr *error,
-	yield StreamRowsYieldFunc,
-) {
-	s.streamRows(ctx, rows, eventCount, iterErr, yield)
-}
-
 // StreamBatch exposes streamBatch for testing error paths (e.g., rows.Close() error)
 func (s *SQLiteStore) StreamBatch(
 	ctx context.Context,
 	rows RowScanner,
 	eventCount *int,
 	iterErr *error,
-	yield StreamRowsYieldFunc,
+	yield func(*eventbus.StoredEvent, error) bool,
 ) (batchCount int, lastPos int64, cont bool) {
 	return s.streamBatch(ctx, rows, eventCount, iterErr, yield)
 }
