@@ -433,6 +433,9 @@ func (*Store) CompareOffsets(left, right eventbus.Offset) (int, error) {
 func (s *Store) decodeChunk(data []byte, next, chunkStart eventbus.Offset) (events []*eventbus.StoredEvent, allEmbedded bool, err error) {
 	// Parse JSON array response (an empty body yields no events).
 	var rawEvents []json.RawMessage
+	if s.cfg.strictDecoding && strings.TrimSpace(string(data)) == "null" {
+		return nil, false, fmt.Errorf("durablestream: decode chunk: null array")
+	}
 	if len(data) > 0 {
 		if err := json.Unmarshal(data, &rawEvents); err != nil {
 			return nil, false, fmt.Errorf("durablestream: unmarshal response: %w", err)
@@ -444,9 +447,15 @@ func (s *Store) decodeChunk(data []byte, next, chunkStart eventbus.Offset) (even
 	allEmbedded = true
 	lastRaw := len(rawEvents) - 1
 	for i, raw := range rawEvents {
+		if s.cfg.strictDecoding && strings.TrimSpace(string(raw)) == "null" {
+			return nil, false, fmt.Errorf("durablestream: decode event at index %d: null envelope", i)
+		}
 		// Try to parse as event with embedded offset first
 		var eventWithOffset storedEventWithOffset
 		if err := json.Unmarshal(raw, &eventWithOffset); err != nil {
+			if s.cfg.strictDecoding {
+				return nil, false, fmt.Errorf("durablestream: decode event at index %d: %w", i, err)
+			}
 			s.handleDecodeError(i, raw, err)
 			continue
 		}

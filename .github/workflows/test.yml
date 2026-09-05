@@ -98,6 +98,9 @@ jobs:
           echo "::endgroup::"
         done
 
+    - name: Verify confirmed replication survives source-process loss
+      run: go run ./scripts/replication-smoke.go
+
   coverage:
     runs-on: ubuntu-latest
     env:

@@ -53,6 +53,10 @@ type EventStore interface {
 	// error does not prove the event is absent: a remote commit may succeed
 	// before its acknowledgement is lost. Implementations should use Event.ID
 	// to make internal retries idempotent.
+	// A replication barrier made from this offset assumes the returned boundary
+	// covers the appended event; stores must not return an earlier chunk-start
+	// boundary for Append. Durability of a successful Append is store-specific:
+	// replication cannot strengthen an in-memory or buffered acknowledgement.
 	Append(ctx context.Context, event *Event) (Offset, error)
 
 	// Read returns events starting after the given offset.

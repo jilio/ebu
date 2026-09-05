@@ -197,6 +197,23 @@ Like durable followers, `Mirror` does not coordinate writers across
 processes: run one mirror per subscription ID, enforced by an external lease
 or a single owner.
 
+## Hybrid write policies with Replicator
+
+Use `NewReplicator` when ordinary writes may remain asynchronous but selected
+operations must wait for destination acknowledgement. It shares Mirror's copy
+loop and adds generation-scoped `ReplicationPosition` values, `Capture`, `Wait`
+and `Confirmed`. A barrier acknowledges the entire source prefix, not only the
+important event. A timeout leaves the copy running; a failed checkpoint save
+cannot advance confirmed progress.
+
+The destination's Append contract determines durability. Configure an independent
+durable destination for source-worker-loss protection. A replica acknowledgement
+is distinct from projection application or permission to promote a new writer.
+Use strict decoding on sources and preserve unreplicated history. See the
+[Confirmed Replication Guide](REPLICATION.md) for complete examples, restart and
+retention rules, and the difference between ordinary Mirror's checkpoint policy
+and confirmed replication.
+
 ## At-least-once, and what to do about it
 
 Every layer of a shared log is at-least-once: appends may be retried, chunked

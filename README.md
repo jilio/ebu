@@ -22,9 +22,13 @@ A lightweight, type-safe event bus for Go with generics support. Build decoupled
 - 💾 **Event persistence** - Built-in support for event storage and replay
 - 🔗 **Cross-process delivery** - `Follow` a shared store to span processes and machines
 - 🪞 **Log replication** - `Mirror` one store into another with envelopes preserved
+- **Confirmed replication** - `Replicator` lets important writes wait for an acknowledged prefix while ordinary writes remain asynchronous
 - 🌍 **Remote storage** - Native support for remote backends like [durable-streams](https://github.com/durable-streams/durable-streams)
 - 🔄 **Event upcasting** - Seamless event schema migration and versioning
 - ✅ **100% test coverage** - Thoroughly tested for reliability
+
+See the [Confirmed Replication Guide](docs/REPLICATION.md) for hybrid write policies,
+recovery contracts, generations and destination durability requirements.
 
 ## Installation
 
@@ -396,6 +400,13 @@ tails one store and appends every event to another with the envelope
 preserved verbatim — a local write-ahead log shipped into a shared store, a
 store migration, a rebuilt replica. See the Distributed Guide's
 "Mirroring one log into another".
+
+For hybrid durability policies, `NewReplicator` binds a source, destination and
+checkpoint store. Run it once, then use `Position` on an append result or `Capture`
+on a group of writes, followed by `Wait` for important operations. A successful
+wait inherits the destination's acknowledgement guarantees; configure an
+independent durable destination for protection against source-worker loss. See
+[Confirmed Replication](docs/REPLICATION.md).
 
 See [**Distributed Guide**](docs/DISTRIBUTED.md) for delivery modes,
 failure behavior, and current limitations.
