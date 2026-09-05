@@ -272,7 +272,7 @@ func mirrorRun(ctx context.Context, src, dst EventStore, subscriptionID string, 
 		return err
 	}
 
-	if tailer, ok := src.(EventStoreTailer); ok {
+	if tailer, ok := src.(EventStoreTailer); ok && cfg.progress == nil {
 		return m.runTail(ctx, tailer)
 	}
 	return m.runPoll(ctx)
@@ -372,7 +372,7 @@ func (m *mirror) runPoll(ctx context.Context) error {
 			if err := m.maybeReconcile(ctx); err != nil {
 				return err
 			}
-			if err := sleepCtx(ctx, m.cfg.pollInterval); err != nil {
+			if err := m.waitForPoll(ctx); err != nil {
 				return err
 			}
 			continue
@@ -384,6 +384,25 @@ func (m *mirror) runPoll(ctx context.Context) error {
 				return err
 			}
 		}
+	}
+}
+
+// A Replicator uses Read even for tail-capable stores: Tail cannot expose an
+// empty chunk's advanced cursor, so it cannot confirm every captured boundary.
+// An explicit waiter wakes idle polling without bypassing failure backoff.
+func (m *mirror) waitForPoll(ctx context.Context) error {
+	if m.cfg.progress == nil {
+		return sleepCtx(ctx, m.cfg.pollInterval)
+	}
+	timer := time.NewTimer(m.cfg.pollInterval)
+	defer timer.Stop()
+	select {
+	case <-m.cfg.progress.wake:
+		return nil
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

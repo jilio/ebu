@@ -638,3 +638,46 @@ func TestReplicationWaitDeadlineDoesNotNeedARunner(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestReplicationConfirmsEmptyResumeBoundaryFromTailCapableSource(t *testing.T) {
+	// Tail has no way to yield a cursor-only update. A confirmed copier must use
+	// Read's nextOffset even for a source that also provides a pushing iterator.
+	source := &mirrorTailerComparerStore{mirrorTailerStore: mirrorTailerStore{
+		mirrorScriptStore: mirrorScriptStore{readFn: func(_ context.Context, from Offset, _ int) ([]*StoredEvent, Offset, error) { return nil, "01", nil }},
+		tailFn: func(ctx context.Context, _ Offset) iter.Seq2[*StoredEvent, error] {
+			return func(func(*StoredEvent, error) bool) { <-ctx.Done() }
+		},
+	}, compareFn: func(l, r Offset) (int, error) { return strings.Compare(string(l), string(r)), nil }}
+	r := newTestReplicator(t, replicationConfig(source, NewMemoryStore()))
+	point, err := r.Capture(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	startReplicator(t, r)
+	ctx := lifecycleContext(t)
+	if err := r.Wait(ctx, point); err != nil {
+		t.Fatalf("empty boundary was never confirmed: %v", err)
+	}
+}
+
+func TestReplicationWaitWakesIdlePolling(t *testing.T) {
+	memory := NewMemoryStore()
+	idle := make(chan struct{})
+	var once sync.Once
+	source := &mirrorComparerStore{mirrorScriptStore: mirrorScriptStore{readFn: func(ctx context.Context, from Offset, n int) ([]*StoredEvent, Offset, error) {
+		events, next, err := memory.Read(ctx, from, n)
+		if from != OffsetNewest && len(events) == 0 {
+			once.Do(func() { close(idle) })
+		}
+		return events, next, err
+	}}, compareFn: memory.CompareOffsets}
+	r := newTestReplicator(t, replicationConfig(source, NewMemoryStore()), MirrorPollInterval(time.Hour))
+	startReplicator(t, r)
+	lifecycleReceive(t, idle)
+	target := replicationPoint(t, r, appendReplicationEvent(t, memory, "wake"))
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := r.Wait(ctx, target); err != nil {
+		t.Fatalf("waiter did not wake idle copier: %v", err)
+	}
+}

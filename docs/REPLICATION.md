@@ -67,6 +67,12 @@ configuration to resume. `MirrorPollInterval`, `MirrorDedupWindow`,
 `MirrorOnForward` and `MirrorOnError` also configure a Replicator. Observers execute
 on the copying goroutine; never wait for that replicator from an observer.
 
+Replicator uses batched `Read`, including for sources with `Tail`: Read exposes
+cursor-only advances across empty chunks, which Tail's event iterator cannot
+report. `MirrorPollInterval` sets the idle polling period. A waiting operation
+wakes an idle copier immediately; it does not bypass retry backoff after errors.
+Plain Mirror continues to prefer Tail when available.
+
 ## Mix ordinary and important writes
 
 Both modes use the same local append. Important operations add a wait:
@@ -95,14 +101,15 @@ func appendWithReplication(
 ```
 
 The application chooses its default and can override it per operation without
-restarting the copier. Assign a stable event ID before attempting the local write
+restarting the copier. Assign an event ID unique to that logical write before attempting the local write
 and make retries of the write idempotent. If the append succeeded but the wait
 timed out, keep the returned position and retry **the wait**, not the write.
 An append error can also be ambiguous; that case requires the source store's
 idempotency/reconciliation mechanism.
 
 `Position` checks the offset using the source comparer; it cannot prove that an
-arbitrary token was actually issued by this log. Pass only a source Append result
+arbitrary token was actually issued by this log. Concrete boundaries must name
+stable prefixes: later appends cannot reuse a tail token with a larger meaning. Pass only a source Append result
 whose boundary covers that append, or use `Capture`. Do not use the offset on an
 arbitrary read event as evidence that the event was copied: a non-last member of
 a chunk can carry the chunk's start token. The copier confirms the end only after

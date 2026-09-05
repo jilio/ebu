@@ -96,6 +96,11 @@ type EventStore interface {
 // either a StoredEvent.Offset or nextOffset. Resumable subscriptions then stop
 // immediately after the one unit that crossed their captured tail instead of
 // chasing concurrent appends.
+// Concrete boundaries must identify stable prefixes within one log generation:
+// appending more history must not change the meaning of an already issued tail
+// token. Several read events can share an earlier token for safe redelivery;
+// that does not make that token evidence of their inclusion in the prefix.
+// CompareOffsets must be safe to call concurrently.
 type EventStoreOffsetComparer interface {
 	CompareOffsets(left, right Offset) (int, error)
 }

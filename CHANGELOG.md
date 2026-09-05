@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   write policies. Ordinary writes replicate asynchronously; `Position` or
   `Capture` plus `Wait` establish a destination-acknowledged prefix barrier.
   `Confirmed` exposes progress, and restart resumes a separately scoped checkpoint.
+  Batched reads observe empty-chunk cursor advances; waiting operations wake idle
+  polling without bypassing failure backoff.
 - Strict checkpoint handling for confirmed replication: no confirmation after
   an ambiguous append or failed checkpoint save; concurrent waits are independent,
   cancellation does not undo writes, and generation mismatches fail explicitly.
@@ -20,7 +22,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   malformed-envelope errors instead of silently skipping records.
 - Confirmed Replication guide, executable API example, and a process-loss smoke
   test that kills a SQLite source and recovers the confirmed prefix independently.
-
 
 ### Fixed
 

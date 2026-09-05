@@ -40,8 +40,8 @@ type ReplicationPosition struct {
 // from opaque offsets, especially after a rebuilt log has caught up again.
 //
 // Source must implement EventStoreOffsetComparer, expose every event without
-// filtering/skipping decode failures, and retain all history not yet replicated. A fresh generation starts at OffsetOldest and requires the
-// full source history. Source and destination must be different logs with no
+// filtering/skipping decode failures, and retain all history not yet replicated.
+// A fresh generation starts at OffsetOldest and requires the full source history. Source and destination must be different logs with no
 // cyclic mirror topology. Destination must preserve all acknowledged records (or
 // a recovery-equivalent snapshot). There must be one owner of the checkpoint
 // namespace across processes; Replicator does not acquire distributed leases.
@@ -71,6 +71,7 @@ type Replicator struct {
 	checkpointID string
 	mu           sync.Mutex
 	changed      chan struct{}
+	wake         chan struct{}
 	started      bool
 	stopped      bool
 	runErr       error
@@ -109,14 +110,15 @@ func NewReplicator(config ReplicatorConfig, opts ...MirrorOption) (*Replicator, 
 	// aliasing another relationship's checkpoints. Plain Mirror IDs stay separate.
 	key, _ := json.Marshal([2]string{config.ID, config.Generation})
 	r := &Replicator{config: config, comparer: comparer, mirrorConfig: cfg,
-		checkpointID: "ebu:replication:" + string(key), changed: make(chan struct{})}
+		checkpointID: "ebu:replication:" + string(key), changed: make(chan struct{}), wake: make(chan struct{}, 1)}
 	cfg.progress = r
 	return r, nil
 }
 
 // Position scopes an offset returned by Source.Append to this relationship.
 // It delegates token comparisons to the store; this is not an existence or
-// provenance check. Pass only offsets actually issued by this source generation. OffsetNewest is rejected; use Capture to resolve it.
+// provenance check. Pass only offsets actually issued by this source generation.
+// OffsetNewest is rejected; use Capture to resolve it.
 func (r *Replicator) Position(offset Offset) (ReplicationPosition, error) {
 	if offset == OffsetNewest {
 		return ReplicationPosition{}, fmt.Errorf("%w: newest is symbolic", ErrReplicationPosition)
@@ -153,7 +155,9 @@ func (r *Replicator) Capture(ctx context.Context) (ReplicationPosition, error) {
 }
 
 // Run copies until canceled or a fatal startup/checkpoint error. Transient
-// mirror errors are retried in place. Concurrent/repeated Run calls fail with
+// mirror errors are retried in place. Run uses batched Read so cursor-only
+// advances (empty chunks) are visible; Wait wakes idle polling without bypassing
+// retry backoff. Concurrent/repeated Run calls fail with
 // ErrReplicatorStarted; use a new instance to resume after this call returns.
 // Observers run on this goroutine: never call Wait on this replicator from one.
 func (r *Replicator) Run(ctx context.Context) (err error) {
@@ -219,6 +223,10 @@ func (r *Replicator) Wait(ctx context.Context, target ReplicationPosition) error
 		}
 		if stopped {
 			return runErr
+		}
+		select {
+		case r.wake <- struct{}{}:
+		default:
 		}
 		select {
 		case <-changed:
