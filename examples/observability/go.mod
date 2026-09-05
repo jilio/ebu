@@ -3,8 +3,8 @@ module github.com/jilio/ebu/examples/observability
 go 1.25.12
 
 require (
-	github.com/jilio/ebu v0.18.1
-	github.com/jilio/ebu/otel v0.18.1
+	github.com/jilio/ebu v0.19.0
+	github.com/jilio/ebu/otel v0.19.0
 	go.opentelemetry.io/otel v1.43.0
 	go.opentelemetry.io/otel/exporters/stdout/stdoutmetric v1.43.0
 	go.opentelemetry.io/otel/exporters/stdout/stdouttrace v1.43.0

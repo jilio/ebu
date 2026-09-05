@@ -3,8 +3,8 @@ module github.com/jilio/ebu/examples/observability/generator
 go 1.25.12
 
 require (
-	github.com/jilio/ebu v0.18.1
-	github.com/jilio/ebu/otel v0.18.1
+	github.com/jilio/ebu v0.19.0
+	github.com/jilio/ebu/otel v0.19.0
 	go.opentelemetry.io/otel v1.43.0
 	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.43.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.43.0
