@@ -443,7 +443,6 @@ func TestCompleteReplaySetupRejectsRemovedOrClosedMarker(t *testing.T) {
 				waitCh: make(chan struct{}), done: make(chan struct{}),
 			}
 			marker := &internalHandler{
-				eventType:        eventType,
 				internalDelivery: func(context.Context, any) error { return nil },
 				onRemove:         coordinator.deactivate,
 			}

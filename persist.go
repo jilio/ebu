@@ -788,7 +788,6 @@ func subscribeContextWithReplay[T any](
 	// Sequential, and observability boundary.
 	marker := &internalHandler{
 		handlerType: h.handlerType,
-		eventType:   eventType,
 		internalDelivery: func(signalCtx context.Context, _ any) error {
 			return coordinator.signal(signalCtx)
 		},

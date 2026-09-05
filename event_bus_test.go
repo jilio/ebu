@@ -719,7 +719,6 @@ func TestSignalReplayMarkersStillWakesWithCancelledPublishContext(t *testing.T) 
 	bus := New()
 	var calls int
 	marker := &internalHandler{
-		eventType: reflect.TypeOf(OrderEvent{}),
 		internalDelivery: func(context.Context, any) error {
 			calls++
 			return nil

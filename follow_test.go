@@ -1361,7 +1361,6 @@ func TestDispatchInternalHandlersHonorsCancellationBeforeSignal(t *testing.T) {
 	eventType := reflect.TypeOf(followEvent{})
 	var calls int
 	bus.addHandler(eventType, &internalHandler{
-		eventType: eventType,
 		internalDelivery: func(context.Context, any) error {
 			calls++
 			return nil

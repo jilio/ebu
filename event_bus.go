@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"reflect"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,7 +25,6 @@ type SubscribeOption func(*internalHandler)
 type internalHandler struct {
 	handler      any
 	handlerType  reflect.Type
-	eventType    reflect.Type
 	once         bool
 	async        bool
 	sequential   bool
@@ -356,7 +356,6 @@ func buildHandler(handler any, eventType reflect.Type, opts []SubscribeOption) (
 	h := &internalHandler{
 		handler:     handler,
 		handlerType: reflect.TypeOf(handler),
-		eventType:   eventType,
 	}
 
 	for _, opt := range opts {
@@ -428,7 +427,12 @@ func (bus *EventBus) removeHandler(eventType reflect.Type, h *internalHandler) {
 			if existing.onRemove != nil {
 				existing.onRemove()
 			}
-			shard.handlers[eventType] = append(handlers[:i], handlers[i+1:]...)
+			handlers = slices.Delete(handlers, i, i+1)
+			if len(handlers) == 0 {
+				delete(shard.handlers, eventType)
+			} else {
+				shard.handlers[eventType] = handlers
+			}
 			shard.mu.Unlock()
 			return
 		}
@@ -630,8 +634,12 @@ func Unsubscribe[T any, H any](bus *EventBus, handler H) error {
 			if h.onRemove != nil {
 				h.onRemove()
 			}
-			// Remove handler efficiently
-			shard.handlers[eventType] = append(handlers[:i], handlers[i+1:]...)
+			handlers = slices.Delete(handlers, i, i+1)
+			if len(handlers) == 0 {
+				delete(shard.handlers, eventType)
+			} else {
+				shard.handlers[eventType] = handlers
+			}
 			return nil
 		}
 	}
@@ -695,11 +703,13 @@ func publishContext[T any](bus *EventBus, ctx context.Context, event T) error {
 	}
 
 	eventType := reflect.TypeOf(event)
-	eventTypeName := EventType(event)
-	if bus != nil && bus.store != nil {
+	var eventTypeName string
+	if bus.store != nil {
 		// Persistent routing must use the reproducible type-derived name. The
 		// persistence step separately rejects an instance-dependent TypeNamer.
 		eventTypeName = typeNameOf(eventType)
+	} else if bus.observability != nil {
+		eventTypeName = EventType(event)
 	}
 
 	// Observability: Track publish start
@@ -1040,12 +1050,16 @@ func removeOnceHandlers(shard *shard, eventType reflect.Type, onceHandlers []*in
 	for _, onceHandler := range onceHandlers {
 		for i, h := range handlers {
 			if h == onceHandler {
-				handlers = append(handlers[:i], handlers[i+1:]...)
+				handlers = slices.Delete(handlers, i, i+1)
 				break
 			}
 		}
 	}
-	shard.handlers[eventType] = handlers
+	if len(handlers) == 0 {
+		delete(shard.handlers, eventType)
+	} else {
+		shard.handlers[eventType] = handlers
+	}
 	shard.mu.Unlock()
 }
 
@@ -1137,10 +1151,16 @@ func callHandlerWithContext[T any](h *internalHandler, ctx context.Context, even
 	if h.suppressObservability {
 		obs = nil
 	}
-	start := time.Now()
+	var start time.Time
+	if obs != nil {
+		start = time.Now()
+	}
 
 	defer func() {
-		duration := time.Since(start)
+		var duration time.Duration
+		if obs != nil {
+			duration = time.Since(start)
+		}
 		if r := recover(); r != nil {
 			panicErr = &handlerPanicError{value: r}
 			if panicHandler != nil {
