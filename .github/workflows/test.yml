@@ -117,6 +117,7 @@ jobs:
     - name: Generate coverage report
       run: |
         go test -v -coverprofile=coverage.out ./...
+        go tool cover -func=coverage.out
         test "$(go tool cover -func=coverage.out | awk '/^total:/ {print $3}')" = "100.0%"
 
     - name: Upload coverage reports
