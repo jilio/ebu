@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.1] - Unreleased
+
+### Fixed
+
+- Apply the same SQLite read-side page-cache, temporary-storage, memory-mapping,
+  and busy-timeout settings to every connection opened by `New` and
+  `OpenReadOnly`. Read-only connections retain their write protection and do
+  not request writer transaction locks or durability settings.
+- Treat SQLite filenames containing `%`, `?`, or `#` literally in `New`, using
+  the same URI escaping as `OpenReadOnly`. The special `:memory:` behavior is
+  unchanged. Both constructors reject NUL bytes instead of opening a truncated
+  filename.
+
+### Changed
+
+- Document the shared release version for all four public modules and use
+  patch releases for compatible changes during `0.x`.
+- Align nested-module and example dependency pins with the shared project
+  release.
+
+## [0.20.0] - 2026-09-12
+
+### Added
+
+- SQLite `OpenReadOnly` opens existing stores without creating or migrating a
+  database or changing its journal mode. Unsupported schemas fail without
+  repair; mutations return `ErrReadOnly`. SQLite enforces read-only access on
+  every pooled connection while allowing later WAL commits to remain visible.
+  WAL shared-memory sidecars may still be created or updated.
+
+### Changed
+
+- Publish `0.20.0` as one shared release across the core, SQLite, Durable
+  Streams, and OpenTelemetry modules.
+
 ## [0.19.0] - 2026-09-05
 
 ### Added
@@ -920,6 +955,8 @@ Initial release of ebu (Event BUs) - a lightweight, type-safe event bus for Go.
 - `ClearAll`: Remove all handlers
 - `WaitAsync`: Wait for async handlers to complete
 
+[0.20.1]: https://github.com/jilio/ebu/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/jilio/ebu/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/jilio/ebu/compare/v0.18.1...v0.19.0
 [0.18.1]: https://github.com/jilio/ebu/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/jilio/ebu/compare/v0.17.0...v0.18.0

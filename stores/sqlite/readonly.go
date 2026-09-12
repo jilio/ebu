@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/url"
-	"path/filepath"
 )
 
 // ErrReadOnly is returned by mutations on a store opened with OpenReadOnly.
@@ -15,6 +13,7 @@ var ErrReadOnly = errors.New("sqlite: store is read-only")
 // schema or journal mode. It never creates or migrates a database. The stored
 // schema must match the version this package reads; WithAutoMigrate(true) is
 // rejected. Other options have the same meaning as for New.
+// The path is a literal filename, not a SQLite URI.
 //
 // SQLite mode=ro is used, not immutable=1: reads can observe later commits by
 // a concurrent writer. SQLite may create or update WAL shared-memory sidecars
@@ -26,6 +25,7 @@ func OpenReadOnly(path string, opts ...Option) (*SQLiteStore, error) {
 		return nil, errors.New("sqlite: read-only opening requires an existing file path")
 	}
 	cfg := defaultConfig()
+	cfg.path = path
 	cfg.autoMigrate = false
 	cfg.readOnly = true
 	for _, opt := range opts {
@@ -34,18 +34,11 @@ func OpenReadOnly(path string, opts ...Option) (*SQLiteStore, error) {
 	if cfg.autoMigrate {
 		return nil, errors.New("sqlite: read-only opening cannot enable automatic migration")
 	}
-	abs, err := filepath.Abs(path)
+	dsn, err := buildDSN(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("sqlite: resolve read-only path: %w", err)
+		return nil, err
 	}
-	cfg.path = abs
-	uri := url.URL{Scheme: "file", Path: abs}
-	query := url.Values{"mode": {"ro"}, "_pragma": {
-		fmt.Sprintf("busy_timeout(%d)", cfg.busyTimeout.Milliseconds()),
-		"query_only(1)",
-	}}
-	uri.RawQuery = query.Encode()
-	db, err := dbOpener("sqlite", uri.String())
+	db, err := dbOpener("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: open read-only database: %w", err)
 	}

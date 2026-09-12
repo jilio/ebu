@@ -199,7 +199,20 @@ creating a database, migrating its schema, or changing its journal mode. The
 stored schema version must be supported; an uninitialized or incompatible
 database is rejected. `WithAutoMigrate(true)` is an error with this constructor.
 `Append`, `SaveOffset`, `SaveSnapshot`, and `TruncateBefore` return
-`sqlite.ErrReadOnly`. Ordinary `New` behavior is unchanged.
+`sqlite.ErrReadOnly`. `New` continues to enable WAL and automatic migrations
+by default.
+
+Both constructors accept literal filenames, not SQLite URIs: characters such
+as `%`, `?`, and `#` are escaped rather than interpreted as options. NUL bytes
+are rejected. `New` also accepts the special path `:memory:` for an isolated,
+pooled in-memory store; `OpenReadOnly` requires an existing file.
+
+For file-backed stores, every pooled connection uses the same read-side
+settings: a 64 MB page cache, memory-backed temporary storage, and up to
+256 MB of memory-mapped reads. Both constructors honor `WithBusyTimeout`
+(five seconds by default). Read-only connections additionally enforce
+`query_only` and do not use the writer's synchronous or immediate-transaction
+settings.
 
 Read-only stores use SQLite `mode=ro`, so later commits from a concurrent WAL
 writer remain visible. They do not use `immutable=1` and do not provide a fixed
