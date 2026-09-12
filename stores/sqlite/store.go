@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"iter"
 	"strconv"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -57,6 +56,8 @@ var dbOpener = sql.Open
 var memDBCounter atomic.Int64
 
 // New creates a new SQLiteStore with the given path and options.
+// The path is a literal filename, not a SQLite URI. The special path
+// :memory: creates an isolated, pooled in-memory store.
 //
 // Note: When WithAutoMigrate is enabled (the default), migrations run with
 // context.Background() and are not cancellable. This ensures migrations
@@ -66,18 +67,17 @@ func New(path string, opts ...Option) (*SQLiteStore, error) {
 		return nil, errors.New("sqlite: path is required")
 	}
 
-	// Validate path to prevent URI parameter injection
-	if path != ":memory:" && (strings.Contains(path, "?") || strings.Contains(path, "#")) {
-		return nil, errors.New("sqlite: path cannot contain '?' or '#' characters")
-	}
-
 	cfg := defaultConfig()
 	cfg.path = path
 	for _, opt := range opts {
 		opt(cfg)
 	}
 
-	db, err := dbOpener("sqlite", buildDSN(cfg))
+	dsn, err := buildDSN(cfg)
+	if err != nil {
+		return nil, err
+	}
+	db, err := dbOpener("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: open database: %w", err)
 	}
@@ -131,42 +131,6 @@ func newFromDB(db *sql.DB, cfg *config, memConn *sql.Conn) (*SQLiteStore, error)
 	}
 
 	return store, nil
-}
-
-// buildDSN constructs the modernc.org/sqlite connection string.
-//
-// Pragmas are connection-scoped in SQLite, and database/sql maintains a pool
-// of connections, so they must travel as modernc `_pragma=` DSN parameters —
-// that way the driver applies them to EVERY pooled connection. Applying them
-// via db.Exec would configure only whichever single connection the pool
-// happened to hand out (leaving the rest without e.g. busy_timeout, which
-// made concurrent appends fail with SQLITE_BUSY).
-func buildDSN(cfg *config) string {
-	if cfg.path == ":memory:" {
-		// Shared cache mode lets database/sql's pooled connections see the
-		// same in-memory database. Each store gets a unique name so two
-		// independent :memory: stores in the same process don't share data.
-		return fmt.Sprintf("file:ebu_memdb_%d?mode=memory&cache=shared", memDBCounter.Add(1))
-	}
-
-	pragmas := []string{
-		fmt.Sprintf("busy_timeout(%d)", cfg.busyTimeout.Milliseconds()),
-		"synchronous(NORMAL)",
-		"cache_size(-64000)", // 64MB cache
-		"temp_store(MEMORY)",
-		"mmap_size(268435456)", // 256MB mmap
-	}
-
-	params := make([]string, 0, len(pragmas)+1)
-	// Immediate transactions take the write lock at BEGIN (honoring
-	// busy_timeout) instead of upgrading mid-transaction, which can return
-	// SQLITE_BUSY immediately. Only migrations use transactions here.
-	params = append(params, "_txlock=immediate")
-	for _, p := range pragmas {
-		params = append(params, "_pragma="+p)
-	}
-
-	return fmt.Sprintf("file:%s?%s", cfg.path, strings.Join(params, "&"))
 }
 
 // enableWAL switches a file-backed database to WAL journaling. Unlike the
