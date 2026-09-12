@@ -284,6 +284,12 @@ func (*SQLiteStore) CompareOffsets(left, right eventbus.Offset) (int, error) {
 // Append stores an event and returns its assigned offset.
 func (s *SQLiteStore) Append(ctx context.Context, event *eventbus.Event) (eventbus.Offset, error) {
 	start := time.Now()
+	if s.cfg.readOnly {
+		if s.metricsHook != nil {
+			s.metricsHook.OnAppend(time.Since(start), ErrReadOnly)
+		}
+		return "", ErrReadOnly
+	}
 
 	// Envelope fields are stored as NULL when absent so rows written through
 	// old and new cores are indistinguishable on read (both scan as empty).
@@ -457,6 +463,12 @@ func (s *SQLiteStore) scanEvents(rows rowScanner) ([]*eventbus.StoredEvent, erro
 // offset the store can resume from.
 func (s *SQLiteStore) SaveOffset(ctx context.Context, subscriptionID string, offset eventbus.Offset) error {
 	start := time.Now()
+	if s.cfg.readOnly {
+		if s.metricsHook != nil {
+			s.metricsHook.OnSaveOffset(time.Since(start), ErrReadOnly)
+		}
+		return ErrReadOnly
+	}
 
 	if offset == eventbus.OffsetNewest {
 		position, err := s.resolveNewest(ctx)
@@ -525,6 +537,9 @@ func (s *SQLiteStore) LoadOffset(ctx context.Context, subscriptionID string) (ev
 // SaveSnapshot upserts the compaction snapshot for snapshotID, recording that
 // blob reflects the projection as of (and including) atOffset.
 func (s *SQLiteStore) SaveSnapshot(ctx context.Context, snapshotID string, atOffset eventbus.Offset, blob json.RawMessage) error {
+	if s.cfg.readOnly {
+		return ErrReadOnly
+	}
 	position, err := parseOffset(atOffset)
 	if err != nil {
 		return fmt.Errorf("sqlite: invalid snapshot offset: %w", err)
@@ -555,6 +570,9 @@ func (s *SQLiteStore) LoadSnapshot(ctx context.Context, snapshotID string) (even
 // table uses AUTOINCREMENT, so deleted positions are never reused; a snapshot
 // resumed via Replay(atOffset) (which reads position > atOffset) is unaffected.
 func (s *SQLiteStore) TruncateBefore(ctx context.Context, beforeOffset eventbus.Offset) (int64, error) {
+	if s.cfg.readOnly {
+		return 0, ErrReadOnly
+	}
 	position, err := parseOffset(beforeOffset)
 	if err != nil {
 		return 0, fmt.Errorf("sqlite: invalid truncate offset: %w", err)

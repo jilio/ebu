@@ -194,6 +194,21 @@ loop closes the current rows; cancellation and query/iteration failures are
 returned through the iterator. Ordinary `Read(ctx, from, 0)` still reads without
 a result limit.
 
+Use `sqlite.OpenReadOnly(path, options...)` to read an existing store without
+creating a database, migrating its schema, or changing its journal mode. The
+stored schema version must be supported; an uninitialized or incompatible
+database is rejected. `WithAutoMigrate(true)` is an error with this constructor.
+`Append`, `SaveOffset`, `SaveSnapshot`, and `TruncateBefore` return
+`sqlite.ErrReadOnly`. Ordinary `New` behavior is unchanged.
+
+Read-only stores use SQLite `mode=ro`, so later commits from a concurrent WAL
+writer remain visible. They do not use `immutable=1` and do not provide a fixed
+snapshot. SQLite may create or update WAL shared-memory sidecars when directory
+permissions allow it. Schema validation happens at open; corruption encountered
+in event pages is reported by reads, without an automatic integrity scan or
+repair. Applications requiring an entirely immutable filesystem copy must
+arrange that separately.
+
 ### Durable-Streams Store
 
 Remote storage using the [Durable Streams](https://electric-sql.com/blog/2025/12/09/announcing-durable-streams) protocol - an HTTP-based persistent stream primitive for reliable, resumable, real-time data streaming developed by [Electric](https://electric-sql.com).
