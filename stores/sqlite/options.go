@@ -31,6 +31,7 @@ type config struct {
 	path            string
 	busyTimeout     time.Duration
 	autoMigrate     bool
+	readOnly        bool
 	logger          Logger
 	metricsHook     MetricsHook
 	streamBatchSize int
@@ -54,7 +55,7 @@ func WithBusyTimeout(timeout time.Duration) Option {
 }
 
 // WithAutoMigrate enables or disables automatic schema migration
-// Default is true
+// Default is true for New; OpenReadOnly defaults to false and rejects true.
 func WithAutoMigrate(enabled bool) Option {
 	return func(c *config) {
 		c.autoMigrate = enabled
