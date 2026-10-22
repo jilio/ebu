@@ -41,18 +41,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- The SQLite store reads back timestamps stored in fixed zones whose names the
-  driver cannot parse (for example `+0500`, which `time.Parse` yields for an
-  RFC 3339 offset outside the local zone). Such events were written but every
-  later read of them failed with a scan error.
+- The SQLite store reads back every timestamp it wrote. Events stamped in a
+  zone whose name the driver cannot parse were written, but every later read of
+  them failed with a scan error. That includes the bus's own `time.Now()`
+  timestamps on hosts whose local zone abbreviates to a numeric offset (for
+  example Asia/Kathmandu `+0545`, Asia/Colombo, Asia/Tehran, Asia/Kabul,
+  Asia/Yangon, Australia/Eucla), and fixed zones such as `+0500`, which
+  `time.Parse` yields for an RFC 3339 offset outside the local zone.
+  Timestamps that were readable before read back exactly as before.
 
-### Compatibility
+### Changed
 
 - `TruncateBefore` is unchanged and records no trim boundary; readers behind a
   truncation keep their previous behavior. The SQLite retention boundary lives
   in a table created by the first `Trim`, so stores that never trim keep schema
   version 4 untouched and stay readable by earlier releases, including
-  `OpenReadOnly`.
+  `OpenReadOnly`. Those earlier releases (v0.20.1 and before) do not know the
+  boundary: reading a trimmed store with them from an offset behind the
+  trimmed prefix silently skips the removed events, with no gap signal.
 
 ## [0.20.1] - 2026-09-12
 

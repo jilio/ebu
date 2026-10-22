@@ -78,5 +78,5 @@ func (s *SQLiteStore) StreamBatch(
 	iterErr *error,
 	yield func(*eventbus.StoredEvent, error) bool,
 ) (batchCount int, lastPos int64, cont bool) {
-	return s.streamBatch(ctx, rows, func() error { return nil }, eventCount, iterErr, yield)
+	return s.streamBatch(ctx, rows, func(int64) error { return nil }, eventCount, iterErr, yield)
 }

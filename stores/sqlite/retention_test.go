@@ -337,7 +337,12 @@ func TestTrimErrors(t *testing.T) {
 	if _, err := store.Trim(ctx, eventbus.RetentionPolicy{}); err == nil || !strings.Contains(err.Error(), "read boundary") {
 		t.Fatalf("Trim with a corrupt boundary = %v", err)
 	}
-	if _, _, err := store.Read(ctx, formatOffset(1), 0); err == nil || !strings.Contains(err.Error(), "read trim boundary") {
+	// A read that returns the immediate successor cannot have crossed a
+	// prefix trim and skips the lookup; any other read consults it.
+	if events, _, err := store.Read(ctx, formatOffset(1), 0); err != nil || len(events) != 2 {
+		t.Fatalf("successor read = %d events, %v", len(events), err)
+	}
+	if _, _, err := store.Read(ctx, formatOffset(3), 0); err == nil || !strings.Contains(err.Error(), "read trim boundary") {
 		t.Fatalf("Read with a corrupt boundary = %v", err)
 	}
 	if _, err := store.db.Exec("DELETE FROM ebu_retention"); err != nil {

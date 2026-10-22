@@ -2,9 +2,12 @@ package sqlite
 
 import (
 	"encoding/json"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
+	_ "time/tzdata" // zone data for the TZ child processes, even without system zoneinfo
 
 	eventbus "github.com/jilio/ebu"
 )
@@ -48,6 +51,8 @@ func TestStoredTimeScan(t *testing.T) {
 	for _, value := range []any{
 		want,
 		"2026-01-02 03:04:05.6 +0500 +0500",
+		"2026-01-02 03:04:05.6 +0500 +0500 m=+0.012345678",
+		"2026-01-02 03:04:05.6 +0500 +05 m=-1.5",
 		[]byte("2026-01-02 03:04:05.6 +0500 PKT"),
 		"2026-01-01T22:04:05.6Z",
 	} {
@@ -68,5 +73,49 @@ func TestStoredTimeScan(t *testing.T) {
 	}
 	if err := got.Scan(42); err == nil || !strings.Contains(err.Error(), "unsupported timestamp type int") {
 		t.Errorf("Scan(int) = %v", err)
+	}
+}
+
+// timestampChildEnv marks the child process of
+// TestTimeNowInANumericLocalZoneReadsBack, which runs with TZ set.
+const timestampChildEnv = "EBU_SQLITE_TIMESTAMP_CHILD"
+
+// TestTimeNowChild appends time.Now() (monotonic reading included) in the
+// process's local zone and reads it back.
+func TestTimeNowChild(t *testing.T) {
+	if os.Getenv(timestampChildEnv) == "" {
+		t.Skip("helper process for TestTimeNowInANumericLocalZoneReadsBack")
+	}
+	store, err := New(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Now()
+	if _, err := store.Append(t.Context(), &eventbus.Event{Type: "t", Data: json.RawMessage(`1`), Timestamp: now}); err != nil {
+		t.Fatal(err)
+	}
+	events, _, err := store.Read(t.Context(), eventbus.OffsetOldest, 0)
+	if err != nil {
+		t.Fatalf("Read in zone %v: %v", time.Local, err)
+	}
+	if !events[0].Timestamp.Equal(now) {
+		t.Fatalf("timestamp %v, want the instant %v", events[0].Timestamp, now)
+	}
+}
+
+// Local zones whose abbreviation is a numeric offset make time.Now().String()
+// look like "2026-01-02 03:04:05.6 +0545 +0545 m=+0.01"; the bus stamps every
+// event that way. Such events must read back (found in pre-release review).
+func TestTimeNowInANumericLocalZoneReadsBack(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns child processes")
+	}
+	for _, zone := range []string{"Asia/Kathmandu", "Australia/Eucla", "America/New_York"} {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestTimeNowChild$", "-test.count=1")
+		cmd.Env = append(os.Environ(), timestampChildEnv+"=1", "TZ="+zone)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Errorf("TZ=%s: %v\n%s", zone, err, out)
+		}
 	}
 }

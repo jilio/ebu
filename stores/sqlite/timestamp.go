@@ -8,11 +8,14 @@ import (
 
 // storedTime scans an events.timestamp value. The driver writes time.Time
 // parameters as text and converts that text back to time.Time only for the
-// formats it recognizes; a timestamp in a fixed zone with a numeric or
-// non-alphabetic name (for example "+0500", which time.Parse produces for an
-// RFC 3339 offset that is not the local zone) comes back as a string. Those
-// strings are Go's time.Time.String form, and the instant they denote is
-// fully determined by the date, the clock and the numeric offset.
+// formats it recognizes; a timestamp whose zone has a numeric or
+// non-alphabetic name comes back as a string. That covers fixed zones such as
+// "+0500" (what time.Parse produces for an RFC 3339 offset outside the local
+// zone) and local zones whose abbreviation is an offset (Asia/Kathmandu
+// "+0545", Asia/Colombo, Asia/Tehran, ...), including time.Now values with
+// their monotonic suffix. Those strings are Go's time.Time.String form, and
+// the instant they denote is fully determined by the date, the clock and the
+// numeric offset.
 type storedTime struct {
 	time.Time
 }
@@ -44,6 +47,12 @@ var storedTimeLayouts = []string{
 }
 
 func (t *storedTime) parse(text string) error {
+	// time.Time.String appends the monotonic clock reading (" m=+0.012")
+	// for values from time.Now, such as the bus's own timestamps; it has no
+	// bearing on the instant.
+	if i := strings.Index(text, " m="); i >= 0 {
+		text = text[:i]
+	}
 	// Drop a trailing zone name ("UTC", "+0500", "UTC+5") after the offset.
 	if fields := strings.Fields(text); len(fields) == 4 {
 		text = strings.Join(fields[:3], " ")
