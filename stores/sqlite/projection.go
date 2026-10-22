@@ -267,10 +267,13 @@ func (p *Projection) setCheckpoint(offset eventbus.Offset) {
 // CatchUp applies every event the source holds after the checkpoint, one
 // batch per transaction, until a read returns no events, and returns the
 // committed checkpoint. Calling it right after an Append returned makes the
-// appended event visible to queries (read-your-writes). A source error —
+// appended event visible to queries (read-your-writes). On a source error —
 // including eventbus.ErrOffsetTrimmed when the source was trimmed past the
-// checkpoint — or an Apply error stops it at the last committed batch.
-// Concurrent calls on one instance are serialized.
+// checkpoint — it first reads the stored checkpoint: one another instance
+// advanced is adopted and catching up continues, a changed version returns
+// ErrProjectionVersionChanged, and otherwise the source error is returned.
+// An Apply error stops it at the last committed batch. Concurrent calls on
+// one instance are serialized.
 func (p *Projection) CatchUp(ctx context.Context) (eventbus.Offset, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

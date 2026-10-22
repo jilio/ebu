@@ -85,7 +85,7 @@ rows, err := p.DB().QueryContext(ctx,
 | Call | Contract |
 |------|----------|
 | `OpenProjection` | Creates the checkpoint table on first use, registers or resumes `Name`, runs `Reset` when `Version` increased, then `Setup` — one transaction. A lower `Version`, or a rebuild over a source that reports a trimmed prefix, is refused with `ErrProjectionRebuild` and changes nothing. Read-only stores return `ErrReadOnly`. |
-| `CatchUp` | Applies batches until a read returns no events; returns the committed checkpoint. A source error (including `ErrOffsetTrimmed`) or an `Apply` error stops at the last committed batch; the failed batch is rolled back and retried by the next call. |
+| `CatchUp` | Applies batches until a read returns no events; returns the committed checkpoint. On a source error (including `ErrOffsetTrimmed`) it first checks the stored checkpoint: if another instance advanced it, `CatchUp` adopts it and continues; if the version changed, it returns `ErrProjectionVersionChanged`; otherwise it returns the source error. An `Apply` error stops at the last committed batch; the failed batch is rolled back and retried by the next call. |
 | `Checkpoint` | The committed source offset this instance last observed (in memory; can lead the stored one after another instance's rebuild). |
 | `Committed` | The checkpoint stored in the database, whichever instance committed it; `ErrProjectionVersionChanged` after a rebuild at another version. The retention bound. |
 | `DB` | The database holding the tables, for queries. |
@@ -215,8 +215,10 @@ for `(msg.Type, msg.Key)`, mapping the fields you query into indexed columns.
 - **Name your tables freely, except `events`, `subscription_positions`,
   `snapshots`, `schema_version` and the `ebu_` prefix**, which belong to the
   store.
-- **Gaps are reported.** If the source is trimmed past the checkpoint, `CatchUp`
-  returns `ErrOffsetTrimmed` and does not move.
+- **Gaps are reported.** If the source is trimmed past the stored checkpoint,
+  `CatchUp` returns `ErrOffsetTrimmed` and does not move. (Trimmed past only
+  this instance's cached checkpoint, with another instance having applied the
+  events, it adopts the stored checkpoint instead.)
 
 ## Follow-ups (not implemented)
 
