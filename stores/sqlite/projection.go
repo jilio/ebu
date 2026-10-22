@@ -72,9 +72,9 @@ type ProjectionConfig struct {
 	// runs inside the transaction that also advances the checkpoint, so its
 	// writes commit exactly when the checkpoint moves past the event. It must
 	// not have effects outside tx, and should stay fast: the batch holds the
-	// database's write lock, delaying appends to the same file. An error rolls back the whole batch and is
-	// returned by CatchUp; the next CatchUp retries from the same checkpoint.
-	// Required.
+	// database's write lock, delaying appends to the same file. An error (or
+	// panic) rolls back the whole batch; CatchUp returns the error and the
+	// next CatchUp retries from the same checkpoint. Required.
 	Apply func(ctx context.Context, tx *sql.Tx, event *eventbus.StoredEvent) error
 
 	// BatchSize is the number of events read and applied per transaction.
@@ -115,7 +115,7 @@ type Projection struct {
 
 // OpenProjection registers (or resumes) the projection cfg.Name in this
 // store's database: it creates the checkpoint table on first use, rebuilds
-// when cfg.Version changed (Reset, then the checkpoint returns to
+// when cfg.Version increased (Reset, then the checkpoint returns to
 // OffsetOldest), and runs cfg.Setup, all in one transaction. Call CatchUp to
 // apply events. Read-only stores return ErrReadOnly.
 func (s *SQLiteStore) OpenProjection(ctx context.Context, cfg ProjectionConfig) (p *Projection, err error) {
@@ -135,12 +135,23 @@ func (s *SQLiteStore) OpenProjection(ctx context.Context, cfg ProjectionConfig) 
 		cfg.BatchSize = defaultProjectionBatchSize
 	}
 
+	// Ask a source other than a SQLite store for its trim boundary before
+	// taking this database's write lock: its Trim may write, possibly to this
+	// very file. The answer only matters if a rebuild turns out to be due.
+	var foreignTrimmed eventbus.Offset
+	var foreignErr error
+	if _, ok := cfg.Source.(*SQLiteStore); !ok {
+		foreignTrimmed, foreignErr = sourceTrimmedThrough(ctx, cfg.Source)
+	}
+
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: projection %q: begin: %w", cfg.Name, err)
 	}
+	committed := false
 	defer func() {
-		if err != nil {
+		// Also runs when Setup or Reset panics, releasing the write lock.
+		if !committed {
 			_ = tx.Rollback()
 		}
 	}()
@@ -165,7 +176,12 @@ func (s *SQLiteStore) OpenProjection(ctx context.Context, cfg ProjectionConfig) 
 		if cfg.Reset == nil {
 			return nil, fmt.Errorf("sqlite: projection %q is stored at version %d; rebuilding it at version %d requires Reset", cfg.Name, version, cfg.Version)
 		}
-		trimmed, err := sourceTrimmedThrough(ctx, cfg.Source)
+		trimmed, err := foreignTrimmed, foreignErr
+		if src, ok := cfg.Source.(*SQLiteStore); ok {
+			// A read on another connection; WAL readers do not wait for
+			// this transaction's write lock.
+			trimmed, err = sourceTrimmedThrough(ctx, src)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("sqlite: projection %q: check source before rebuild: %w", cfg.Name, err)
 		}
@@ -190,6 +206,7 @@ func (s *SQLiteStore) OpenProjection(ctx context.Context, cfg ProjectionConfig) 
 	if err = tx.Commit(); err != nil {
 		return nil, fmt.Errorf("sqlite: projection %q: commit: %w", cfg.Name, err)
 	}
+	committed = true
 
 	p = &Projection{store: s, cfg: cfg}
 	p.setCheckpoint(eventbus.Offset(checkpoint))
@@ -206,7 +223,8 @@ func (p *Projection) DB() *sql.DB { return p.store.db }
 
 // Checkpoint returns the source offset through which the projection's tables
 // are committed, as last observed by this instance (OffsetOldest before the
-// first event).
+// first event). It can only lag the stored checkpoint, never lead it, so it
+// is always a safe retention bound for the source.
 func (p *Projection) Checkpoint() eventbus.Offset {
 	if checkpoint := p.checkpoint.Load(); checkpoint != nil {
 		return *checkpoint
@@ -237,6 +255,9 @@ func (p *Projection) CatchUp(ctx context.Context) (eventbus.Offset, error) {
 		if err != nil {
 			return from, fmt.Errorf("sqlite: projection %q: read after %q: %w", p.cfg.Name, from, err)
 		}
+		// Sources return a nextOffset that never moves backwards (the
+		// EventStore contract), so an empty read either ends the loop or
+		// persists an advanced resume token exactly once.
 		if len(events) == 0 && next == from {
 			return from, nil
 		}
@@ -254,8 +275,10 @@ func (p *Projection) applyBatch(ctx context.Context, from eventbus.Offset, event
 	if err != nil {
 		return fmt.Errorf("sqlite: projection %q: begin: %w", p.cfg.Name, err)
 	}
+	committed := false
 	defer func() {
-		if err != nil {
+		// Also runs when Apply panics, releasing the write lock.
+		if !committed {
 			_ = tx.Rollback()
 		}
 	}()
@@ -270,9 +293,8 @@ func (p *Projection) applyBatch(ctx context.Context, from eventbus.Offset, event
 		return err
 	}
 	if eventbus.Offset(stored) != from {
-		// Another instance applied this range first: adopt its checkpoint.
-		// err stays nil, so the deferred rollback does not run again.
-		_ = tx.Rollback()
+		// Another instance applied this range first: adopt its checkpoint
+		// (the deferred rollback discards this transaction).
 		p.setCheckpoint(eventbus.Offset(stored))
 		return nil
 	}
@@ -288,6 +310,7 @@ func (p *Projection) applyBatch(ctx context.Context, from eventbus.Offset, event
 	if err = tx.Commit(); err != nil {
 		return fmt.Errorf("sqlite: projection %q: commit: %w", p.cfg.Name, err)
 	}
+	committed = true
 	p.setCheckpoint(next)
 	return nil
 }

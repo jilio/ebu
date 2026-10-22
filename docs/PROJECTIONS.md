@@ -172,7 +172,12 @@ for `(msg.Type, msg.Key)`, mapping the fields you query into indexed columns.
   projection forward, or reset it deliberately.
 - **Batches hold the write lock.** A batch runs inside one write transaction,
   so a slow `Apply` or a large `BatchSize` delays appends to the same file.
-  Keep `Apply` free of external I/O.
+  Keep `Apply` free of external I/O, and lower `BatchSize` when `Apply` is
+  heavy (larger batches amortize commits; smaller ones release the lock
+  sooner). A panicking `Apply` rolls its batch back and releases the lock.
+- **`Checkpoint` lags, never leads.** It is the checkpoint this instance last
+  observed, so it is always a safe retention bound for the source, even with
+  several instances.
 - **Name your tables freely, except `events`, `subscription_positions`,
   `snapshots`, `schema_version` and the `ebu_` prefix**, which belong to the
   store.

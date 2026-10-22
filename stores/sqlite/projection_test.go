@@ -616,3 +616,50 @@ func TestZeroProjectionCheckpoint(t *testing.T) {
 		t.Fatalf("zero Projection checkpoint = %q", got)
 	}
 }
+
+func TestProjectionApplyPanicReleasesTheWriteLock(t *testing.T) {
+	store, err := New(filepath.Join(t.TempDir(), "events.db"), WithBusyTimeout(100*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	counter := &counterProjection{}
+	cfg := counter.config("groups", store, 0)
+	apply := cfg.Apply
+	var panicked atomic.Bool
+	cfg.Apply = func(ctx context.Context, tx *sql.Tx, event *eventbus.StoredEvent) error {
+		if panicked.CompareAndSwap(false, true) {
+			panic("apply bug")
+		}
+		return apply(ctx, tx, event)
+	}
+	p, err := store.OpenProjection(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendGroups(t, store, 3)
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("Apply panic did not propagate")
+			}
+		}()
+		_, _ = p.CatchUp(t.Context())
+	}()
+	// The panicking batch released its write lock: appends and the retry work.
+	appendGroups(t, store, 1)
+	if _, err := p.CatchUp(t.Context()); err != nil || counter.applied.Load() != 4 {
+		t.Fatalf("CatchUp after a panic = %v (applied %d)", err, counter.applied.Load())
+	}
+}
+
+func TestProjectionIgnoresTrimLookupFailureWithoutRebuild(t *testing.T) {
+	store := newTrimStore(t)
+	source := trimmerSource{EventStore: store, err: errors.New("boundary unavailable")}
+	cfg := (&counterProjection{}).config("groups", source, 0)
+	for range 2 {
+		if _, err := store.OpenProjection(t.Context(), cfg); err != nil {
+			t.Fatalf("OpenProjection without a pending rebuild = %v", err)
+		}
+	}
+}
