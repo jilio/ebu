@@ -1404,7 +1404,10 @@ type MemoryStore struct {
 	events        []*StoredEvent
 	subscriptions map[string]Offset
 	nextOffset    int64
-	mu            sync.RWMutex
+	// trimmedThrough is the offset of the newest event a prefix retention
+	// rule removed (see Trim), or OffsetOldest.
+	trimmedThrough Offset
+	mu             sync.RWMutex
 }
 
 // Ensure MemoryStore implements all required interfaces
@@ -1413,6 +1416,7 @@ var _ EventStoreOffsetComparer = (*MemoryStore)(nil)
 var _ EventStoreStreamer = (*MemoryStore)(nil)
 var _ SubscriptionStore = (*MemoryStore)(nil)
 var _ SubscriptionStoreLookup = (*MemoryStore)(nil)
+var _ EventStoreTrimmer = (*MemoryStore)(nil)
 
 // NewMemoryStore creates a new in-memory event store
 func NewMemoryStore() *MemoryStore {
@@ -1482,11 +1486,25 @@ func (m *MemoryStore) tailOffset() Offset {
 	return m.events[len(m.events)-1].Offset
 }
 
-// Read implements EventStore
+// trimmedError reports whether reading from a concrete offset would skip
+// events removed by a prefix retention rule. Caller must hold at least a read
+// lock.
+func (m *MemoryStore) trimmedError(from Offset) error {
+	if from == OffsetOldest || from == OffsetNewest || from >= m.trimmedThrough {
+		return nil
+	}
+	return &OffsetTrimmedError{Offset: from, ResumeFrom: m.trimmedThrough}
+}
+
+// Read implements EventStore. Reading from a concrete offset older than the
+// prefix removed by Trim fails with ErrOffsetTrimmed.
 func (m *MemoryStore) Read(ctx context.Context, from Offset, limit int) ([]*StoredEvent, Offset, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
+	if err := m.trimmedError(from); err != nil {
+		return nil, from, err
+	}
 	start := m.searchAfter(from)
 	end := len(m.events)
 	if limit > 0 && start+limit < end {
@@ -1565,6 +1583,11 @@ func (m *MemoryStore) ReadStream(ctx context.Context, from Offset) iter.Seq2[*St
 	return func(yield func(*StoredEvent, error) bool) {
 		// Take a snapshot to avoid holding lock during iteration
 		m.mu.RLock()
+		if err := m.trimmedError(from); err != nil {
+			m.mu.RUnlock()
+			yield(nil, err)
+			return
+		}
 		start := m.searchAfter(from)
 		events := make([]*StoredEvent, len(m.events)-start)
 		for i, event := range m.events[start:] {
@@ -1586,4 +1609,67 @@ func (m *MemoryStore) ReadStream(ctx context.Context, from Offset) iter.Seq2[*St
 			}
 		}
 	}
+}
+
+// Trim implements EventStoreTrimmer. Offsets of retained events are unchanged
+// and offsets are never reused. Reads from concrete offsets older than the
+// newest event removed by a prefix rule (Through, OlderThan, MaxEvents) fail
+// with ErrOffsetTrimmed; MaxPerPartition removals are not reported to readers.
+func (m *MemoryStore) Trim(ctx context.Context, policy RetentionPolicy) (TrimResult, error) {
+	if err := policy.Validate(); err != nil {
+		return TrimResult{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return TrimResult{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// cut is the number of leading events the prefix rules remove.
+	cut := 0
+	if policy.Through != OffsetOldest {
+		cut = m.searchAfter(policy.Through)
+	}
+	if !policy.OlderThan.IsZero() {
+		old := 0
+		for old < len(m.events) && m.events[old].Timestamp.Before(policy.OlderThan) {
+			old++
+		}
+		cut = max(cut, old)
+	}
+	if policy.MaxEvents > 0 {
+		cut = max(cut, len(m.events)-policy.MaxEvents)
+	}
+
+	var deleted int64
+	if cut > 0 {
+		m.trimmedThrough = m.events[cut-1].Offset
+		deleted = int64(cut)
+		m.events = append([]*StoredEvent(nil), m.events[cut:]...)
+	}
+
+	if policy.MaxPerPartition > 0 {
+		perPartition := make(map[string]int)
+		keep := make([]bool, len(m.events))
+		kept := 0
+		for i := len(m.events) - 1; i >= 0; i-- {
+			partition := m.events[i].Metadata[policy.PartitionKey]
+			if perPartition[partition] < policy.MaxPerPartition {
+				perPartition[partition]++
+				keep[i] = true
+				kept++
+			}
+		}
+		if kept < len(m.events) {
+			retained := make([]*StoredEvent, 0, kept)
+			for i, event := range m.events {
+				if keep[i] {
+					retained = append(retained, event)
+				}
+			}
+			deleted += int64(len(m.events) - kept)
+			m.events = retained
+		}
+	}
+	return TrimResult{Deleted: deleted, TrimmedThrough: m.trimmedThrough}, nil
 }

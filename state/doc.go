@@ -103,10 +103,15 @@
 //	// Periodically: persist the current state.
 //	if err := mat.SaveSnapshotTo(ctx, snapshotter, "users"); err != nil { ... }
 //
-//	// Optionally, once the snapshot is durably saved, compact the log:
-//	if tr, ok := bus.GetStore().(eventbus.EventStoreTruncator); ok {
-//	    tr.TruncateBefore(ctx, offset) // offset the snapshot was saved at
-//	}
+//	// Or snapshot and drop the covered log prefix in one step. Offsets passed
+//	// after the ID are checkpoints other readers still resume from; the log
+//	// is trimmed only through the oldest of them and the snapshot.
+//	result, err := mat.Compact(ctx, bus.GetStore(), "users", followerCheckpoint)
+//
+// Compact saves the snapshot before removing anything. It trims with
+// eventbus.EventStoreTrimmer when available, so a reader that still resumes
+// from an older offset fails with eventbus.ErrOffsetTrimmed instead of
+// silently skipping events, and falls back to eventbus.EventStoreTruncator.
 //
 // Snapshots carry an explicit format version and composite-key codec, and every
 // encoded key is validated before restore. Legacy versionless snapshots remain
