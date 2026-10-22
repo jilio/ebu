@@ -81,7 +81,8 @@ func (s Synchronous) pragma() string {
 	return "NORMAL"
 }
 
-// String returns the SQLite pragma value for the mode.
+// String returns the mode's name: the SQLite pragma value for declared modes,
+// and Synchronous(N) otherwise.
 func (s Synchronous) String() string {
 	switch s {
 	case SynchronousNormal:

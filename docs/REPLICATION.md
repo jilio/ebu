@@ -22,8 +22,8 @@ SQLite uses WAL with `synchronous=NORMAL` by default; this is not a promise that
 the latest commit survives power loss on the destination. Open the destination
 with `sqlite.WithSynchronous(sqlite.SynchronousFull)` when it must be. A
 Durable Streams acknowledgement inherits the server/backend's configured
-guarantees. Do not silently downgrade
-an important operation when that destination is unavailable.
+guarantees. Do not silently downgrade an important operation when that
+destination is unavailable.
 
 A wait does not mean a destination projection has applied the events. It also
 does not acquire a lease, fence an old writer, elect a replacement worker, or
