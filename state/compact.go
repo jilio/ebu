@@ -43,8 +43,10 @@ type CompactResult struct {
 // snapshot is durably saved before anything is removed: when Compact fails
 // after saving, the log still holds every event the snapshot does not cover,
 // and the returned result reports the saved Snapshot with Through at
-// OffsetOldest. A store that can remove nothing also yields Through
-// OffsetOldest and Removed 0. Like SaveSnapshotTo it refuses to run before
+// OffsetOldest (for the bundled stores, which remove in one transaction,
+// nothing was removed; for other stores Through on failure is best-effort).
+// A store that can remove nothing also yields Through OffsetOldest and
+// Removed 0. Like SaveSnapshotTo it refuses to run before
 // any event was applied.
 func (m *Materializer) Compact(ctx context.Context, store eventbus.EventStore, snapshotID string, keep ...eventbus.Offset) (CompactResult, error) {
 	snapshotter, ok := store.(eventbus.EventStoreSnapshotter)
