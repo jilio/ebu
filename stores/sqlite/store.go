@@ -257,16 +257,8 @@ func (s *SQLiteStore) Append(ctx context.Context, event *eventbus.Event) (eventb
 
 	// Envelope fields are stored as NULL when absent so rows written through
 	// old and new cores are indistinguishable on read (both scan as empty).
-	metadataJSON, err := marshalMetadata(event.Metadata)
-	if err != nil {
-		if s.metricsHook != nil {
-			s.metricsHook.OnAppend(time.Since(start), err)
-		}
-		return "", fmt.Errorf("sqlite: marshal event metadata: %w", err)
-	}
-
 	result, err := s.appendStmt.ExecContext(ctx, event.Type, event.Data, event.Timestamp,
-		nullifyEmpty(event.ID), nullifyEmpty(event.Origin), metadataJSON)
+		nullifyEmpty(event.ID), nullifyEmpty(event.Origin), marshalMetadata(event.Metadata))
 	if err != nil {
 		if s.metricsHook != nil {
 			s.metricsHook.OnAppend(time.Since(start), err)
@@ -368,15 +360,14 @@ func nullifyEmpty(s string) any {
 }
 
 // marshalMetadata encodes non-empty metadata as a JSON object, or NULL.
-func marshalMetadata(md map[string]string) (any, error) {
+// Encoding a map[string]string cannot fail (invalid UTF-8 is replaced, not
+// rejected), so there is no error to report.
+func marshalMetadata(md map[string]string) any {
 	if len(md) == 0 {
-		return nil, nil
+		return nil
 	}
-	data, err := json.Marshal(md)
-	if err != nil {
-		return nil, err
-	}
-	return string(data), nil
+	data, _ := json.Marshal(md)
+	return string(data)
 }
 
 // scanEvent scans one events row (position, type, data, timestamp, envelope)

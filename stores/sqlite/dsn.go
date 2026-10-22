@@ -7,6 +7,11 @@ import (
 	"strings"
 )
 
+// absPath resolves database paths; injectable so tests can exercise the
+// failure path (filepath.Abs fails only when the working directory cannot be
+// determined).
+var absPath = filepath.Abs
+
 // buildDSN configures each pooled connection, including connections opened
 // after construction. Running connection-scoped pragmas through db.Exec would
 // configure only the connection handed out by the pool at that moment.
@@ -25,7 +30,7 @@ func buildDSN(cfg *config) (string, error) {
 	if strings.ContainsRune(cfg.path, '\x00') {
 		return "", fmt.Errorf("sqlite: path cannot contain NUL")
 	}
-	abs, err := filepath.Abs(cfg.path)
+	abs, err := absPath(cfg.path)
 	if err != nil {
 		return "", fmt.Errorf("sqlite: resolve database path: %w", err)
 	}
