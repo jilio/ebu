@@ -432,7 +432,7 @@ func TestProducer_PermanentStatuses(t *testing.T) {
 		headers map[string]string
 		want    error
 	}{
-		{"closed stream", http.StatusConflict, map[string]string{"Stream-Closed": "true"}, durablestreams.ErrStreamClosed},
+		{"closed stream", http.StatusConflict, map[string]string{"Stream-Closed": "true", "Producer-Expected-Seq": "0"}, durablestreams.ErrStreamClosed},
 		{"content type", http.StatusConflict, nil, durablestreams.ErrContentTypeMismatch},
 		{"bad request", http.StatusBadRequest, nil, durablestreams.ErrBadRequest},
 		{"not found", http.StatusNotFound, nil, durablestreams.ErrStreamNotFound},
@@ -1380,5 +1380,29 @@ func TestProducer_OffsetRecoveryIsBoundedOnABusyStream(t *testing.T) {
 	offset, err := store.Append(ctx, producerEvent(1))
 	if err != nil || offset != eventbus.Offset(padOffset(2)) {
 		t.Fatalf("Append = %q, %v; want the exact %q, found within the captured tail", offset, err, padOffset(2))
+	}
+}
+
+// A duplicate without Producer-Seq proves nothing, even for an owning store
+// whose attempt may have landed.
+func TestProducer_OwnedDuplicateWithoutProducerSeqIsIndeterminate(t *testing.T) {
+	var posts atomic.Int32
+	ps := scriptedServer(t, func(w http.ResponseWriter, r *http.Request) bool {
+		switch posts.Add(1) {
+		case 1:
+			return false // accepted: the store owns its epoch
+		case 2:
+			w.WriteHeader(http.StatusServiceUnavailable)
+		default:
+			w.WriteHeader(http.StatusNoContent) // no Producer-Seq
+		}
+		return true
+	})
+	store := newProducerStore(t, ps, "events", ds.WithProducer("w", 0))
+	if _, err := store.Append(t.Context(), producerEvent(0)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Append(t.Context(), producerEvent(1)); !errors.Is(err, ds.ErrProducerIndeterminate) {
+		t.Fatalf("Append = %v, want ErrProducerIndeterminate", err)
 	}
 }

@@ -416,7 +416,10 @@ func (s *Store) appendAsProducer(ctx context.Context, eventID string, data []byt
 			highest, parseErr := strconv.ParseInt(resp.seq, 10, 64)
 			known := parseErr == nil
 			switch {
-			case mayHaveLanded && p.owned && seq > sentBefore && (!known || highest >= seq):
+			case mayHaveLanded && p.owned && seq > sentBefore && known && highest >= seq:
+				// (The protocol sends Producer-Seq with every duplicate; one
+				// without it proves nothing and falls through to
+				// indeterminate.)
 				// Only this store writes its epoch and nothing else ever
 				// carried this number: an earlier attempt landed and only its
 				// acknowledgement was lost. Written once.
@@ -533,6 +536,8 @@ func (s *Store) locate(ctx context.Context, from eventbus.Offset, eventID string
 	if err != nil {
 		return "", false, err
 	}
+	// Offsets compare as strings: the protocol makes them lexicographically
+	// sortable (section 6), and OffsetOldest, the empty string, sorts first.
 	matches := 0
 	// complete records that the scan reached the captured tail; a scan that
 	// stops earlier (a premature caught-up answer, a chunk that does not
