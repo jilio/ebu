@@ -20,8 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silently dropped as a duplicate. `WithProducerAutoClaim()` claims the next
   free epoch at the first append (newest instance wins; an instance that owns
   its epoch never re-claims), and `ProducerEpoch` reports the epoch in use.
-  Producer appends are serialized per store. Stores without the option send
-  no producer headers and keep their at-least-once behavior.
+  Producer appends are serialized per store; a queued `Append` gives up when
+  its context ends. If the tail lookup after a deduplicated retry fails,
+  `Append` reports an error although the event is stored, like any
+  indeterminate append. Stores without the option send no producer headers
+  and keep their at-least-once behavior.
 
 ## [0.20.1] - 2026-09-12
 

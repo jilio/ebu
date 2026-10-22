@@ -464,8 +464,8 @@ func TestProducer_MalformedProtocolResponses(t *testing.T) {
 		headers map[string]string
 		want    string
 	}{
-		{"403 without epoch", http.StatusForbidden, nil, "stale-epoch response carries invalid"},
-		{"403 with older epoch", http.StatusForbidden, map[string]string{"Producer-Epoch": "2"}, "stale-epoch response carries invalid"},
+		{"403 without epoch", http.StatusForbidden, nil, "not a producer fencing response"},
+		{"403 with older epoch", http.StatusForbidden, map[string]string{"Producer-Epoch": "2"}, "not a producer fencing response"},
 		{"409 expecting a later sequence", http.StatusConflict, map[string]string{"Producer-Expected-Seq": "7"}, "server expects sequence \"7\""},
 		{"409 with garbage", http.StatusConflict, map[string]string{"Producer-Expected-Seq": "x"}, "server expects sequence \"x\""},
 	} {
@@ -610,5 +610,46 @@ func TestProducer_NoClaimAfterAPossiblyLandedAttempt(t *testing.T) {
 	}
 	if posts.Load() != 2 {
 		t.Fatalf("re-sent a possibly committed event under a claimed epoch (%d posts)", posts.Load())
+	}
+}
+
+func TestProducer_WaitingForTheProducerHonorsContext(t *testing.T) {
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	ps := scriptedServer(t, func(w http.ResponseWriter, r *http.Request) bool {
+		select {
+		case entered <- struct{}{}:
+			<-release // hold the first append in flight
+		default:
+		}
+		return false
+	})
+	store := newProducerStore(t, ps, "events", ds.WithProducer("writer", 0))
+	first := make(chan error, 1)
+	go func() {
+		_, err := store.Append(context.Background(), producerEvent(0))
+		first <- err
+	}()
+	<-entered
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if _, err := store.Append(ctx, producerEvent(1)); !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "waiting for the producer") {
+		t.Fatalf("queued Append = %v", err)
+	}
+	if waited := time.Since(start); waited > 2*time.Second {
+		t.Fatalf("queued Append ignored its deadline for %v", waited)
+	}
+	close(release)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	// The abandoned caller took no sequence number.
+	if _, err := store.Append(t.Context(), producerEvent(2)); err != nil {
+		t.Fatal(err)
+	}
+	if _, lastSeq, _ := ps.producerOf("events", "writer"); lastSeq != 1 {
+		t.Fatalf("lastSeq = %d, want 1", lastSeq)
 	}
 }
