@@ -261,6 +261,11 @@ func (p *Projection) CatchUp(ctx context.Context) (eventbus.Offset, error) {
 		if len(events) == 0 && next == from {
 			return from, nil
 		}
+		if next == from {
+			// A non-conforming source: applying would commit the same
+			// checkpoint and read the same events again, forever.
+			return from, fmt.Errorf("sqlite: projection %q: source returned %d events after %q without advancing its offset", p.cfg.Name, len(events), from)
+		}
 		if err := p.applyBatch(ctx, from, events, next); err != nil {
 			return p.Checkpoint(), err
 		}

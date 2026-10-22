@@ -663,3 +663,26 @@ func TestProjectionIgnoresTrimLookupFailureWithoutRebuild(t *testing.T) {
 		}
 	}
 }
+
+// stuckSource returns the same event forever without advancing its offset.
+type stuckSource struct{ eventbus.EventStore }
+
+func (stuckSource) Read(_ context.Context, from eventbus.Offset, _ int) ([]*eventbus.StoredEvent, eventbus.Offset, error) {
+	data, _ := json.Marshal(map[string]string{"Fingerprint": "g"})
+	return []*eventbus.StoredEvent{{Offset: from, Type: "error.reported", Data: data}}, from, nil
+}
+
+func TestProjectionRejectsASourceThatDoesNotAdvance(t *testing.T) {
+	store := newTrimStore(t)
+	counter := &counterProjection{}
+	p, err := store.OpenProjection(t.Context(), counter.config("groups", stuckSource{store}, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.CatchUp(t.Context()); err == nil || !strings.Contains(err.Error(), "without advancing its offset") {
+		t.Fatalf("CatchUp = %v", err)
+	}
+	if counter.applied.Load() != 0 {
+		t.Fatalf("applied %d events from a stuck source", counter.applied.Load())
+	}
+}

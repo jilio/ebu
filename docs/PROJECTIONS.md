@@ -11,10 +11,10 @@ store is in memory, and `SaveSnapshotTo` serializes *all* entities into one
 blob. That works for small, read-mostly state, but not for mutable-row
 workloads:
 
-- **Queues** (jobs with leases and due times) need "the next due, unleased
-  job" — an indexed range query, not a scan of a map.
-- **Aggregates** (error groups with counters, rate windows) apply
-  non-idempotent updates (`count = count + 1`); re-applying an event after a
+- **Queues** (tasks with claims and due times) need "the next due, unclaimed
+  task" — an indexed range query, not a scan of a map.
+- **Aggregates** (per-page view counters, rate windows) apply
+  non-idempotent updates (`views = views + 1`); re-applying an event after a
   crash corrupts them.
 - **Large state** should not live in memory, and compaction should not rewrite
   every payload into a fresh snapshot blob.
@@ -54,19 +54,19 @@ example.
 
 ```go
 p, err := store.OpenProjection(ctx, sqlite.ProjectionConfig{
-    Name:    "jobs",       // checkpoint identity in this database
+    Name:    "tasks",      // checkpoint identity in this database
     Version: 1,            // raise to rebuild (Reset + replay from OffsetOldest)
     Source:  store,        // any eventbus.EventStore
     Setup: func(ctx context.Context, tx *sql.Tx) error { // idempotent DDL
         _, err := tx.ExecContext(ctx, `
-            CREATE TABLE IF NOT EXISTS jobs (
+            CREATE TABLE IF NOT EXISTS tasks (
                 id TEXT PRIMARY KEY, state TEXT NOT NULL, due_at INTEGER NOT NULL,
-                worker TEXT, lease_until INTEGER);
-            CREATE INDEX IF NOT EXISTS idx_jobs_due ON jobs(state, due_at)`)
+                owner TEXT, claimed_until INTEGER);
+            CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(state, due_at)`)
         return err
     },
     Reset: func(ctx context.Context, tx *sql.Tx) error { // before a rebuild
-        _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS jobs`)
+        _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS tasks`)
         return err
     },
     Apply: func(ctx context.Context, tx *sql.Tx, e *eventbus.StoredEvent) error {
@@ -78,7 +78,7 @@ p, err := store.OpenProjection(ctx, sqlite.ProjectionConfig{
 
 checkpoint, err := p.CatchUp(ctx) // apply everything after the checkpoint
 rows, err := p.DB().QueryContext(ctx,
-    `SELECT id FROM jobs WHERE state = 'ready' AND due_at <= ? ORDER BY due_at LIMIT 10`, now)
+    `SELECT id FROM tasks WHERE state = 'ready' AND due_at <= ? ORDER BY due_at LIMIT 10`, now)
 ```
 
 | Call | Contract |
@@ -113,31 +113,31 @@ reopened the projection with a different `Version`, `CatchUp` fails with
 
 ### Concurrent commands
 
-The log decides. When two writers race (two workers leasing the same job),
+The log decides. When two writers race (two consumers claiming the same task),
 both events are appended; `Apply` resolves them deterministically, for example
-"the first lease of a ready job wins":
+"the first claim of a ready task wins":
 
 ```sql
-UPDATE jobs SET state = 'leased', worker = ?, lease_until = ?
+UPDATE tasks SET state = 'claimed', owner = ?, claimed_until = ?
 WHERE id = ? AND state = 'ready'
 ```
 
-Each worker calls `CatchUp` and checks whether it holds the lease. Lease expiry
-should compare against event timestamps (`e.Timestamp`), not the wall clock,
-so every replica derives the same state.
+Each consumer calls `CatchUp` and checks whether it holds the claim. Claim
+expiry should compare against event timestamps (`e.Timestamp`), not the wall
+clock, so every replica derives the same state.
 
 ### Counters
 
 ```go
 Apply: func(ctx context.Context, tx *sql.Tx, e *eventbus.StoredEvent) error {
-    var r struct{ Fingerprint string }
-    if err := json.Unmarshal(e.Data, &r); err != nil {
+    var v struct{ Page string }
+    if err := json.Unmarshal(e.Data, &v); err != nil {
         return err
     }
     _, err := tx.ExecContext(ctx, `
-        INSERT INTO error_groups (fingerprint, count, last_seen) VALUES (?, 1, ?)
-        ON CONFLICT(fingerprint) DO UPDATE SET count = count + 1, last_seen = excluded.last_seen`,
-        r.Fingerprint, e.Timestamp)
+        INSERT INTO page_views (page, views, last_seen) VALUES (?, 1, ?)
+        ON CONFLICT(page) DO UPDATE SET views = views + 1, last_seen = excluded.last_seen`,
+        v.Page, e.Timestamp)
     return err
 }
 ```
@@ -157,7 +157,13 @@ for `(msg.Type, msg.Key)`, mapping the fields you query into indexed columns.
 - **Cross-file sources.** When the source is another store or file, reading
   a batch and committing it are not one transaction. That is safe because the
   checkpoint commits with the tables and the source's `nextOffset` does not
-  redeliver; only the projection's own database must be consistent.
+  redeliver; only the projection's own database must be consistent. A
+  separate SQLite source should run with `WithSynchronous(SynchronousFull)`:
+  with the default `SynchronousNormal`, a power loss can roll back the source's
+  newest events after the projection committed them, and the source then
+  reissues those positions to new events, which the projection skips as
+  already applied. (A source in the projection's own file needs no such care:
+  WAL commit order rolls both back together.)
 - **Skipped records are invisible.** A Durable Streams source skips
   undecodable records by default; open it with `WithStrictDecoding()` so a
   corrupt record stops the projection instead.
@@ -169,8 +175,13 @@ for `(msg.Type, msg.Key)`, mapping the fields you query into indexed columns.
   `OffsetOldest`. When the source reports a trimmed prefix (SQLite and
   MemoryStore `Trim`), the rebuild is refused with `ErrProjectionRebuild`
   before `Reset` runs; migrate the tables in `Setup` and keep the version
-  instead. A prefix removed with the legacy `TruncateBefore` cannot be
-  detected, so do not raise `Version` over a log compacted that way.
+  instead. The guard only sees prefixes removed by `Trim`'s prefix rules. It
+  cannot see a prefix removed with the legacy `TruncateBefore`, events removed
+  by `MaxPerPartition`, Durable Streams server-side retention, or the history
+  of a custom store that does not implement `EventStoreTrimmer`. Raising
+  `Version` over such a source rebuilds from whatever it still holds, without
+  an error, so the rebuilt tables can be incomplete. Only raise `Version`
+  when the source still holds the complete history.
 - **No downgrades.** A `Version` lower than the stored one is refused, so
   rolling back to an older binary never discards a newer projection; roll the
   projection forward, or reset it deliberately.
