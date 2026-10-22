@@ -165,8 +165,11 @@ func TestMarshalMetadataEmpty(t *testing.T) {
 	if v := marshalMetadata(map[string]string{"k": "v"}); v != `{"k":"v"}` {
 		t.Errorf("metadata must marshal to a JSON object, got %v", v)
 	}
-	if v := marshalMetadata(map[string]string{"k": "\xff"}); v != "{\"k\":\"\ufffd\"}" {
-		t.Errorf("invalid UTF-8 must be replaced, got %v", v)
+	// Go versions differ in whether the replacement character is escaped
+	// ("\ufffd") or written raw; compare the decoded value.
+	var decoded map[string]string
+	if v, ok := marshalMetadata(map[string]string{"k": "\xff"}).(string); !ok || json.Unmarshal([]byte(v), &decoded) != nil || decoded["k"] != "\ufffd" {
+		t.Errorf("invalid UTF-8 must be replaced, got %v (decoded %q)", v, decoded["k"])
 	}
 
 	if nullifyEmpty("") != nil {
