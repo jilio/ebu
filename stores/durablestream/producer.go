@@ -228,6 +228,9 @@ type producerResponse struct {
 // the outcome is reported as ErrProducerIndeterminate, never as success.
 func (s *Store) appendAsProducer(ctx context.Context, data []byte) (eventbus.Offset, error) {
 	p := s.producer
+	if err := ctx.Err(); err != nil {
+		return "", fmt.Errorf("durablestream: append: %w", err)
+	}
 	select {
 	case p.turn <- struct{}{}:
 	case <-ctx.Done():
@@ -268,10 +271,8 @@ func (s *Store) appendAsProducer(ctx context.Context, data []byte) (eventbus.Off
 				return "", fmt.Errorf("durablestream: append: %w", err)
 			}
 		}
-		if err := ctx.Err(); err != nil {
-			return "", fmt.Errorf("durablestream: append: %w", err)
-		}
-
+		// A context that ends now fails the request below without sending
+		// it, and the error path returns because ctx.Err() is set.
 		epoch := p.epoch.Load()
 		p.sentThrough = max(p.sentThrough, seq)
 		resp, err := s.postAsProducer(ctx, data, epoch, seq)

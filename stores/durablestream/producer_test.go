@@ -886,3 +886,15 @@ func TestProducer_EpochRestartCountsAsACorrection(t *testing.T) {
 		t.Fatalf("Append = %v", err)
 	}
 }
+
+func TestProducer_RequestConstructionFailure(t *testing.T) {
+	ps := newProtoServer()
+	defer ps.Close()
+	store := newProducerStore(t, ps, "events", ds.WithProducer("w", 0), ds.WithRetry(1, time.Millisecond))
+	ds.SetStreamURLForTest(store, "http://[::1") // unparsable
+	_, err := store.Append(t.Context(), producerEvent(0))
+	var streamErr *durablestreams.StreamError
+	if !errors.As(err, &streamErr) || streamErr.StatusCode != 0 || !strings.Contains(err.Error(), "missing ']'") {
+		t.Fatalf("Append = %v", err)
+	}
+}
