@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `EventStoreTrimmer` and `RetentionPolicy`: bound a log by offset (`Through`),
+  age (`OlderThan`), total count (`MaxEvents`) and per-partition count
+  (`PartitionKey` + `MaxPerPartition`, partitioned by an event metadata key).
+  Offsets of retained events never change and are never reused. ebu applies no
+  default policy. `MemoryStore` and the SQLite store implement it.
+- `ErrOffsetTrimmed` and `*OffsetTrimmedError`: a read from a concrete offset
+  older than a prefix removed by `Trim` fails with this gap signal, naming an
+  offset to resume from, instead of silently skipping events. Reading from
+  `OffsetOldest` is never an error. Per-partition caps follow key-based
+  compaction semantics and are not reported. The SQLite store checks the
+  boundary after its event query, and before each `ReadStream` batch's first
+  event, so a concurrent `Trim` cannot slip events past a reader.
+- `state.Materializer.Compact` saves a snapshot and then trims the log prefix
+  it covers, bounded by caller-supplied checkpoints of other readers. It uses
+  `Trim` when available and falls back to `TruncateBefore`.
+- Durable Streams reads and tails that the server answers with 410 Gone from a
+  concrete offset (server-side retention) now also match `ErrOffsetTrimmed`,
+  with `ResumeFrom` = `OffsetOldest`; `errors.Is(err,
+  durablestreams.ErrOffsetGone)` still holds.
+
+### Fixed
+
+- The SQLite store reads back timestamps stored in fixed zones whose names the
+  driver cannot parse (for example `+0500`, which `time.Parse` yields for an
+  RFC 3339 offset outside the local zone). Such events were written but every
+  later read of them failed with a scan error.
+
+### Compatibility
+
+- `TruncateBefore` is unchanged and records no trim boundary; readers behind a
+  truncation keep their previous behavior. The SQLite retention boundary lives
+  in a table created by the first `Trim`, so stores that never trim keep schema
+  version 4 untouched and stay readable by earlier releases, including
+  `OpenReadOnly`.
+
 ## [0.20.1] - 2026-09-12
 
 ### Fixed
@@ -955,6 +994,7 @@ Initial release of ebu (Event BUs) - a lightweight, type-safe event bus for Go.
 - `ClearAll`: Remove all handlers
 - `WaitAsync`: Wait for async handlers to complete
 
+[Unreleased]: https://github.com/jilio/ebu/compare/v0.20.1...HEAD
 [0.20.1]: https://github.com/jilio/ebu/compare/v0.20.0...v0.20.1
 [0.20.0]: https://github.com/jilio/ebu/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/jilio/ebu/compare/v0.18.1...v0.19.0
