@@ -90,6 +90,7 @@ func TestOpenReadOnlyIgnoresSynchronous(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = reader.Close() })
 	var got int
+	// 2 is FULL, the compiled-in default of the bundled SQLite.
 	if err := reader.db.QueryRowContext(t.Context(), "PRAGMA synchronous").Scan(&got); err != nil || got != 2 {
 		t.Fatalf("read-only connection changed SQLite's default synchronous setting: %d (error %v)", got, err)
 	}
