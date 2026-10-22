@@ -171,9 +171,12 @@ func TestAcknowledgedAppendsSurviveProcessKill(t *testing.T) {
 	scanner := bufio.NewScanner(stdout)
 	for acked < killAfter && scanner.Scan() {
 		line := scanner.Text()
+		if strings.HasPrefix(line, "open-error") || strings.HasPrefix(line, "append-error") {
+			t.Fatalf("child: %s", line)
+		}
 		value, ok := strings.CutPrefix(line, "acked ")
 		if !ok {
-			t.Fatalf("child: %s", line)
+			continue // test-framework output, e.g. with -v in GOFLAGS
 		}
 		if acked, err = strconv.Atoi(value); err != nil {
 			t.Fatal(err)

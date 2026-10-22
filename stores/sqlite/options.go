@@ -86,9 +86,10 @@ func (s Synchronous) String() string {
 // WithSynchronous sets the synchronous mode of every pooled connection a
 // writable store opens (see Synchronous). The default, SynchronousNormal,
 // preserves the behavior of earlier releases; choose SynchronousFull when an
-// acknowledged write must survive power loss. Stores opened with OpenReadOnly
-// never write and ignore this option; :memory: stores have nothing to sync.
-// New rejects values other than the declared constants.
+// acknowledged write must survive power loss. New rejects values other than
+// the declared constants; for :memory: stores the mode is validated but has
+// no effect. Stores opened with OpenReadOnly never write and ignore it.
+// SQLite's EXTRA mode adds nothing over FULL in WAL mode and is not offered.
 func WithSynchronous(mode Synchronous) Option {
 	return func(c *config) {
 		c.synchronous = mode
