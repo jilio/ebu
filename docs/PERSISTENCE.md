@@ -181,6 +181,7 @@ bus := eventbus.New(eventbus.WithStore(store))
 
 SQLite store features:
 - WAL mode for better concurrency
+- Selectable durability with `WithSynchronous`
 - Prepared statements for performance
 - Memory-efficient streaming with `ReadStream`
 - Automatic schema migrations
@@ -193,6 +194,29 @@ concurrent appends and is not a point-in-time snapshot. Breaking out of the rang
 loop closes the current rows; cancellation and query/iteration failures are
 returned through the iterator. Ordinary `Read(ctx, from, 0)` still reads without
 a result limit.
+
+#### Durability
+
+Writable file-backed stores run in WAL mode with SQLite's `synchronous=NORMAL`
+by default. Commits are atomic and never reordered, and a crashed process loses
+nothing it acknowledged; but a power loss or operating-system crash can roll
+back the most recent acknowledged commits (`Append`, `SaveOffset`,
+`SaveSnapshot`, `TruncateBefore`), because the write-ahead log is synced only
+at checkpoints. When an acknowledged write must survive power loss, opt in to
+syncing every commit:
+
+```go
+store, err := sqlite.New("./events.db",
+    sqlite.WithSynchronous(sqlite.SynchronousFull),
+)
+```
+
+`SynchronousFull` adds one sync to every commit, which bounds the commit rate
+on most disks; write in fewer, larger commits when throughput matters. The
+guarantee holds only if the storage stack honors sync requests (on macOS,
+`fsync` does not flush the drive's cache). The setting applies to every pooled
+connection. `OpenReadOnly` stores never write and ignore it; `New` rejects
+undeclared modes.
 
 Use `sqlite.OpenReadOnly(path, options...)` to read an existing store without
 creating a database, migrating its schema, or changing its journal mode. The
@@ -1075,11 +1099,13 @@ per-operation confirmed writes without changing the local write format. Its
 positions are source offsets scoped by relationship ID and log generation.
 
 A successful destination Append carries that store's guarantees: MemoryStore is
-not durable, SQLite's WAL `synchronous=NORMAL` is not a destination-power-loss
-guarantee for the latest commit, and a remote acknowledgement depends on server
-storage configuration. Use a destination outside the source worker's failure
-domain and configure its acknowledgement policy explicitly. Replication cannot
-strengthen an acknowledgement returned too early by a backend.
+not durable, SQLite's default WAL `synchronous=NORMAL` is not a
+destination-power-loss guarantee for the latest commit (use
+`sqlite.WithSynchronous(sqlite.SynchronousFull)`), and a remote
+acknowledgement depends on server storage configuration. Use a destination
+outside the source worker's failure domain and configure its acknowledgement
+policy explicitly. Replication cannot strengthen an acknowledgement returned
+too early by a backend.
 
 A Durable Streams source should enable `WithStrictDecoding()` for loss-sensitive
 copying: malformed envelopes then return indexed Read/Tail errors rather than

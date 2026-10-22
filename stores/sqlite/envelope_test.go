@@ -152,21 +152,24 @@ func TestEnvelopeCorruptMetadataErrors(t *testing.T) {
 	}
 }
 
-// TestAppendUnmarshalableMetadata exercises the marshal-failure guard in
-// Append. Metadata is map[string]string, which cannot itself fail to
-// marshal, so this documents the guard via the exported test hook instead.
+// TestMarshalMetadataEmpty pins the NULL encoding of absent metadata and the
+// JSON object encoding otherwise, including invalid UTF-8 (replaced, not an
+// error: metadata encoding cannot fail).
 func TestMarshalMetadataEmpty(t *testing.T) {
-	v, err := marshalMetadata(nil)
-	if err != nil || v != nil {
-		t.Errorf("nil metadata must marshal to NULL, got %v err=%v", v, err)
+	if v := marshalMetadata(nil); v != nil {
+		t.Errorf("nil metadata must marshal to NULL, got %v", v)
 	}
-	v, err = marshalMetadata(map[string]string{})
-	if err != nil || v != nil {
-		t.Errorf("empty metadata must marshal to NULL, got %v err=%v", v, err)
+	if v := marshalMetadata(map[string]string{}); v != nil {
+		t.Errorf("empty metadata must marshal to NULL, got %v", v)
 	}
-	v, err = marshalMetadata(map[string]string{"k": "v"})
-	if err != nil || v != `{"k":"v"}` {
-		t.Errorf("metadata must marshal to a JSON object, got %v err=%v", v, err)
+	if v := marshalMetadata(map[string]string{"k": "v"}); v != `{"k":"v"}` {
+		t.Errorf("metadata must marshal to a JSON object, got %v", v)
+	}
+	// Go versions differ in whether the replacement character is escaped
+	// ("\ufffd") or written raw; compare the decoded value.
+	var decoded map[string]string
+	if v, ok := marshalMetadata(map[string]string{"k": "\xff"}).(string); !ok || json.Unmarshal([]byte(v), &decoded) != nil || decoded["k"] != "\ufffd" {
+		t.Errorf("invalid UTF-8 must be replaced, got %v (decoded %q)", v, decoded["k"])
 	}
 
 	if nullifyEmpty("") != nil {

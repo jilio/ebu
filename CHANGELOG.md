@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- SQLite `WithSynchronous(SynchronousNormal | SynchronousFull)` selects the
+  durability of every pooled writer connection. `SynchronousFull` syncs the
+  write-ahead log before each commit returns, so acknowledged appends,
+  checkpoints, snapshots and truncations survive power loss and OS crashes.
+  The default remains `SynchronousNormal` (the previous, faster behavior that
+  can roll back the latest commits on power loss); `OpenReadOnly` ignores the
+  option and `New` rejects undeclared modes.
 - Durable Streams `WithProducer(id, epoch)` makes `Append` use the protocol's
   idempotent producer (Producer-Id, Producer-Epoch, Producer-Seq). A retry
   whose first attempt was committed is deduplicated by the server instead of
