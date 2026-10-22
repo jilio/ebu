@@ -27,6 +27,8 @@ type config struct {
 	retryBaseDelay     time.Duration
 	decodeErrorHandler DecodeErrorHandler
 	strictDecoding     bool
+	producer           *producerConfig
+	producerAutoClaim  bool
 }
 
 func defaultConfig() *config {
