@@ -1,4 +1,4 @@
 github.com/durable-streams/durable-streams/packages/client-go v0.2.0 h1:s5QL0QEu06m954GVbV76Hl21sXCq2M9883PaoMI0oh4=
 github.com/durable-streams/durable-streams/packages/client-go v0.2.0/go.mod h1:G9l/FuZz1LWA1IhuCg6epPrMKU7Yd9805L4yC+0iuHc=
-github.com/jilio/ebu v0.20.2-0.20261022014505-6bccc486fc25 h1:35Gie6tDwW3A5VC9L//ChalWt6MoudgP9LcQrm0Ycto=
-github.com/jilio/ebu v0.20.2-0.20261022014505-6bccc486fc25/go.mod h1:HudFk9G56WhAmSpucnJFC7nf6/uSpCcEZYS2sItng74=
+github.com/jilio/ebu v0.20.2-0.20261022023926-c813e20b9b04 h1:BKbriFlbE99SR9vdYXufXSIqINmShAZBT1UEVCjlC2A=
+github.com/jilio/ebu v0.20.2-0.20261022023926-c813e20b9b04/go.mod h1:HudFk9G56WhAmSpucnJFC7nf6/uSpCcEZYS2sItng74=

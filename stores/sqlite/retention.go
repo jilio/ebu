@@ -88,73 +88,13 @@ func (s *SQLiteStore) Trim(ctx context.Context, policy eventbus.RetentionPolicy)
 		}
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
+	var deleted, watermark int64
+	err = s.inTx(ctx, "sqlite: trim", func(tx *sql.Tx) (txErr error) {
+		deleted, watermark, txErr = trimInTx(ctx, tx, policy, through)
+		return txErr
+	})
 	if err != nil {
-		return eventbus.TrimResult{}, fmt.Errorf("sqlite: trim: begin: %w", err)
-	}
-	defer func() {
-		if err != nil {
-			_ = tx.Rollback()
-		}
-	}()
-
-	if _, err = tx.ExecContext(ctx, createRetentionTable); err != nil {
-		return eventbus.TrimResult{}, fmt.Errorf("sqlite: trim: create retention table: %w", err)
-	}
-	watermark, err := optionalInt64(ctx, tx, selectTrimmedThrough)
-	if err != nil {
-		return eventbus.TrimResult{}, fmt.Errorf("sqlite: trim: read boundary: %w", err)
-	}
-
-	cut := through
-	if !policy.OlderThan.IsZero() {
-		old, err := firstNotOlder(ctx, tx, policy.OlderThan)
-		if err != nil {
-			return eventbus.TrimResult{}, err
-		}
-		cut = max(cut, old-1)
-	}
-	if policy.MaxEvents > 0 {
-		position, err := optionalInt64(ctx, tx, "SELECT position FROM events ORDER BY position DESC LIMIT 1 OFFSET ?", policy.MaxEvents)
-		if err != nil {
-			return eventbus.TrimResult{}, fmt.Errorf("sqlite: trim: find count boundary: %w", err)
-		}
-		cut = max(cut, position)
-	}
-
-	var deleted int64
-	if cut > 0 {
-		// The boundary is the newest event actually removed, never a
-		// position beyond the tail that later appends would reuse.
-		var newest sql.NullInt64
-		if err = tx.QueryRowContext(ctx, "SELECT MAX(position) FROM events WHERE position <= ?", cut).Scan(&newest); err != nil {
-			return eventbus.TrimResult{}, fmt.Errorf("sqlite: trim: find prefix boundary: %w", err)
-		}
-		if newest.Valid {
-			res, err := tx.ExecContext(ctx, "DELETE FROM events WHERE position <= ?", newest.Int64)
-			if err != nil {
-				return eventbus.TrimResult{}, fmt.Errorf("sqlite: trim: delete prefix: %w", err)
-			}
-			n, _ := res.RowsAffected()
-			deleted += n
-			if _, err = tx.ExecContext(ctx, upsertTrimmedThrough, newest.Int64); err != nil {
-				return eventbus.TrimResult{}, fmt.Errorf("sqlite: trim: record boundary: %w", err)
-			}
-			watermark = max(watermark, newest.Int64)
-		}
-	}
-
-	if policy.MaxPerPartition > 0 {
-		res, err := tx.ExecContext(ctx, deleteBeyondPartitionCap, policy.PartitionKey, policy.MaxPerPartition)
-		if err != nil {
-			return eventbus.TrimResult{}, fmt.Errorf("sqlite: trim: apply partition cap: %w", err)
-		}
-		n, _ := res.RowsAffected()
-		deleted += n
-	}
-
-	if err = tx.Commit(); err != nil {
-		return eventbus.TrimResult{}, fmt.Errorf("sqlite: trim: commit: %w", err)
+		return eventbus.TrimResult{}, err
 	}
 	if s.logger != nil {
 		s.logger.Debug("trimmed events", "deleted", deleted, "trimmed_through", watermark)
@@ -164,6 +104,64 @@ func (s *SQLiteStore) Trim(ctx context.Context, policy eventbus.RetentionPolicy)
 		result.TrimmedThrough = formatOffset(watermark)
 	}
 	return result, nil
+}
+
+// trimInTx applies policy inside tx and returns the number of events removed
+// and the boundary after the call.
+func trimInTx(ctx context.Context, tx *sql.Tx, policy eventbus.RetentionPolicy, through int64) (deleted, watermark int64, err error) {
+	if _, err = tx.ExecContext(ctx, createRetentionTable); err != nil {
+		return 0, 0, fmt.Errorf("sqlite: trim: create retention table: %w", err)
+	}
+	if watermark, err = optionalInt64(ctx, tx, selectTrimmedThrough); err != nil {
+		return 0, 0, fmt.Errorf("sqlite: trim: read boundary: %w", err)
+	}
+
+	cut := through
+	if !policy.OlderThan.IsZero() {
+		old, err := firstNotOlder(ctx, tx, policy.OlderThan)
+		if err != nil {
+			return 0, 0, err
+		}
+		cut = max(cut, old-1)
+	}
+	if policy.MaxEvents > 0 {
+		position, err := optionalInt64(ctx, tx, "SELECT position FROM events ORDER BY position DESC LIMIT 1 OFFSET ?", policy.MaxEvents)
+		if err != nil {
+			return 0, 0, fmt.Errorf("sqlite: trim: find count boundary: %w", err)
+		}
+		cut = max(cut, position)
+	}
+
+	if cut > 0 {
+		// The boundary is the newest event actually removed, never a
+		// position beyond the tail that later appends would reuse.
+		var newest sql.NullInt64
+		if err := tx.QueryRowContext(ctx, "SELECT MAX(position) FROM events WHERE position <= ?", cut).Scan(&newest); err != nil {
+			return 0, 0, fmt.Errorf("sqlite: trim: find prefix boundary: %w", err)
+		}
+		if newest.Valid {
+			res, err := tx.ExecContext(ctx, "DELETE FROM events WHERE position <= ?", newest.Int64)
+			if err != nil {
+				return 0, 0, fmt.Errorf("sqlite: trim: delete prefix: %w", err)
+			}
+			n, _ := res.RowsAffected()
+			deleted += n
+			if _, err := tx.ExecContext(ctx, upsertTrimmedThrough, newest.Int64); err != nil {
+				return 0, 0, fmt.Errorf("sqlite: trim: record boundary: %w", err)
+			}
+			watermark = max(watermark, newest.Int64)
+		}
+	}
+
+	if policy.MaxPerPartition > 0 {
+		res, err := tx.ExecContext(ctx, deleteBeyondPartitionCap, policy.PartitionKey, policy.MaxPerPartition)
+		if err != nil {
+			return 0, 0, fmt.Errorf("sqlite: trim: apply partition cap: %w", err)
+		}
+		n, _ := res.RowsAffected()
+		deleted += n
+	}
+	return deleted, watermark, nil
 }
 
 // optionalInt64 runs a single-value query and returns 0 when it has no row.
@@ -236,12 +234,16 @@ func (s *SQLiteStore) trimmedThrough(ctx context.Context) (int64, error) {
 // read snapshot: if a trim committed before that snapshot, the boundary read
 // here already includes it; if it committed later, the query saw every event.
 //
+// Only the symbolic OffsetOldest ("start of the retained log") is exempt; a
+// concrete zero checkpoint, saved before any event existed, is checked like
+// any other position.
+//
 // first is the position of the first event the query returned (0: none).
 // When it is position+1 the read cannot have crossed a prefix trim — that
 // would have removed position+1 — so the common tailing read skips the
 // boundary lookup.
 func (s *SQLiteStore) checkTrimmed(ctx context.Context, from eventbus.Offset, position, first int64) error {
-	if position <= 0 || first == position+1 {
+	if from == eventbus.OffsetOldest || first == position+1 {
 		return nil
 	}
 	watermark, err := s.trimmedThrough(ctx)
