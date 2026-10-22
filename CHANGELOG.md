@@ -40,9 +40,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tables from any event log. Each batch of events is applied in the
   transaction that advances the projection's checkpoint (exactly once across
   crashes, so counters are safe); the tables are the snapshot, so restarts
-  apply only the tail and compaction is `Trim(Through: checkpoint)`. Several
-  instances may share a projection; raising `Version` rebuilds through
-  `Reset`, and stale instances stop with `ErrProjectionVersionChanged`. A
+  apply only the tail and compaction is `Trim(Through: committed)` with the
+  checkpoint `Committed` reads from the database. Several instances may share
+  a projection; raising `Version` rebuilds through `Reset`, and stale
+  instances, idle or not, stop with `ErrProjectionVersionChanged`. A
   lower `Version`, or a rebuild over a source that reports a trimmed prefix,
   is refused with `ErrProjectionRebuild`. Design and follow-ups:
   `docs/PROJECTIONS.md`.

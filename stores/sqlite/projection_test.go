@@ -686,3 +686,98 @@ func TestProjectionRejectsASourceThatDoesNotAdvance(t *testing.T) {
 		t.Fatalf("applied %d events from a stuck source", counter.applied.Load())
 	}
 }
+
+// Codex review findings: after another instance rebuilt the projection, an
+// idle stale instance must not report a successful catch-up, and its cached
+// Checkpoint is not a retention bound (Committed is).
+func TestProjectionStaleInstanceAfterARebuild(t *testing.T) {
+	ctx := t.Context()
+	store := newTrimStore(t)
+	appendGroups(t, store, 4)
+	old := &counterProjection{}
+	a, err := store.OpenProjection(ctx, old.config("groups", store, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tail, err := a.CatchUp(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if committed, err := a.Committed(ctx); err != nil || committed != tail {
+		t.Fatalf("Committed = %q, %v; want %q", committed, err, tail)
+	}
+
+	cfg := (&counterProjection{}).config("groups", store, 0)
+	cfg.Version = 2
+	b, err := store.OpenProjection(ctx, cfg) // resets the tables
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No new events: the stale instance's read is empty, yet it must notice.
+	if _, err := a.CatchUp(ctx); !errors.Is(err, ErrProjectionVersionChanged) {
+		t.Fatalf("stale CatchUp = %v, want ErrProjectionVersionChanged", err)
+	}
+	if a.Checkpoint() != tail {
+		t.Fatalf("cached checkpoint = %q", a.Checkpoint())
+	}
+	if _, err := a.Committed(ctx); !errors.Is(err, ErrProjectionVersionChanged) {
+		t.Fatalf("stale Committed = %v, want ErrProjectionVersionChanged", err)
+	}
+	if committed, err := b.Committed(ctx); err != nil || committed != eventbus.OffsetOldest {
+		t.Fatalf("Committed during the rebuild = %q, %v; want OffsetOldest", committed, err)
+	}
+	if _, err := b.CatchUp(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if committed, err := b.Committed(ctx); err != nil || committed != tail {
+		t.Fatalf("Committed after the rebuild = %q, %v", committed, err)
+	}
+}
+
+// An instance whose source no longer holds the events another instance
+// applied (retention trimmed them through the committed checkpoint) adopts
+// the stored checkpoint instead of reporting an older one.
+func TestProjectionAdoptsACheckpointAdvancedElsewhere(t *testing.T) {
+	ctx := t.Context()
+	source := eventbus.NewMemoryStore()
+	db := newTrimStore(t)
+	appendGroups(t, source, 3)
+	a, err := db.OpenProjection(ctx, (&counterProjection{}).config("groups", source, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := db.OpenProjection(ctx, (&counterProjection{}).config("groups", source, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.CatchUp(ctx); err != nil {
+		t.Fatal(err)
+	}
+	committed, err := b.Committed(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.Trim(ctx, eventbus.RetentionPolicy{Through: committed}); err != nil {
+		t.Fatal(err)
+	}
+	if checkpoint, err := a.CatchUp(ctx); err != nil || checkpoint != committed || a.Checkpoint() != committed {
+		t.Fatalf("CatchUp = %q, %v; want the adopted %q", checkpoint, err, committed)
+	}
+}
+
+func TestProjectionCommittedLoadFailure(t *testing.T) {
+	store := newTrimStore(t)
+	p, err := store.OpenProjection(t.Context(), (&counterProjection{}).config("groups", store, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`DELETE FROM ebu_projections`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Committed(t.Context()); err == nil || !strings.Contains(err.Error(), "load checkpoint") {
+		t.Fatalf("Committed = %v", err)
+	}
+	if _, err := p.CatchUp(t.Context()); err == nil || !strings.Contains(err.Error(), "load checkpoint") {
+		t.Fatalf("CatchUp = %v", err)
+	}
+}

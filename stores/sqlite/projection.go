@@ -100,8 +100,9 @@ type ProjectionConfig struct {
 // discarded when another instance got there first.
 //
 // Query the tables through DB. Compact the source with
-// RetentionPolicy{Through: p.Checkpoint()} (or keep it as a bound for other
-// compaction) to drop events the projection no longer needs.
+// RetentionPolicy{Through: committed}, where committed comes from Committed,
+// to drop events the projection no longer needs (bounded by the source's
+// other readers), but not while a rebuild is replaying.
 type Projection struct {
 	store *SQLiteStore
 	cfg   ProjectionConfig
@@ -144,37 +145,39 @@ func (s *SQLiteStore) OpenProjection(ctx context.Context, cfg ProjectionConfig) 
 		foreignTrimmed, foreignErr = sourceTrimmedThrough(ctx, cfg.Source)
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
+	var checkpoint string
+	err = s.inTx(ctx, fmt.Sprintf("sqlite: projection %q", cfg.Name), func(tx *sql.Tx) (txErr error) {
+		checkpoint, txErr = openProjectionInTx(ctx, tx, cfg, foreignTrimmed, foreignErr)
+		return txErr
+	})
 	if err != nil {
-		return nil, fmt.Errorf("sqlite: projection %q: begin: %w", cfg.Name, err)
-	}
-	committed := false
-	defer func() {
-		// Also runs when Setup or Reset panics, releasing the write lock.
-		if !committed {
-			_ = tx.Rollback()
-		}
-	}()
-	if _, err = tx.ExecContext(ctx, createProjectionsTable); err != nil {
-		return nil, fmt.Errorf("sqlite: projection %q: create checkpoint table: %w", cfg.Name, err)
+		return nil, err
 	}
 
-	var version int
-	var checkpoint string
-	err = tx.QueryRowContext(ctx, "SELECT version, checkpoint FROM ebu_projections WHERE name = ?", cfg.Name).Scan(&version, &checkpoint)
+	p = &Projection{store: s, cfg: cfg}
+	p.setCheckpoint(eventbus.Offset(checkpoint))
+	return p, nil
+}
+
+// openProjectionInTx registers or resumes cfg.Name inside tx (see
+// OpenProjection) and returns the checkpoint to resume from.
+func openProjectionInTx(ctx context.Context, tx *sql.Tx, cfg ProjectionConfig, foreignTrimmed eventbus.Offset, foreignErr error) (string, error) {
+	if _, err := tx.ExecContext(ctx, createProjectionsTable); err != nil {
+		return "", fmt.Errorf("sqlite: projection %q: create checkpoint table: %w", cfg.Name, err)
+	}
+	version, checkpoint, err := loadProjection(ctx, tx, cfg.Name)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		if _, err = tx.ExecContext(ctx, "INSERT INTO ebu_projections (name, version, checkpoint) VALUES (?, ?, '')", cfg.Name, cfg.Version); err != nil {
-			return nil, fmt.Errorf("sqlite: projection %q: register: %w", cfg.Name, err)
+		if _, err := tx.ExecContext(ctx, "INSERT INTO ebu_projections (name, version, checkpoint) VALUES (?, ?, '')", cfg.Name, cfg.Version); err != nil {
+			return "", fmt.Errorf("sqlite: projection %q: register: %w", cfg.Name, err)
 		}
 	case err != nil:
-		return nil, fmt.Errorf("sqlite: projection %q: load checkpoint: %w", cfg.Name, err)
+		return "", fmt.Errorf("sqlite: projection %q: load checkpoint: %w", cfg.Name, err)
 	case version > cfg.Version:
-		err = fmt.Errorf("%w: projection %q is stored at version %d, newer than %d", ErrProjectionRebuild, cfg.Name, version, cfg.Version)
-		return nil, err
+		return "", fmt.Errorf("%w: projection %q is stored at version %d, newer than %d", ErrProjectionRebuild, cfg.Name, version, cfg.Version)
 	case version < cfg.Version:
 		if cfg.Reset == nil {
-			return nil, fmt.Errorf("sqlite: projection %q is stored at version %d; rebuilding it at version %d requires Reset", cfg.Name, version, cfg.Version)
+			return "", fmt.Errorf("sqlite: projection %q is stored at version %d; rebuilding it at version %d requires Reset", cfg.Name, version, cfg.Version)
 		}
 		trimmed, err := foreignTrimmed, foreignErr
 		if src, ok := cfg.Source.(*SQLiteStore); ok {
@@ -183,34 +186,37 @@ func (s *SQLiteStore) OpenProjection(ctx context.Context, cfg ProjectionConfig) 
 			trimmed, err = sourceTrimmedThrough(ctx, src)
 		}
 		if err != nil {
-			return nil, fmt.Errorf("sqlite: projection %q: check source before rebuild: %w", cfg.Name, err)
+			return "", fmt.Errorf("sqlite: projection %q: check source before rebuild: %w", cfg.Name, err)
 		}
 		if trimmed != eventbus.OffsetOldest {
-			err = fmt.Errorf("%w: projection %q: the source was trimmed through %q, so a rebuild from OffsetOldest would be incomplete; migrate the tables in Setup and keep Version %d",
+			return "", fmt.Errorf("%w: projection %q: the source was trimmed through %q, so a rebuild from OffsetOldest would be incomplete; migrate the tables in Setup and keep Version %d",
 				ErrProjectionRebuild, cfg.Name, trimmed, version)
-			return nil, err
 		}
-		if err = cfg.Reset(ctx, tx); err != nil {
-			return nil, fmt.Errorf("sqlite: projection %q: reset: %w", cfg.Name, err)
+		if err := cfg.Reset(ctx, tx); err != nil {
+			return "", fmt.Errorf("sqlite: projection %q: reset: %w", cfg.Name, err)
 		}
-		if _, err = tx.ExecContext(ctx, "UPDATE ebu_projections SET version = ?, checkpoint = '', updated_at = CURRENT_TIMESTAMP WHERE name = ?", cfg.Version, cfg.Name); err != nil {
-			return nil, fmt.Errorf("sqlite: projection %q: reset checkpoint: %w", cfg.Name, err)
+		if _, err := tx.ExecContext(ctx, "UPDATE ebu_projections SET version = ?, checkpoint = '', updated_at = CURRENT_TIMESTAMP WHERE name = ?", cfg.Version, cfg.Name); err != nil {
+			return "", fmt.Errorf("sqlite: projection %q: reset checkpoint: %w", cfg.Name, err)
 		}
 		checkpoint = ""
 	}
 	if cfg.Setup != nil {
-		if err = cfg.Setup(ctx, tx); err != nil {
-			return nil, fmt.Errorf("sqlite: projection %q: setup: %w", cfg.Name, err)
+		if err := cfg.Setup(ctx, tx); err != nil {
+			return "", fmt.Errorf("sqlite: projection %q: setup: %w", cfg.Name, err)
 		}
 	}
-	if err = tx.Commit(); err != nil {
-		return nil, fmt.Errorf("sqlite: projection %q: commit: %w", cfg.Name, err)
-	}
-	committed = true
+	return checkpoint, nil
+}
 
-	p = &Projection{store: s, cfg: cfg}
-	p.setCheckpoint(eventbus.Offset(checkpoint))
-	return p, nil
+// queryRower is the part of *sql.DB and *sql.Tx that loadProjection needs.
+type queryRower interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// loadProjection reads the stored version and checkpoint of a projection.
+func loadProjection(ctx context.Context, q queryRower, name string) (version int, checkpoint string, err error) {
+	err = q.QueryRowContext(ctx, "SELECT version, checkpoint FROM ebu_projections WHERE name = ?", name).Scan(&version, &checkpoint)
+	return version, checkpoint, err
 }
 
 // Name returns the projection's name.
@@ -223,13 +229,36 @@ func (p *Projection) DB() *sql.DB { return p.store.db }
 
 // Checkpoint returns the source offset through which the projection's tables
 // are committed, as last observed by this instance (OffsetOldest before the
-// first event). It can only lag the stored checkpoint, never lead it, so it
-// is always a safe retention bound for the source.
+// first event). While other instances only advance the projection it lags
+// the stored checkpoint, but after another instance rebuilds the projection
+// (raises Version) it leads it. Use Committed for a retention bound.
 func (p *Projection) Checkpoint() eventbus.Offset {
 	if checkpoint := p.checkpoint.Load(); checkpoint != nil {
 		return *checkpoint
 	}
 	return eventbus.OffsetOldest
+}
+
+// Committed reads the checkpoint stored for the projection: the source
+// offset through which its tables are committed, whichever instance committed
+// them. It fails with ErrProjectionVersionChanged when another instance
+// reopened the projection at a different Version; a rebuild in progress
+// reports OffsetOldest. Committed is the safe retention bound for the source:
+// trim through it, bounded by the checkpoints of the source's other readers,
+// and do not trim while a rebuild is replaying (see docs/PROJECTIONS.md).
+func (p *Projection) Committed(ctx context.Context) (eventbus.Offset, error) {
+	version, stored, err := loadProjection(ctx, p.store.db, p.cfg.Name)
+	if err != nil {
+		return eventbus.OffsetOldest, fmt.Errorf("sqlite: projection %q: load checkpoint: %w", p.cfg.Name, err)
+	}
+	if version != p.cfg.Version {
+		return eventbus.OffsetOldest, p.versionChanged(version)
+	}
+	return eventbus.Offset(stored), nil
+}
+
+func (p *Projection) versionChanged(version int) error {
+	return fmt.Errorf("sqlite: projection %q is now at version %d, this instance applies version %d: %w", p.cfg.Name, version, p.cfg.Version, ErrProjectionVersionChanged)
 }
 
 func (p *Projection) setCheckpoint(offset eventbus.Offset) {
@@ -259,7 +288,18 @@ func (p *Projection) CatchUp(ctx context.Context) (eventbus.Offset, error) {
 		// EventStore contract), so an empty read either ends the loop or
 		// persists an advanced resume token exactly once.
 		if len(events) == 0 && next == from {
-			return from, nil
+			// Caught up, as far as this instance knows. Confirm against the
+			// stored state: another instance may have rebuilt the
+			// projection (reset tables) or advanced it.
+			stored, err := p.Committed(ctx)
+			if err != nil {
+				return from, err
+			}
+			if stored == from {
+				return from, nil
+			}
+			p.setCheckpoint(stored)
+			continue
 		}
 		if next == from {
 			// A non-conforming source: applying would commit the same
@@ -275,48 +315,41 @@ func (p *Projection) CatchUp(ctx context.Context) (eventbus.Offset, error) {
 // applyBatch applies events and moves the checkpoint from from to next in
 // one transaction. When another instance already moved the stored
 // checkpoint, nothing is applied and this instance adopts the stored one.
-func (p *Projection) applyBatch(ctx context.Context, from eventbus.Offset, events []*eventbus.StoredEvent, next eventbus.Offset) (err error) {
-	tx, err := p.store.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("sqlite: projection %q: begin: %w", p.cfg.Name, err)
-	}
-	committed := false
-	defer func() {
-		// Also runs when Apply panics, releasing the write lock.
-		if !committed {
-			_ = tx.Rollback()
+func (p *Projection) applyBatch(ctx context.Context, from eventbus.Offset, events []*eventbus.StoredEvent, next eventbus.Offset) error {
+	adopted := eventbus.Offset("")
+	adopt := false
+	err := p.store.inTx(ctx, fmt.Sprintf("sqlite: projection %q", p.cfg.Name), func(tx *sql.Tx) error {
+		version, stored, err := loadProjection(ctx, tx, p.cfg.Name)
+		if err != nil {
+			return fmt.Errorf("sqlite: projection %q: load checkpoint: %w", p.cfg.Name, err)
 		}
-	}()
-
-	var version int
-	var stored string
-	if err = tx.QueryRowContext(ctx, "SELECT version, checkpoint FROM ebu_projections WHERE name = ?", p.cfg.Name).Scan(&version, &stored); err != nil {
-		return fmt.Errorf("sqlite: projection %q: load checkpoint: %w", p.cfg.Name, err)
-	}
-	if version != p.cfg.Version {
-		err = fmt.Errorf("sqlite: projection %q is now at version %d, this instance applies version %d: %w", p.cfg.Name, version, p.cfg.Version, ErrProjectionVersionChanged)
+		if version != p.cfg.Version {
+			return p.versionChanged(version)
+		}
+		if eventbus.Offset(stored) != from {
+			// Another instance applied this range first: adopt its
+			// checkpoint (the transaction commits nothing).
+			adopted, adopt = eventbus.Offset(stored), true
+			return nil
+		}
+		for _, event := range events {
+			if err := p.cfg.Apply(ctx, tx, event); err != nil {
+				return fmt.Errorf("sqlite: projection %q: apply event %q at %q: %w", p.cfg.Name, event.ID, event.Offset, err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "UPDATE ebu_projections SET checkpoint = ?, updated_at = CURRENT_TIMESTAMP WHERE name = ?", string(next), p.cfg.Name); err != nil {
+			return fmt.Errorf("sqlite: projection %q: save checkpoint: %w", p.cfg.Name, err)
+		}
+		return nil
+	})
+	if err != nil {
 		return err
 	}
-	if eventbus.Offset(stored) != from {
-		// Another instance applied this range first: adopt its checkpoint
-		// (the deferred rollback discards this transaction).
-		p.setCheckpoint(eventbus.Offset(stored))
-		return nil
+	if adopt {
+		p.setCheckpoint(adopted)
+	} else {
+		p.setCheckpoint(next)
 	}
-
-	for _, event := range events {
-		if err = p.cfg.Apply(ctx, tx, event); err != nil {
-			return fmt.Errorf("sqlite: projection %q: apply event %q at %q: %w", p.cfg.Name, event.ID, event.Offset, err)
-		}
-	}
-	if _, err = tx.ExecContext(ctx, "UPDATE ebu_projections SET checkpoint = ?, updated_at = CURRENT_TIMESTAMP WHERE name = ?", string(next), p.cfg.Name); err != nil {
-		return fmt.Errorf("sqlite: projection %q: save checkpoint: %w", p.cfg.Name, err)
-	}
-	if err = tx.Commit(); err != nil {
-		return fmt.Errorf("sqlite: projection %q: commit: %w", p.cfg.Name, err)
-	}
-	committed = true
-	p.setCheckpoint(next)
 	return nil
 }
 

@@ -37,9 +37,10 @@ events (the log, optional)   ebu_projections (name, version, checkpoint)   your 
   checkpoint and applies only the tail. Nothing is held in memory, and no
   payload is ever rewritten for compaction.
 - **Compaction is retention.** Once the projection has applied the log through
-  its checkpoint, those events can be trimmed with
-  `RetentionPolicy{Through: p.Checkpoint()}` (bounded by any other reader's
-  checkpoint). The projection does not need them again.
+  its committed checkpoint, those events can be trimmed with
+  `RetentionPolicy{Through: committed}`, where `committed, err :=
+  p.Committed(ctx)` (bounded by any other reader's checkpoint). The projection
+  does not need them again.
 - **Queries are plain SQL** through `p.DB()`, with whatever indexes `Setup`
   created. A committed read always observes the tables at some committed
   checkpoint.
@@ -85,7 +86,8 @@ rows, err := p.DB().QueryContext(ctx,
 |------|----------|
 | `OpenProjection` | Creates the checkpoint table on first use, registers or resumes `Name`, runs `Reset` when `Version` increased, then `Setup` — one transaction. A lower `Version`, or a rebuild over a source that reports a trimmed prefix, is refused with `ErrProjectionRebuild` and changes nothing. Read-only stores return `ErrReadOnly`. |
 | `CatchUp` | Applies batches until a read returns no events; returns the committed checkpoint. A source error (including `ErrOffsetTrimmed`) or an `Apply` error stops at the last committed batch; the failed batch is rolled back and retried by the next call. |
-| `Checkpoint` | The committed source offset this instance last observed. |
+| `Checkpoint` | The committed source offset this instance last observed (in memory; can lead the stored one after another instance's rebuild). |
+| `Committed` | The checkpoint stored in the database, whichever instance committed it; `ErrProjectionVersionChanged` after a rebuild at another version. The retention bound. |
 | `DB` | The database holding the tables, for queries. |
 
 ### Read-your-writes
@@ -175,7 +177,13 @@ for `(msg.Type, msg.Key)`, mapping the fields you query into indexed columns.
   `OffsetOldest`. When the source reports a trimmed prefix (SQLite and
   MemoryStore `Trim`), the rebuild is refused with `ErrProjectionRebuild`
   before `Reset` runs; migrate the tables in `Setup` and keep the version
-  instead. The guard only sees prefixes removed by `Trim`'s prefix rules. It
+  instead. The guard checks the source once, before `Reset`, and does not hold
+  retention off: do not trim the source while a rebuild is replaying. A trim
+  after the rebuild's first batch makes its next read fail with
+  `ErrOffsetTrimmed`, but one between the check and the first read (an age or
+  count rule, or a `Through` bound taken before the rebuild) leaves the rebuilt
+  tables silently incomplete. The guard only sees prefixes removed by `Trim`'s
+  prefix rules. It
   cannot see a prefix removed with the legacy `TruncateBefore`, events removed
   by `MaxPerPartition`, Durable Streams server-side retention, or the history
   of a custom store that does not implement `EventStoreTrimmer`. Raising
@@ -190,9 +198,18 @@ for `(msg.Type, msg.Key)`, mapping the fields you query into indexed columns.
   Keep `Apply` free of external I/O, and lower `BatchSize` when `Apply` is
   heavy (larger batches amortize commits; smaller ones release the lock
   sooner). A panicking `Apply` rolls its batch back and releases the lock.
-- **`Checkpoint` lags, never leads.** It is the checkpoint this instance last
-  observed, so it is always a safe retention bound for the source, even with
-  several instances.
+- **Trim through `Committed`, not `Checkpoint`.** `Checkpoint` is the value
+  this instance last observed. It lags while other instances advance the
+  projection, but after another instance rebuilds it (raises `Version`) it
+  leads the stored checkpoint, and trimming through it would remove history
+  the rebuild still needs. `Committed` reads the stored checkpoint and fails
+  with `ErrProjectionVersionChanged` on a stale instance; during a rebuild it
+  reports `OffsetOldest`.
+- **Stale instances stop, even when idle.** `CatchUp` confirms the stored
+  version and checkpoint before reporting that it caught up, so an instance
+  whose projection was rebuilt by another instance returns
+  `ErrProjectionVersionChanged` instead of claiming success, and one whose
+  projection another instance advanced adopts the stored checkpoint.
 - **Name your tables freely, except `events`, `subscription_positions`,
   `snapshots`, `schema_version` and the `ebu_` prefix**, which belong to the
   store.
