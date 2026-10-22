@@ -17,7 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one the server has accepted is fenced with the permanent
   `ErrProducerFenced` (`*ProducerFencedError`) and writes nothing; reusing an
   earlier instance's epoch fails with `ErrProducerConflict` rather than being
-  silently dropped as a duplicate. `WithProducerAutoClaim()` claims the next
+  silently dropped as a duplicate. A duplicate answer counts as success only
+  when it is provably this event's (the store owns its epoch and no earlier
+  request carried the number); otherwise the server's `Producer-Seq` decides
+  between a conflict and a claim, or `Append` returns
+  `ErrProducerIndeterminate`. A first append that gives up before a new epoch
+  is established no longer wedges the store: the next append restarts the
+  epoch at sequence 0. Requests abandoned after a timeout can still arrive
+  late; exactly-once holds for acknowledged appends, and consumers still
+  deduplicate on `Event.ID`. `WithProducerAutoClaim()` claims the next
   free epoch at the first append (newest instance wins; an instance that owns
   its epoch never re-claims), and `ProducerEpoch` reports the epoch in use.
   Producer appends are serialized per store; a queued `Append` gives up when

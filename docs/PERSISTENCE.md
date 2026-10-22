@@ -292,6 +292,13 @@ store, err := durablestream.New(baseURL, "orders",
   stream's current tail, which covers the event. If that tail lookup fails,
   `Append` returns an error although the event is stored; as with any
   indeterminate `Append` error, consumers still deduplicate on `Event.ID`.
+- **A duplicate is success only when it is provably this event's.** That
+  requires the store to own its epoch (its first append was accepted) and the
+  sequence number to be one no earlier request of the store carried. Otherwise
+  the server's `Producer-Seq` (its highest accepted number) identifies another
+  writer's event (`ErrProducerConflict`, or a claim with auto-claim), and when
+  even that cannot tell, `Append` returns `ErrProducerIndeterminate` instead of
+  claiming success.
 - **Stale writers are fenced.** Once the server has accepted an append with a
   higher epoch for the same producer ID, appends from an older epoch fail with
   `durablestream.ErrProducerFenced` (`*ProducerFencedError` carries both
@@ -302,12 +309,23 @@ store, err := durablestream.New(baseURL, "orders",
   at the first append: the newest instance then wins. Claiming happens only
   before the store's first accepted append, so two live instances cannot keep
   taking the producer from each other. `ProducerEpoch` reports the epoch in use.
-  Reusing an old epoch is reported as `ErrProducerConflict` instead of the event
-  being discarded as a duplicate.
+  Reusing an old epoch is reported as `ErrProducerConflict` (or
+  `ErrProducerIndeterminate`) instead of the event being discarded as a
+  duplicate.
 - **Appends are serialized per store**, because sequence numbers must reach the
-  server in order; a queued `Append` gives up when its context ends. When an `Append` gives up, its sequence number may or may
-  not have been committed; the next append resolves this with the server's
-  expected sequence, never writing an event twice or under another's number.
+  server in order; a queued `Append` gives up when its context ends. When an
+  `Append` gives up, its sequence number may or may not have been committed;
+  the next append learns which from the server (a 409 naming the expected
+  number, or a 400 while a new epoch is not yet established) and renumbers its
+  event, so a failed first append never wedges the store.
+- **Abandoned requests are the limit of exactly-once.** A request that timed
+  out can still reach the server later. If it arrives after the next append
+  was renumbered onto its sequence number, the server keeps whichever arrived
+  first and drops the other as a duplicate (the renumbered append then fails
+  rather than reporting success). And because an `Append` error is
+  indeterminate, a caller that retries an event whose timed-out attempt did
+  land writes it twice. Exactly-once holds for acknowledged appends; consumers
+  still deduplicate on `Event.ID`.
 
 Exactly-once within an epoch depends on the server committing producer state
 atomically with the data (the protocol's atomicity requirement). Snapshots on

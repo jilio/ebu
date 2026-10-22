@@ -163,13 +163,21 @@ func TestProducer_RetryAfterLostAckIsWrittenOnce(t *testing.T) {
 func TestProducer_DuplicateTailLookupFailureIsReported(t *testing.T) {
 	var posts atomic.Int32
 	ps := scriptedServer(t, func(w http.ResponseWriter, r *http.Request) bool {
-		if posts.Add(1) == 1 {
+		switch posts.Add(1) {
+		case 1:
+			return false // accepted: the store now owns its epoch
+		case 2:
 			w.WriteHeader(http.StatusServiceUnavailable) // may have landed
-		} else {
+		default:
+			w.Header().Set("Producer-Seq", "1")
 			w.WriteHeader(http.StatusNoContent) // ...and it had
 		}
 		return true
 	})
+	store := newProducerStore(t, ps, "events", ds.WithProducer("writer", 0))
+	if _, err := store.Append(t.Context(), producerEvent(0)); err != nil {
+		t.Fatal(err)
+	}
 	inner := ps.Config.Handler
 	ps.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
@@ -178,8 +186,7 @@ func TestProducer_DuplicateTailLookupFailureIsReported(t *testing.T) {
 		}
 		inner.ServeHTTP(w, r)
 	})
-	store := newProducerStore(t, ps, "events", ds.WithProducer("writer", 0))
-	_, err := store.Append(t.Context(), producerEvent(0))
+	_, err := store.Append(t.Context(), producerEvent(1))
 	if err == nil || !errors.Is(err, durablestreams.ErrStreamNotFound) || !strings.Contains(err.Error(), "append committed, but its offset is unknown") {
 		t.Fatalf("expected a committed-but-unknown-offset error, got %v", err)
 	}
@@ -651,5 +658,203 @@ func TestProducer_WaitingForTheProducerHonorsContext(t *testing.T) {
 	}
 	if _, lastSeq, _ := ps.producerOf("events", "writer"); lastSeq != 1 {
 		t.Fatalf("lastSeq = %d, want 1", lastSeq)
+	}
+}
+
+// failFirstPosts makes the first n POSTs fail with status before the server
+// processes them (nothing is committed).
+func failFirstPosts(ps *protoServer, n int32, status int) *atomic.Int32 {
+	var remaining atomic.Int32
+	remaining.Store(n)
+	ps.reject = func(*http.Request) int {
+		if remaining.Add(-1) >= 0 {
+			return status
+		}
+		return 0
+	}
+	return &remaining
+}
+
+// writeAsPredecessor appends n events as a previous instance owning epoch.
+func writeAsPredecessor(t *testing.T, ps *protoServer, epoch int64, n int) {
+	t.Helper()
+	old := newProducerStore(t, ps, "events", ds.WithProducer("w", epoch))
+	for i := range n {
+		if _, err := old.Append(t.Context(), producerEvent(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// A restarted auto-claim instance whose first attempt fails transiently gets
+// a duplicate on retry for the predecessor's numbers. It must not report
+// success for an event that was never stored (review probe).
+func TestProducer_AutoClaimTransientThenForeignDuplicateIsNotSuccess(t *testing.T) {
+	ps := newProtoServer()
+	defer ps.Close()
+	writeAsPredecessor(t, ps, 0, 3)
+	failFirstPosts(ps, 1, http.StatusServiceUnavailable)
+	fresh := newProducerStore(t, ps, "events", ds.WithProducer("w", 0), ds.WithProducerAutoClaim())
+	if _, err := fresh.Append(t.Context(), producerEvent(99)); !errors.Is(err, ds.ErrProducerConflict) {
+		t.Fatalf("Append = %v, want ErrProducerConflict (the duplicate is the predecessor's)", err)
+	}
+	if got := ps.storedMessages("events"); len(got) != 3 {
+		t.Fatalf("stored %d messages", len(got))
+	}
+	// The next append claims a new epoch and is stored.
+	if _, err := fresh.Append(t.Context(), producerEvent(100)); err != nil {
+		t.Fatal(err)
+	}
+	if epoch, _ := fresh.ProducerEpoch(); epoch != 1 || len(ps.storedMessages("events")) != 4 {
+		t.Fatalf("epoch %d, stored %d", epoch, len(ps.storedMessages("events")))
+	}
+}
+
+// The same without auto-claim: a reused epoch stays a loud conflict even when
+// a transient failure preceded the duplicate (review probe).
+func TestProducer_ReusedEpochTransientThenDuplicateIsAConflict(t *testing.T) {
+	for _, status := range []int{http.StatusServiceUnavailable, http.StatusTooManyRequests} {
+		ps := newProtoServer()
+		writeAsPredecessor(t, ps, 0, 3)
+		failFirstPosts(ps, 1, status)
+		fresh := newProducerStore(t, ps, "events", ds.WithProducer("w", 0))
+		if _, err := fresh.Append(t.Context(), producerEvent(99)); !errors.Is(err, ds.ErrProducerConflict) {
+			t.Fatalf("status %d: Append = %v, want ErrProducerConflict", status, err)
+		}
+		if got := ps.storedMessages("events"); len(got) != 3 {
+			t.Fatalf("status %d: stored %d messages", status, len(got))
+		}
+		ps.Close()
+	}
+}
+
+// Before the store owns its epoch, a duplicate whose highest accepted number
+// equals ours cannot be attributed: it is indeterminate, not success.
+func TestProducer_UnownedLostAckIsIndeterminate(t *testing.T) {
+	t.Run("own attempt landed", func(t *testing.T) {
+		ps := newProtoServer()
+		defer ps.Close()
+		var lost atomic.Bool
+		ps.loseAck = func(*http.Request) bool { return lost.CompareAndSwap(false, true) }
+		store := newProducerStore(t, ps, "events", ds.WithProducer("w", 0))
+		if _, err := store.Append(t.Context(), producerEvent(0)); !errors.Is(err, ds.ErrProducerIndeterminate) {
+			t.Fatalf("Append = %v, want ErrProducerIndeterminate", err)
+		}
+		if got := ps.storedMessages("events"); len(got) != 1 {
+			t.Fatalf("stored %d messages", len(got))
+		}
+	})
+	t.Run("predecessor wrote only sequence 0", func(t *testing.T) {
+		ps := newProtoServer()
+		defer ps.Close()
+		writeAsPredecessor(t, ps, 0, 1)
+		failFirstPosts(ps, 1, http.StatusServiceUnavailable)
+		store := newProducerStore(t, ps, "events", ds.WithProducer("w", 0))
+		if _, err := store.Append(t.Context(), producerEvent(99)); !errors.Is(err, ds.ErrProducerIndeterminate) {
+			t.Fatalf("Append = %v, want ErrProducerIndeterminate", err)
+		}
+		if got := ps.storedMessages("events"); len(got) != 1 {
+			t.Fatalf("stored %d messages", len(got))
+		}
+	})
+	t.Run("no Producer-Seq header", func(t *testing.T) {
+		var posts atomic.Int32
+		ps := scriptedServer(t, func(w http.ResponseWriter, r *http.Request) bool {
+			if posts.Add(1) == 1 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+			} else {
+				w.WriteHeader(http.StatusNoContent)
+			}
+			return true
+		})
+		store := newProducerStore(t, ps, "events", ds.WithProducer("w", 0))
+		if _, err := store.Append(t.Context(), producerEvent(0)); !errors.Is(err, ds.ErrProducerIndeterminate) {
+			t.Fatalf("Append = %v, want ErrProducerIndeterminate", err)
+		}
+	})
+}
+
+// An owning store whose renumbered append (reusing a number an abandoned
+// request carried) gets a duplicate after a lost acknowledgement cannot know
+// whose request landed: indeterminate, never success.
+func TestProducer_RenumberedLostAckIsIndeterminate(t *testing.T) {
+	ps := newProtoServer()
+	defer ps.Close()
+	store := newProducerStore(t, ps, "events", ds.WithProducer("w", 0), ds.WithRetry(2, time.Millisecond))
+	if _, err := store.Append(t.Context(), producerEvent(0)); err != nil {
+		t.Fatal(err)
+	}
+	// Sequence 1 is abandoned without landing.
+	failFirstPosts(ps, 2, http.StatusServiceUnavailable)
+	if _, err := store.Append(t.Context(), producerEvent(1)); err == nil {
+		t.Fatal("expected the abandoned append to fail")
+	}
+	// Sequence 2 is renumbered to 1; its acknowledgement is lost.
+	ps.reject = nil
+	var lost atomic.Bool
+	ps.loseAck = func(*http.Request) bool { return lost.CompareAndSwap(false, true) }
+	if _, err := store.Append(t.Context(), producerEvent(2)); !errors.Is(err, ds.ErrProducerIndeterminate) {
+		t.Fatalf("Append = %v, want ErrProducerIndeterminate", err)
+	}
+	if got := ps.storedMessages("events"); len(got) != 2 {
+		t.Fatalf("stored %d messages", len(got))
+	}
+	// The store keeps working.
+	if _, err := store.Append(t.Context(), producerEvent(3)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A new instance with a fresh, greater epoch whose very first Append gives up
+// must recover once the server is back: the epoch was never established, so
+// the server rejects any sequence but 0 with 400 (review probe).
+func TestProducer_FailedFirstAppendDoesNotWedgeANewEpoch(t *testing.T) {
+	ps := newProtoServer()
+	defer ps.Close()
+	writeAsPredecessor(t, ps, 0, 2)
+	var down atomic.Bool
+	down.Store(true)
+	ps.reject = func(*http.Request) int {
+		if down.Load() {
+			return http.StatusServiceUnavailable
+		}
+		return 0
+	}
+	fresh := newProducerStore(t, ps, "events", ds.WithProducer("w", 1))
+	if _, err := fresh.Append(t.Context(), producerEvent(10)); err == nil {
+		t.Fatal("expected the first append to give up")
+	}
+	down.Store(false)
+	for i := range 3 {
+		if _, err := fresh.Append(t.Context(), producerEvent(11+i)); err != nil {
+			t.Fatalf("append %d after recovery: %v", i, err)
+		}
+	}
+	if got := ps.storedMessages("events"); len(got) != 5 {
+		t.Fatalf("stored %d messages, want 5", len(got))
+	}
+	if epoch, lastSeq, _ := ps.producerOf("events", "w"); epoch != 1 || lastSeq != 2 {
+		t.Fatalf("server producer state epoch %d lastSeq %d", epoch, lastSeq)
+	}
+}
+
+func TestProducer_BadRequestAtSequenceZeroIsPermanent(t *testing.T) {
+	var posts atomic.Int32
+	ps := scriptedServer(t, func(w http.ResponseWriter, r *http.Request) bool {
+		posts.Add(1)
+		w.WriteHeader(http.StatusBadRequest)
+		return true
+	})
+	store := newProducerStore(t, ps, "events", ds.WithProducer("w", 0), ds.WithRetry(1, time.Millisecond))
+	// A 400 at sequence 0 is permanent and consumes the number.
+	if _, err := store.Append(t.Context(), producerEvent(0)); !errors.Is(err, durablestreams.ErrBadRequest) || posts.Load() != 1 {
+		t.Fatalf("Append = %v after %d requests", err, posts.Load())
+	}
+	before := posts.Load()
+	if _, err := store.Append(t.Context(), producerEvent(1)); !errors.Is(err, durablestreams.ErrBadRequest) {
+		t.Fatalf("Append = %v, want ErrBadRequest", err)
+	}
+	if sent := posts.Load() - before; sent != 2 {
+		t.Fatalf("sent %d requests, want 2 (seq 1, then seq 0)", sent)
 	}
 }

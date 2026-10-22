@@ -46,11 +46,21 @@ var (
 	ErrProducerFenced = errors.New("durablestream: producer fenced by a newer epoch")
 
 	// ErrProducerConflict reports that the server already holds the producer
-	// sequence number this store was about to use, although this store never
-	// sent that event under it: another writer is using the same producer ID
-	// and epoch (or an abandoned request of this store arrived late). The event
-	// was not appended. Give every concurrently live writer its own epoch.
+	// sequence number this store was about to use, and the duplicate is not
+	// this event: another writer is using the same producer ID and epoch (for
+	// example a restarted instance that reused its predecessor's epoch), or
+	// an abandoned request of this store arrived late. This event was not
+	// appended. Give every live writer its own epoch.
 	ErrProducerConflict = errors.New("durablestream: producer sequence already used by another writer")
+
+	// ErrProducerIndeterminate reports that the server answered a retry with
+	// a duplicate that cannot be attributed: an earlier attempt of this
+	// Append may have landed, but the same sequence number may also have been
+	// used by another writer (before this store owns its epoch) or by an
+	// earlier, abandoned request of this store. The event may or may not be
+	// stored; like any indeterminate Append error, retrying may store it
+	// twice, so consumers deduplicate on Event.ID.
+	ErrProducerIndeterminate = errors.New("durablestream: producer append outcome is indeterminate")
 )
 
 // ProducerFencedError details an ErrProducerFenced rejection.
@@ -86,7 +96,11 @@ func (e *ProducerFencedError) Unwrap() error { return ErrProducerFenced }
 // example a lease generation or a durable counter incremented at startup — or
 // use WithProducerAutoClaim to claim the next epoch from the server. Reusing a
 // previous instance's epoch makes the first Append fail with
-// ErrProducerConflict instead of being silently discarded as a duplicate.
+// ErrProducerConflict (or ErrProducerIndeterminate when an earlier attempt of
+// it may have landed); it never reports success for an event the server
+// discarded as a duplicate. Until the store owns its epoch, a deduplicated
+// retry cannot be told apart from another writer's event under the same
+// number and is reported as ErrProducerIndeterminate.
 //
 // Appends of a producer Store are serialized: concurrent Append calls wait for
 // one another (honoring their contexts), because the sequence numbers must
@@ -159,6 +173,11 @@ type producerState struct {
 	// owned is set by the first accepted append: the epoch is then this
 	// store's, and auto-claim is over.
 	owned bool
+	// sentThrough is the highest sequence number this store has sent in the
+	// current epoch (-1: none). A number at or below it may still reach the
+	// server from an abandoned request, so a duplicate for it cannot be
+	// attributed to the current Append.
+	sentThrough int64
 	// fenced is the sticky ErrProducerFenced once a newer epoch was seen.
 	fenced error
 }
@@ -167,7 +186,7 @@ func newProducerState(cfg *config) *producerState {
 	if cfg.producer == nil {
 		return nil
 	}
-	p := &producerState{turn: make(chan struct{}, 1), id: cfg.producer.id, autoClaim: cfg.producerAutoClaim}
+	p := &producerState{turn: make(chan struct{}, 1), id: cfg.producer.id, autoClaim: cfg.producerAutoClaim, sentThrough: -1}
 	p.epoch.Store(cfg.producer.epoch)
 	return p
 }
@@ -187,6 +206,7 @@ type producerResponse struct {
 	status      int
 	nextOffset  string
 	epoch       string
+	seq         string // Producer-Seq: on success, the highest accepted sequence
 	expectedSeq string
 	closed      bool
 }
@@ -194,12 +214,18 @@ type producerResponse struct {
 // appendAsProducer appends data under the idempotent producer protocol.
 //
 // Sequence numbers: each call takes the next number; retries of the call reuse
-// it with the same body, so a duplicate (204) after a failed attempt proves the
-// event was committed by that attempt. A call that gives up leaves its number
-// unused-or-committed; the next call's number then runs one past what the server
-// expects if the abandoned attempt never landed, and the server's 409 names the
-// expected number. A 409 means nothing was appended, so renumbering the current
-// event down to the expected number cannot duplicate or lose anything.
+// it with the same body. A call that gives up leaves its number unused or
+// committed; if it never landed, the next call's number runs past what the
+// server expects and the server's 409 names the expected number (or, before
+// the epoch is established, a 400 rejects any number but 0). Those answers
+// mean nothing was appended, so the current event is renumbered.
+//
+// A duplicate answer (204) proves this Append's event was stored only when an
+// earlier attempt of it may have landed, the store owns its epoch (no other
+// instance writes it), and the number was never sent by an earlier request
+// that might still arrive. Otherwise the server's Producer-Seq (the highest
+// accepted number) tells another writer's duplicate apart; when it cannot,
+// the outcome is reported as ErrProducerIndeterminate, never as success.
 func (s *Store) appendAsProducer(ctx context.Context, data []byte) (eventbus.Offset, error) {
 	p := s.producer
 	select {
@@ -214,11 +240,27 @@ func (s *Store) appendAsProducer(ctx context.Context, data []byte) (eventbus.Off
 
 	seq := p.nextSeq
 	p.nextSeq++
+	// sentBefore is the highest number earlier calls sent in this epoch; only
+	// numbers above it are attributable to this call.
+	sentBefore := p.sentThrough
 	// mayHaveLanded records that an earlier attempt of this exact
 	// (epoch, seq, body) may have been committed although no acknowledgement
-	// arrived. Only then is a duplicate response this store's own event.
+	// arrived.
 	mayHaveLanded := false
 	corrections := 0
+	correct := func() error {
+		if corrections++; corrections > maxProducerCorrections {
+			return producerCorrectionsError(p)
+		}
+		return nil
+	}
+	// claim moves to a new epoch whose sequence starts at 0.
+	claim := func(epoch int64) {
+		p.epoch.Store(epoch)
+		seq, p.nextSeq = 0, 1
+		p.sentThrough, sentBefore = -1, -1
+		mayHaveLanded = false
+	}
 	var lastErr error
 	for attempt := 1; attempt <= s.cfg.retryAttempts; {
 		if attempt > 1 {
@@ -231,7 +273,19 @@ func (s *Store) appendAsProducer(ctx context.Context, data []byte) (eventbus.Off
 		}
 
 		epoch := p.epoch.Load()
+		p.sentThrough = max(p.sentThrough, seq)
 		resp, err := s.postAsProducer(ctx, data, epoch, seq)
+		if err == nil && resp.status == http.StatusBadRequest && !p.owned && seq > 0 {
+			// A new epoch must start at sequence 0 (protocol section 5.2.1):
+			// an earlier call that gave up never established it. Nothing was
+			// appended; start the epoch with this event.
+			if err := correct(); err != nil {
+				return "", err
+			}
+			seq, p.nextSeq = 0, 1
+			mayHaveLanded = false
+			continue
+		}
 		if err == nil {
 			err = producerStatusError(s.streamURL, resp)
 		}
@@ -254,25 +308,34 @@ func (s *Store) appendAsProducer(ctx context.Context, data []byte) (eventbus.Off
 			return s.producerAckOffset(ctx)
 
 		case http.StatusNoContent:
-			if mayHaveLanded {
-				// An earlier attempt was committed and only its
-				// acknowledgement was lost: success, written once.
-				p.owned = true
+			highest, parseErr := strconv.ParseInt(resp.seq, 10, 64)
+			known := parseErr == nil
+			switch {
+			case mayHaveLanded && p.owned && seq > sentBefore && (!known || highest >= seq):
+				// Only this store writes its epoch and nothing else ever
+				// carried this number: an earlier attempt landed and only its
+				// acknowledgement was lost. Written once.
 				return s.producerAckOffset(ctx)
-			}
-			if p.autoClaim && !p.owned {
+			case mayHaveLanded && (p.owned || !known || highest == seq):
+				return "", fmt.Errorf("durablestream: append: producer %q epoch %d sequence %d: duplicate after a lost acknowledgement: %w",
+					p.id, epoch, seq, ErrProducerIndeterminate)
+			case p.autoClaim && !p.owned && !mayHaveLanded:
 				// The configured epoch is already in use: claim the next.
-				if corrections++; corrections > maxProducerCorrections {
-					return "", producerCorrectionsError(p)
+				if err := correct(); err != nil {
+					return "", err
 				}
 				if epoch >= maxProducerEpochOrSeq {
 					return "", fmt.Errorf("durablestream: append: producer %q cannot claim an epoch beyond %d", p.id, epoch)
 				}
-				p.epoch.Store(epoch + 1)
-				seq, p.nextSeq = 0, 1
+				claim(epoch + 1)
 				continue
+			default:
+				// The server holds another writer's event under this
+				// number (its highest accepted number differs, or no attempt
+				// of this event can have landed).
+				return "", fmt.Errorf("durablestream: append: producer %q epoch %d sequence %d (server holds through %q): %w",
+					p.id, epoch, seq, resp.seq, ErrProducerConflict)
 			}
-			return "", fmt.Errorf("durablestream: append: producer %q epoch %d sequence %d: %w", p.id, epoch, seq, ErrProducerConflict)
 
 		case http.StatusForbidden:
 			current, parseErr := strconv.ParseInt(resp.epoch, 10, 64)
@@ -285,11 +348,10 @@ func (s *Store) appendAsProducer(ctx context.Context, data []byte) (eventbus.Off
 			// Claim only while no attempt of this event can have landed:
 			// re-sending it under a new epoch could otherwise write it twice.
 			if p.autoClaim && !p.owned && !mayHaveLanded && current < maxProducerEpochOrSeq {
-				if corrections++; corrections > maxProducerCorrections {
-					return "", producerCorrectionsError(p)
+				if err := correct(); err != nil {
+					return "", err
 				}
-				p.epoch.Store(current + 1)
-				seq, p.nextSeq = 0, 1
+				claim(current + 1)
 				continue
 			}
 			p.fenced = &ProducerFencedError{ProducerID: p.id, Epoch: epoch, CurrentEpoch: current}
@@ -301,8 +363,8 @@ func (s *Store) appendAsProducer(ctx context.Context, data []byte) (eventbus.Off
 				return "", fmt.Errorf("durablestream: append: producer %q epoch %d sequence %d: server expects sequence %q: %w",
 					p.id, epoch, seq, resp.expectedSeq, durablestreams.ErrSeqConflict)
 			}
-			if corrections++; corrections > maxProducerCorrections {
-				return "", producerCorrectionsError(p)
+			if err := correct(); err != nil {
+				return "", err
 			}
 			// Nothing was appended, and the server has not committed
 			// sequence numbers >= expected in this epoch: earlier calls
@@ -355,6 +417,7 @@ func (s *Store) postAsProducer(ctx context.Context, data []byte, epoch, seq int6
 		status:      resp.StatusCode,
 		nextOffset:  resp.Header.Get(headerStreamNextOffset),
 		epoch:       resp.Header.Get(headerProducerEpoch),
+		seq:         resp.Header.Get(headerProducerSeq),
 		expectedSeq: resp.Header.Get(headerProducerExpectedSeq),
 		closed:      resp.Header.Get(headerStreamClosed) == "true",
 	}, nil
