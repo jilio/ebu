@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync/atomic"
 
 	durablestreams "github.com/durable-streams/durable-streams/packages/client-go"
@@ -167,6 +168,11 @@ func validateProducer(cfg *config) error {
 	if cfg.producer.id == "" {
 		return errors.New("durablestream: producer ID is required")
 	}
+	if strings.ContainsFunc(cfg.producer.id, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
+		// HTTP header values cannot carry control characters; fail at New
+		// rather than on every append.
+		return fmt.Errorf("durablestream: producer ID %q contains control characters", cfg.producer.id)
+	}
 	if cfg.producer.epoch < 0 || cfg.producer.epoch > maxProducerEpochOrSeq {
 		return fmt.Errorf("durablestream: producer epoch %d is outside [0, 2^53-1]", cfg.producer.epoch)
 	}
@@ -175,8 +181,10 @@ func validateProducer(cfg *config) error {
 
 // producerState is the live sequence state of a producer Store. The turn
 // token is held for an entire Append, including retries and backoff, so
-// sequence numbers reach the server in order; it guards nextSeq, owned and
-// fenced. Waiting for it honors the caller's context.
+// sequence numbers reach the server in order. Every field except id,
+// autoClaim and epoch (an atomic, read by ProducerEpoch) is guarded by the
+// token: only appendAsProducer, while holding it, may touch them. Waiting
+// for the token honors the caller's context.
 type producerState struct {
 	turn chan struct{}
 	id   string
@@ -216,6 +224,14 @@ func newProducerState(cfg *config) *producerState {
 	p := &producerState{turn: make(chan struct{}, 1), id: cfg.producer.id, autoClaim: cfg.producerAutoClaim, sentThrough: -1}
 	p.epoch.Store(cfg.producer.epoch)
 	return p
+}
+
+// canClaimAfter reports whether an epoch above epoch exists to claim.
+func (p *producerState) canClaimAfter(epoch int64) error {
+	if epoch >= maxProducerEpochOrSeq {
+		return fmt.Errorf("durablestream: append: producer %q cannot claim an epoch beyond %d", p.id, epoch)
+	}
+	return nil
 }
 
 // ProducerEpoch returns the epoch Append writes with — after auto-claim, the
@@ -274,14 +290,17 @@ func (s *Store) appendAsProducer(ctx context.Context, eventID string, data []byt
 	}
 	if p.claimNext {
 		epoch := p.epoch.Load()
-		if epoch >= maxProducerEpochOrSeq {
-			return "", fmt.Errorf("durablestream: append: producer %q cannot claim an epoch beyond %d", p.id, epoch)
+		if err := p.canClaimAfter(epoch); err != nil {
+			return "", err
 		}
 		p.claimNext = false
 		p.epoch.Store(epoch + 1)
 		p.nextSeq, p.sentThrough = 0, -1
 	}
 
+	// Taken even if this call later fails without sending (a non-retryable
+	// status, a cancelled context): the next call's number then runs ahead,
+	// and the server's 409 or 400 renumbers it, at the cost of one round trip.
 	seq := p.nextSeq
 	p.nextSeq++
 	// sentBefore is the highest number earlier calls sent in this epoch; only
@@ -296,7 +315,7 @@ func (s *Store) appendAsProducer(ctx context.Context, eventID string, data []byt
 	corrections := 0
 	correct := func() error {
 		if corrections++; corrections > maxProducerCorrections {
-			return producerCorrectionsError(p)
+			return fmt.Errorf("durablestream: append: producer %q gave up after %d epoch or sequence corrections", p.id, maxProducerCorrections)
 		}
 		return nil
 	}
@@ -411,8 +430,8 @@ func (s *Store) appendAsProducer(ctx context.Context, eventID string, data []byt
 				if err := correct(); err != nil {
 					return "", err
 				}
-				if epoch >= maxProducerEpochOrSeq {
-					return "", fmt.Errorf("durablestream: append: producer %q cannot claim an epoch beyond %d", p.id, epoch)
+				if err := p.canClaimAfter(epoch); err != nil {
+					return "", err
 				}
 				claim(epoch + 1)
 				continue
@@ -472,10 +491,6 @@ func (s *Store) appendAsProducer(ctx context.Context, eventID string, data []byt
 	return "", fmt.Errorf("durablestream: append: giving up after %d attempts: %w", s.cfg.retryAttempts, lastErr)
 }
 
-func producerCorrectionsError(p *producerState) error {
-	return fmt.Errorf("durablestream: append: producer %q gave up after %d epoch or sequence corrections", p.id, maxProducerCorrections)
-}
-
 // producerAckOffset returns the exact offset after an event the server
 // acknowledged without one (a deduplicated retry, or a server that omitted
 // Stream-Next-Offset). It reads from the store's previous acknowledged offset
@@ -512,6 +527,10 @@ func (s *Store) locate(ctx context.Context, from eventbus.Offset, eventID string
 		return "", false, err
 	}
 	matches := 0
+	// complete records that the scan reached the captured tail; a scan that
+	// stops earlier (a premature caught-up answer, a chunk that does not
+	// advance) may have missed a later copy of the ID, so it proves nothing.
+	complete := from >= tail
 	for at := from; at < tail; {
 		chunk, _, err := s.readChunk(ctx, at)
 		if err != nil {
@@ -538,11 +557,12 @@ func (s *Store) locate(ctx context.Context, from eventbus.Offset, eventID string
 			break
 		}
 		at = next
+		complete = at >= tail
 	}
 	// An ID identifies a publish, not a physical record: with more than one
 	// copy (an earlier, retried publish of the same event) the appended
 	// record cannot be told apart, and either offset could skip events.
-	return offset, matches == 1 && exact, nil
+	return offset, complete && matches == 1 && exact, nil
 }
 
 // postAsProducer sends one append attempt with producer headers. Transport

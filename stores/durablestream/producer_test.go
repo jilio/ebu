@@ -397,6 +397,7 @@ func TestProducer_OptionValidation(t *testing.T) {
 		{"negative epoch", []ds.Option{ds.WithProducer("w", -1)}, "outside [0, 2^53-1]"},
 		{"epoch too large", []ds.Option{ds.WithProducer("w", 1<<53)}, "outside [0, 2^53-1]"},
 		{"auto-claim alone", []ds.Option{ds.WithProducerAutoClaim()}, "requires WithProducer"},
+		{"control characters", []ds.Option{ds.WithProducer("w\r\nX-Injected: 1", 0)}, "contains control characters"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := ds.New(ps.URL+"/v1/stream", "events", tc.opts...); err == nil || !strings.Contains(err.Error(), tc.want) {
@@ -1229,6 +1230,20 @@ func TestProducer_LocateDefensivePaths(t *testing.T) {
 			_, _ = w.Write([]byte("not json"))
 		}, "append committed, but its offset is unknown"},
 		{"caught up before the captured tail", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Stream-Next-Offset", r.URL.Query().Get("offset"))
+			w.Header().Set("Stream-Up-To-Date", "true")
+			w.WriteHeader(http.StatusNoContent)
+		}, "no exact offset follows it"},
+		{"a copy, then caught up before the captured tail", func(w http.ResponseWriter, r *http.Request) {
+			// The first read returns one copy of the ID, ending its chunk;
+			// the next answers caught up although the tail is later. A
+			// later copy could have been missed, so nothing is proven.
+			if r.URL.Query().Get("offset") == padOffset(1) {
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Stream-Next-Offset", padOffset(2))
+				_, _ = w.Write([]byte(`[{"id":"event-1","type":"produced","data":1}]`))
+				return
+			}
 			w.Header().Set("Stream-Next-Offset", r.URL.Query().Get("offset"))
 			w.Header().Set("Stream-Up-To-Date", "true")
 			w.WriteHeader(http.StatusNoContent)

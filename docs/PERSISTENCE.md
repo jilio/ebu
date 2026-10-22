@@ -309,7 +309,10 @@ store, err := durablestream.New(baseURL, "orders",
   duplicate is `ErrProducerIndeterminate`, never success. When the exact
   offset is recovered by reading, an event ID that occurs more than once makes
   the appended copy ambiguous (indeterminate), and the read stops at the tail
-  captured beforehand, so a busy stream cannot keep it running.
+  captured beforehand, so a busy stream cannot keep it running; a read that
+  ends before that tail proves nothing (indeterminate). The read is linear in
+  what was appended since the store's previous acknowledgement and runs while
+  the store's appends wait.
 - **Stale writers are fenced.** Once the server has accepted an append with a
   higher epoch for the same producer ID, appends from an older epoch fail with
   `durablestream.ErrProducerFenced` (`*ProducerFencedError` carries both
