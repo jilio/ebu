@@ -80,6 +80,7 @@ func (m *Materializer) Compact(ctx context.Context, store eventbus.EventStore, s
 		}
 		cmp, err := comparer.CompareOffsets(k, result.Through)
 		if err != nil {
+			result.Through = eventbus.OffsetOldest // nothing was trimmed
 			return result, fmt.Errorf("state: compact: compare keep offset %q: %w", k, err)
 		}
 		if cmp < 0 {
