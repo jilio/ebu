@@ -6,29 +6,31 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"strings"
 	"time"
 
 	eventbus "github.com/jilio/ebu"
 )
 
-// The retention table records how far Trim has removed a prefix of the log.
-// It is created by the first Trim rather than by a schema migration, so
+// The ebu_retention table records how far Trim has removed a prefix of the
+// log. It is created by the first Trim rather than by a schema migration, so
 // databases that never trim keep schema version 4 unchanged and remain
 // readable by earlier releases (including their OpenReadOnly). A missing
-// table means nothing was trimmed.
+// table means nothing was trimmed. The ebu_ prefix keeps it apart from tables
+// that callers create in the same database (see Projection).
 const (
 	createRetentionTable = `
-		CREATE TABLE IF NOT EXISTS retention (
+		CREATE TABLE IF NOT EXISTS ebu_retention (
 			id              INTEGER PRIMARY KEY CHECK (id = 1),
 			trimmed_through INTEGER NOT NULL,
 			updated_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`
 
-	selectTrimmedThrough = `SELECT trimmed_through FROM retention WHERE id = 1`
+	retentionTableExists = `SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ebu_retention')`
+
+	selectTrimmedThrough = `SELECT trimmed_through FROM ebu_retention WHERE id = 1`
 
 	upsertTrimmedThrough = `
-		INSERT INTO retention (id, trimmed_through, updated_at) VALUES (1, ?, CURRENT_TIMESTAMP)
+		INSERT INTO ebu_retention (id, trimmed_through, updated_at) VALUES (1, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(id) DO UPDATE SET
 			trimmed_through = MAX(trimmed_through, excluded.trimmed_through),
 			updated_at = CURRENT_TIMESTAMP`
@@ -36,14 +38,15 @@ const (
 	// deleteBeyondPartitionCap keeps the newest ?2 events of every partition,
 	// where an event's partition is the value of metadata key ?1 ('' when the
 	// key is absent). json_each matches the key exactly, so keys need no
-	// JSON-path quoting.
+	// JSON-path quoting. Metadata that is not valid JSON (never written by
+	// this store) counts as having no key instead of failing the Trim.
 	deleteBeyondPartitionCap = `
 		DELETE FROM events WHERE position IN (
 			SELECT position FROM (
 				SELECT position, ROW_NUMBER() OVER (PARTITION BY part ORDER BY position DESC) AS rank
 				FROM (
 					SELECT e.position,
-						COALESCE((SELECT value FROM json_each(e.metadata) WHERE key = ?1), '') AS part
+						COALESCE((SELECT value FROM json_each(CASE WHEN json_valid(e.metadata) THEN e.metadata END) WHERE key = ?1), '') AS part
 					FROM events e
 				)
 			)
@@ -60,7 +63,10 @@ var _ eventbus.EventStoreTrimmer = (*SQLiteStore)(nil)
 // MaxEvents) record the newest position they removed; Read and ReadStream
 // from an older concrete offset then fail with *eventbus.OffsetTrimmedError.
 // MaxPerPartition partitions by an event metadata key and scans the retained
-// log once per call, so run it periodically rather than per append. Removed
+// log once per call, so run it periodically rather than per append. The
+// write transaction lasts for the whole call: a first OlderThan run over a
+// large backlog, or a partition pass over a large log, delays concurrent
+// appends for that long. Removed
 // pages are reused by later appends (the database file does not shrink).
 // Unlike TruncateBefore, Trim leaves write-ahead-log checkpoints to SQLite's
 // automatic checkpointing: a TRUNCATE checkpoint waits for every open reader,
@@ -189,14 +195,26 @@ func firstNotOlder(ctx context.Context, tx *sql.Tx, cutoff time.Time) (int64, er
 
 // trimmedThrough returns the newest position removed by a prefix retention
 // rule, or 0 when nothing was trimmed (including databases without the
-// retention table).
+// retention table). The table is created in the same transaction as the first
+// boundary, so its absence proves no trim committed; once seen, it is never
+// looked up again.
 func (s *SQLiteStore) trimmedThrough(ctx context.Context) (int64, error) {
+	if !s.retentionTable.Load() {
+		var exists bool
+		if err := s.db.QueryRowContext(ctx, retentionTableExists).Scan(&exists); err != nil {
+			return 0, fmt.Errorf("sqlite: look up trim boundary: %w", err)
+		}
+		if !exists {
+			return 0, nil
+		}
+		s.retentionTable.Store(true)
+	}
 	var watermark int64
 	err := s.db.QueryRowContext(ctx, selectTrimmedThrough).Scan(&watermark)
 	switch {
 	case err == nil:
 		return watermark, nil
-	case errors.Is(err, sql.ErrNoRows), err != nil && strings.Contains(err.Error(), "no such table: retention"):
+	case errors.Is(err, sql.ErrNoRows):
 		return 0, nil
 	default:
 		return 0, fmt.Errorf("sqlite: read trim boundary: %w", err)
