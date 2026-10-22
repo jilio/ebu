@@ -858,3 +858,31 @@ func TestProducer_BadRequestAtSequenceZeroIsPermanent(t *testing.T) {
 		t.Fatalf("sent %d requests, want 2 (seq 1, then seq 0)", sent)
 	}
 }
+
+func TestProducer_EpochRestartCountsAsACorrection(t *testing.T) {
+	const burned = 40
+	var posts, conflicts atomic.Int32
+	ps := scriptedServer(t, func(w http.ResponseWriter, r *http.Request) bool {
+		if posts.Add(1) <= burned {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return true
+		}
+		if conflicts.Add(1) <= 16 {
+			seq, _ := strconv.Atoi(r.Header.Get("Producer-Seq"))
+			w.Header().Set("Producer-Expected-Seq", strconv.Itoa(seq-1))
+			w.WriteHeader(http.StatusConflict)
+			return true
+		}
+		w.WriteHeader(http.StatusBadRequest)
+		return true
+	})
+	store := newProducerStore(t, ps, "events", ds.WithProducer("w", 0), ds.WithRetry(1, time.Millisecond))
+	for range burned {
+		if _, err := store.Append(t.Context(), producerEvent(0)); err == nil {
+			t.Fatal("expected the injected failure")
+		}
+	}
+	if _, err := store.Append(t.Context(), producerEvent(1)); err == nil || !strings.Contains(err.Error(), "corrections") {
+		t.Fatalf("Append = %v", err)
+	}
+}
