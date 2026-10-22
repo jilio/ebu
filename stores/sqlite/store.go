@@ -366,7 +366,7 @@ func marshalMetadata(md map[string]string) any {
 	if len(md) == 0 {
 		return nil
 	}
-	data, _ := json.Marshal(md)
+	data, _ := json.Marshal(md) // cannot fail for map[string]string
 	return string(data)
 }
 
