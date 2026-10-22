@@ -20,7 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   age (`OlderThan`), total count (`MaxEvents`) and per-partition count
   (`PartitionKey` + `MaxPerPartition`, partitioned by an event metadata key).
   Offsets of retained events never change and are never reused. ebu applies no
-  default policy. `MemoryStore` and the SQLite store implement it.
+  default policy; a zero policy is a query that reports the current boundary
+  (in SQLite without taking the write lock). `MemoryStore` and the SQLite
+  store implement it.
 - `ErrOffsetTrimmed` and `*OffsetTrimmedError`: a read from a concrete offset
   older than a prefix removed by `Trim` fails with this gap signal, naming an
   offset to resume from, instead of silently skipping events. Reading from

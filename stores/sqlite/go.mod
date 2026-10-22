@@ -3,7 +3,7 @@ module github.com/jilio/ebu/stores/sqlite
 go 1.24.2
 
 require (
-	github.com/jilio/ebu v0.20.2-0.20261022023926-c813e20b9b04
+	github.com/jilio/ebu v0.20.2-0.20261022025434-9c34889cd4cb
 	modernc.org/sqlite v1.40.1
 )
 

@@ -124,7 +124,9 @@ func TestDurabilityChildAppendsUntilKilled(t *testing.T) {
 		fmt.Println("open-error", err)
 		os.Exit(2)
 	}
-	for seq := 1; ; seq++ {
+	// Bounded, so a leaked environment variable cannot make a normal test run
+	// loop forever; the parent kills the child long before the bound.
+	for seq := 1; seq <= 1_000_000; seq++ {
 		data, _ := json.Marshal(seq)
 		if _, err := store.Append(context.Background(), &eventbus.Event{ID: strconv.Itoa(seq), Type: "seq", Data: data, Timestamp: time.Now()}); err != nil {
 			fmt.Println("append-error", err)
@@ -132,6 +134,7 @@ func TestDurabilityChildAppendsUntilKilled(t *testing.T) {
 		}
 		fmt.Println("acked", seq)
 	}
+	os.Exit(3) // the parent should have killed this process
 }
 
 // TestAcknowledgedAppendsSurviveProcessKill is a crash-consistency smoke

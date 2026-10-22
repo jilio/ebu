@@ -81,6 +81,19 @@ func (s *SQLiteStore) Trim(ctx context.Context, policy eventbus.RetentionPolicy)
 	if err := policy.Validate(); err != nil {
 		return eventbus.TrimResult{}, err
 	}
+	if policy == (eventbus.RetentionPolicy{}) {
+		// A query: report the boundary without taking the write lock or
+		// creating the retention table.
+		watermark, err := s.trimmedThrough(ctx)
+		if err != nil {
+			return eventbus.TrimResult{}, err
+		}
+		result.TrimmedThrough = eventbus.OffsetOldest
+		if watermark > 0 {
+			result.TrimmedThrough = formatOffset(watermark)
+		}
+		return result, nil
+	}
 	var through int64
 	if policy.Through != eventbus.OffsetOldest {
 		if through, err = parseOffset(policy.Through); err != nil {
@@ -139,12 +152,14 @@ func trimInTx(ctx context.Context, tx *sql.Tx, policy eventbus.RetentionPolicy, 
 		if err := tx.QueryRowContext(ctx, "SELECT MAX(position) FROM events WHERE position <= ?", cut).Scan(&newest); err != nil {
 			return 0, 0, fmt.Errorf("sqlite: trim: find prefix boundary: %w", err)
 		}
+		// No event at or below cut (all were removed earlier): nothing to
+		// delete and no new boundary to record.
 		if newest.Valid {
 			res, err := tx.ExecContext(ctx, "DELETE FROM events WHERE position <= ?", newest.Int64)
 			if err != nil {
 				return 0, 0, fmt.Errorf("sqlite: trim: delete prefix: %w", err)
 			}
-			n, _ := res.RowsAffected()
+			n, _ := res.RowsAffected() // never fails for SQLite
 			deleted += n
 			if _, err := tx.ExecContext(ctx, upsertTrimmedThrough, newest.Int64); err != nil {
 				return 0, 0, fmt.Errorf("sqlite: trim: record boundary: %w", err)

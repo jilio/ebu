@@ -475,10 +475,16 @@ if errors.As(err, &trimmed) { // errors.Is(err, eventbus.ErrOffsetTrimmed)
 
 Reading from `OffsetOldest` is never an error; it starts at the oldest retained
 event. Once `Trim` has removed every event, `OffsetNewest` resolves to the trim
-boundary, so a checkpoint saved then still detects later gaps. The condition is permanent for that offset, so consumers that retry
-reads (`Follow`, `Mirror`, resumable subscriptions) report it on every attempt
-until the checkpoint is moved. Retention never consults subscriptions or
-snapshots: bound `Through` by the checkpoints that must stay readable.
+boundary, so a checkpoint saved then still detects later gaps. The condition is
+permanent for that offset, so consumers that retry reads (`Follow`, `Mirror`,
+resumable subscriptions) report it on every attempt until the checkpoint is
+moved. Retention never consults subscriptions or snapshots: bound `Through` by
+the checkpoints that must stay readable.
+
+Releases before retention existed (v0.20.1 and earlier) do not know the
+boundary: when they read a trimmed SQLite store from an offset behind the
+trimmed prefix, they silently skip the removed events. Upgrade every reader of a
+store before trimming it.
 
 Attach the partition key when publishing:
 
@@ -489,8 +495,13 @@ eventbus.PublishContext(bus, ctx, event)
 
 In SQLite, `Through` is an indexed lookup, `OlderThan` scans only the events
 it removes (plus one), `MaxEvents` steps over the N newest events, and
-`MaxPerPartition` scans the retained log once. Freed pages are reused by later appends. The retention boundary is kept in
-a table created by the first `Trim`, so databases that never trim are
+`MaxPerPartition` scans the retained log once. A `Trim` runs in one write
+transaction and delays appends to the same file while it runs, so a first
+`OlderThan` pass over a large backlog, or a partition pass over a large log,
+belongs in a quiet period (or can be split by trimming `Through` stepwise).
+A zero policy is a query that takes no write lock. Freed pages are reused by
+later appends. The retention boundary is kept in a table created by the first
+`Trim` that removes or could remove events, so databases that never trim are
 unchanged, and the schema version stays readable by earlier releases.
 
 `EventStoreTruncator.TruncateBefore` keeps its earlier, silent semantics and
@@ -1117,9 +1128,10 @@ A successful destination Append carries that store's guarantees: MemoryStore is
 not durable, SQLite's default WAL `synchronous=NORMAL` is not a
 destination-power-loss guarantee for the latest commit (use
 `sqlite.WithSynchronous(sqlite.SynchronousFull)`), and a remote
-acknowledgement depends on server storage configuration. Use a destination outside the source worker's failure
-domain and configure its acknowledgement policy explicitly. Replication cannot
-strengthen an acknowledgement returned too early by a backend.
+acknowledgement depends on server storage configuration. Use a destination
+outside the source worker's failure domain and configure its acknowledgement
+policy explicitly. Replication cannot strengthen an acknowledgement returned
+too early by a backend.
 
 A Durable Streams source should enable `WithStrictDecoding()` for loss-sensitive
 copying: malformed envelopes then return indexed Read/Tail errors rather than

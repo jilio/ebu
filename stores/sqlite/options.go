@@ -71,6 +71,16 @@ const (
 	SynchronousFull
 )
 
+// pragma returns the PRAGMA synchronous value for a declared mode. buildDSN
+// depends on it, so it is kept separate from String, which may change for
+// display without changing the DSN.
+func (s Synchronous) pragma() string {
+	if s == SynchronousFull {
+		return "FULL"
+	}
+	return "NORMAL"
+}
+
 // String returns the SQLite pragma value for the mode.
 func (s Synchronous) String() string {
 	switch s {

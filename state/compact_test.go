@@ -297,3 +297,25 @@ func TestCompactIsSerializedWithLoadSnapshotFrom(t *testing.T) {
 		t.Fatalf("LastOffset = %q", mat.LastOffset())
 	}
 }
+
+// A failed trim reports that nothing was trimmed, next to the saved snapshot.
+func TestCompactFailureReportsNothingTrimmed(t *testing.T) {
+	ctx := context.Background()
+	store := newCompactStore()
+	_, mat, _, offsets := compactFixture(t, store, 2)
+	failing := &failingTrimStore{compactStore: store, trimErr: errors.New("trim failed")}
+	result, err := mat.Compact(ctx, failing, "users")
+	if err == nil || result.Snapshot != offsets[1] || result.Through != eventbus.OffsetOldest || result.Removed != 0 {
+		t.Fatalf("Compact = %+v, %v", result, err)
+	}
+	memory := eventbus.NewMemoryStore()
+	truncating := &truncatingStore{
+		minimalSnapshotStore:     minimalSnapshotStore{memory, newFakeSnapshotStore()},
+		EventStoreOffsetComparer: memory,
+		truncateErr:              errors.New("disk full"),
+	}
+	_, mat, _, offsets = compactFixture(t, truncating, 2)
+	if result, err := mat.Compact(ctx, truncating, "users"); err == nil || result.Snapshot != offsets[1] || result.Through != eventbus.OffsetOldest {
+		t.Fatalf("Compact via a failing truncator = %+v, %v", result, err)
+	}
+}
