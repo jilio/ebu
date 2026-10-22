@@ -28,6 +28,10 @@ const (
 // Producer-Seq (2^53-1, for JavaScript interoperability).
 const maxProducerEpochOrSeq = 1<<53 - 1
 
+// maxDrainedBody bounds how much of an append response body is read: the
+// producer protocol carries everything in headers.
+const maxDrainedBody = 64 << 10
+
 // maxProducerCorrections bounds the protocol corrections (epoch claims and
 // sequence renumbering) a single Append may make. One of each is all a
 // correctly behaving server ever requires; the bound only stops a
@@ -392,9 +396,10 @@ func (s *Store) appendAsProducer(ctx context.Context, data []byte) (eventbus.Off
 
 		case http.StatusForbidden:
 			current, parseErr := strconv.ParseInt(resp.epoch, 10, 64)
-			if parseErr != nil || current < epoch {
-				// Not a fencing answer (for example a 403 from an
-				// authorizing proxy): report it without fencing the store.
+			if parseErr != nil || current <= epoch {
+				// Not a fencing answer: the protocol fences only with a newer
+				// epoch (a 403 from an authorizing proxy carries none).
+				// Report it without fencing the store.
 				return "", &durablestreams.StreamError{Op: "append", URL: s.streamURL, StatusCode: http.StatusForbidden,
 					Err: fmt.Errorf("403 without a newer %s (got %q): not a producer fencing response", headerProducerEpoch, resp.epoch)}
 			}
@@ -427,6 +432,9 @@ func (s *Store) appendAsProducer(ctx context.Context, data []byte) (eventbus.Off
 			// Nothing was appended, and the server has not committed
 			// sequence numbers >= expected in this epoch: earlier calls
 			// that gave up never landed. Reuse the expected number.
+			// sentBefore stays as it was: the expected number was carried by
+			// an earlier request, so a duplicate for it after a lost
+			// acknowledgement is reported as indeterminate, not success.
 			seq, p.nextSeq = expected, expected+1
 			mayHaveLanded = false
 		}
@@ -470,7 +478,9 @@ func (s *Store) postAsProducer(ctx context.Context, data []byte, epoch, seq int6
 		return producerResponse{}, &durablestreams.StreamError{Op: "append", URL: s.streamURL, Err: err}
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
+	// Drain a bounded amount so the connection can be reused; a server or
+	// proxy sending a large error body cannot make each attempt read it all.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrainedBody))
 	return producerResponse{
 		status:      resp.StatusCode,
 		nextOffset:  resp.Header.Get(headerStreamNextOffset),

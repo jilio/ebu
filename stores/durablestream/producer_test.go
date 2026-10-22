@@ -476,6 +476,7 @@ func TestProducer_MalformedProtocolResponses(t *testing.T) {
 	}{
 		{"403 without epoch", http.StatusForbidden, nil, "not a producer fencing response"},
 		{"403 with older epoch", http.StatusForbidden, map[string]string{"Producer-Epoch": "2"}, "not a producer fencing response"},
+		{"403 with the same epoch", http.StatusForbidden, map[string]string{"Producer-Epoch": "3"}, "not a producer fencing response"},
 		{"409 expecting a later sequence", http.StatusConflict, map[string]string{"Producer-Expected-Seq": "7"}, "server expects sequence \"7\""},
 		{"409 with garbage", http.StatusConflict, map[string]string{"Producer-Expected-Seq": "x"}, "server expects sequence \"x\""},
 	} {
@@ -497,10 +498,10 @@ func TestProducer_MalformedProtocolResponses(t *testing.T) {
 
 func TestProducer_CorrectionsAreBounded(t *testing.T) {
 	t.Run("claims", func(t *testing.T) {
-		var epoch atomic.Int64
 		ps := scriptedServer(t, func(w http.ResponseWriter, r *http.Request) bool {
 			// A racing claimant that is always one epoch ahead.
-			w.Header().Set("Producer-Epoch", strconv.FormatInt(epoch.Add(1), 10))
+			sent, _ := strconv.ParseInt(r.Header.Get("Producer-Epoch"), 10, 64)
+			w.Header().Set("Producer-Epoch", strconv.FormatInt(sent+1, 10))
 			w.WriteHeader(http.StatusForbidden)
 			return true
 		})
@@ -1060,5 +1061,26 @@ func TestProducer_PendingClaimAtTheEpochCeiling(t *testing.T) {
 	}
 	if _, err := store.Append(t.Context(), producerEvent(2)); err == nil || !strings.Contains(err.Error(), "cannot claim an epoch beyond") {
 		t.Fatalf("Append = %v", err)
+	}
+}
+
+func TestProducer_LargeResponseBodiesAreNotReadInFull(t *testing.T) {
+	var written atomic.Int64
+	ps := scriptedServer(t, func(w http.ResponseWriter, r *http.Request) bool {
+		w.Header().Set("Stream-Next-Offset", padOffset(1))
+		w.WriteHeader(http.StatusOK)
+		chunk := bytes.Repeat([]byte("x"), 32<<10)
+		for range 64 { // 2 MiB, far beyond what the client drains
+			n, err := w.Write(chunk)
+			written.Add(int64(n))
+			if err != nil {
+				return true
+			}
+		}
+		return true
+	})
+	store := newProducerStore(t, ps, "events", ds.WithProducer("w", 0))
+	if offset, err := store.Append(t.Context(), producerEvent(0)); err != nil || offset != eventbus.Offset(padOffset(1)) {
+		t.Fatalf("Append = %q, %v", offset, err)
 	}
 }
