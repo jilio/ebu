@@ -475,7 +475,12 @@ if errors.As(err, &trimmed) { // errors.Is(err, eventbus.ErrOffsetTrimmed)
 
 Reading from `OffsetOldest` is never an error; it starts at the oldest retained
 event. Once `Trim` has removed every event, `OffsetNewest` resolves to the trim
-boundary, so a checkpoint saved then still detects later gaps. The condition is
+boundary, so a checkpoint saved then still detects later gaps. A store that has
+never held an event resolves `OffsetNewest` to `OffsetOldest` (the `EventStore`
+contract), and a checkpoint equal to `OffsetOldest` is never reported as a gap.
+The SQLite store persists such a checkpoint as the concrete position zero, which
+is checked; with other stores, take the checkpoint after the first event when a
+reader must detect trimming from the very start. The condition is
 permanent for that offset, so consumers that retry reads (`Follow`, `Mirror`,
 resumable subscriptions) report it on every attempt until the checkpoint is
 moved. Retention never consults subscriptions or snapshots: bound `Through` by

@@ -56,7 +56,9 @@ const (
 
 var _ eventbus.EventStoreTrimmer = (*SQLiteStore)(nil)
 
-// Trim implements eventbus.EventStoreTrimmer in one write transaction.
+// Trim implements eventbus.EventStoreTrimmer in one write transaction. A zero
+// policy is a query that takes no write lock and also works on read-only
+// stores; any other policy on a read-only store fails with ErrReadOnly.
 //
 // Positions are AUTOINCREMENT keys, so retained offsets never change and
 // removed offsets are never reused. The prefix rules (Through, OlderThan,
@@ -75,11 +77,11 @@ var _ eventbus.EventStoreTrimmer = (*SQLiteStore)(nil)
 // checkpoint waits for every open reader, which a periodic retention job
 // should not do.
 func (s *SQLiteStore) Trim(ctx context.Context, policy eventbus.RetentionPolicy) (result eventbus.TrimResult, err error) {
-	if s.cfg.readOnly {
-		return eventbus.TrimResult{}, ErrReadOnly
-	}
 	if err := policy.Validate(); err != nil {
 		return eventbus.TrimResult{}, err
+	}
+	if policy != (eventbus.RetentionPolicy{}) && s.cfg.readOnly {
+		return eventbus.TrimResult{}, ErrReadOnly
 	}
 	if policy == (eventbus.RetentionPolicy{}) {
 		// A query: report the boundary without taking the write lock or

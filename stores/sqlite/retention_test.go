@@ -283,6 +283,11 @@ func TestTrimKeepsSchemaReadableByEarlierReleases(t *testing.T) {
 	if _, err := reader.Trim(t.Context(), eventbus.RetentionPolicy{MaxEvents: 1}); !errors.Is(err, ErrReadOnly) {
 		t.Fatalf("read-only Trim = %v", err)
 	}
+	// The zero-policy boundary query works on read-only stores, with and
+	// without a retention table.
+	if result, err := reader.Trim(t.Context(), eventbus.RetentionPolicy{}); err != nil || result.TrimmedThrough != eventbus.OffsetOldest {
+		t.Fatalf("read-only boundary query without a table = %+v, %v", result, err)
+	}
 
 	writer, err := New(path)
 	if err != nil {
@@ -299,6 +304,9 @@ func TestTrimKeepsSchemaReadableByEarlierReleases(t *testing.T) {
 	// Readers opened before or after the first Trim see the boundary.
 	if _, _, err := reader.Read(t.Context(), offsets[0], 0); !errors.Is(err, eventbus.ErrOffsetTrimmed) {
 		t.Fatalf("existing read-only store missed the boundary: %v", err)
+	}
+	if result, err := reader.Trim(t.Context(), eventbus.RetentionPolicy{}); err != nil || result.TrimmedThrough != offsets[1] {
+		t.Fatalf("read-only boundary query = %+v, %v", result, err)
 	}
 	_ = reader.Close()
 	reopened, err := OpenReadOnly(path)

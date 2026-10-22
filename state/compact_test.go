@@ -211,8 +211,9 @@ func TestCompactRejections(t *testing.T) {
 	store.saveErr = nil
 
 	failing := &failingTrimStore{compactStore: store, compareErr: errors.New("incomparable")}
-	if _, err := mat.Compact(ctx, failing, "users", offsets[0]); err == nil || !strings.Contains(err.Error(), "incomparable") {
-		t.Fatalf("compare error = %v", err)
+	if result, err := mat.Compact(ctx, failing, "users", offsets[0]); err == nil || !strings.Contains(err.Error(), "incomparable") ||
+		result.Snapshot != offsets[1] || result.Through != eventbus.OffsetOldest || result.Removed != 0 {
+		t.Fatalf("compare error = %+v, %v", result, err)
 	}
 	failing.compareErr, failing.trimErr = nil, errors.New("trim failed")
 	if _, err := mat.Compact(ctx, failing, "users"); err == nil || !strings.Contains(err.Error(), "trim failed") {
