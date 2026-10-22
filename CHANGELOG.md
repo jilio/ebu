@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Durable Streams `WithProducer(id, epoch)` makes `Append` use the protocol's
+  idempotent producer (Producer-Id, Producer-Epoch, Producer-Seq). A retry
+  whose first attempt was committed is deduplicated by the server instead of
+  written twice; when the server reports no offset for it, `Append` returns
+  the stream tail, which covers the event. A writer whose epoch is older than
+  one the server has accepted is fenced with the permanent
+  `ErrProducerFenced` (`*ProducerFencedError`) and writes nothing; reusing an
+  earlier instance's epoch fails with `ErrProducerConflict` rather than being
+  silently dropped as a duplicate. `WithProducerAutoClaim()` claims the next
+  free epoch at the first append (newest instance wins; an instance that owns
+  its epoch never re-claims), and `ProducerEpoch` reports the epoch in use.
+  Producer appends are serialized per store. Stores without the option send
+  no producer headers and keep their at-least-once behavior.
+
 ## [0.20.1] - 2026-09-12
 
 ### Fixed
@@ -955,6 +973,7 @@ Initial release of ebu (Event BUs) - a lightweight, type-safe event bus for Go.
 - `ClearAll`: Remove all handlers
 - `WaitAsync`: Wait for async handlers to complete
 
+[Unreleased]: https://github.com/jilio/ebu/compare/v0.20.1...HEAD
 [0.20.1]: https://github.com/jilio/ebu/compare/v0.20.0...v0.20.1
 [0.20.0]: https://github.com/jilio/ebu/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/jilio/ebu/compare/v0.18.1...v0.19.0

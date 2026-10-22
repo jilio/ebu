@@ -258,6 +258,7 @@ Durable-streams features:
 - Configurable timeouts and HTTP client
 - Server-assigned opaque offsets
 - Projection snapshots (`EventStoreSnapshotter`) on a companion stream
+- Opt-in idempotent, fenced producer (`WithProducer`)
 
 Snapshots live on a reserved companion stream (`<stream>.snap` — the
 constructor rejects stream paths with that suffix): each `SaveSnapshot`
@@ -271,6 +272,45 @@ prefix; the companion stream must **not** be head-trimmed (no earliest-offset
 discovery in the protocol — `LoadSnapshot` fails loudly on a trimmed head),
 though expiring it whole is safe and reads as "no snapshot". See the package
 documentation for details.
+
+#### Idempotent, fenced producers
+
+By default every `Append` is an independent POST and a retry whose first
+attempt was committed (but whose response was lost) stores the event twice;
+consumers deduplicate on `Event.ID`. `WithProducer` switches the store to the
+protocol's idempotent producer (Producer-Id / Producer-Epoch / Producer-Seq):
+
+```go
+store, err := durablestream.New(baseURL, "orders",
+    durablestream.WithProducer("orders-writer", epoch),
+)
+```
+
+- **Retries are written once.** Retries reuse the append's sequence number, so
+  the server recognizes a retry of a committed attempt and does not write it
+  again. Such a deduplicated append reports no offset; `Append` returns the
+  stream's current tail, which covers the event.
+- **Stale writers are fenced.** Once the server has accepted an append with a
+  higher epoch for the same producer ID, appends from an older epoch fail with
+  `durablestream.ErrProducerFenced` (`*ProducerFencedError` carries both
+  epochs) and nothing is written. Fencing is permanent for that `Store`.
+- **Every live instance needs its own, newer epoch.** Pass one that is strictly
+  greater than any earlier instance's (a lease generation, a durable counter),
+  or add `WithProducerAutoClaim()` to claim the next free epoch from the server
+  at the first append: the newest instance then wins. Claiming happens only
+  before the store's first accepted append, so two live instances cannot keep
+  taking the producer from each other. `ProducerEpoch` reports the epoch in use.
+  Reusing an old epoch is reported as `ErrProducerConflict` instead of the event
+  being discarded as a duplicate.
+- **Appends are serialized per store**, because sequence numbers must reach the
+  server in order. When an `Append` gives up, its sequence number may or may
+  not have been committed; the next append resolves this with the server's
+  expected sequence, never writing an event twice or under another's number.
+
+Exactly-once within an epoch depends on the server committing producer state
+atomically with the data (the protocol's atomicity requirement). Snapshots on
+the companion stream are not fenced. Plain stores send no producer headers and
+behave as before.
 
 ## Replay Patterns
 
