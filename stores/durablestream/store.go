@@ -594,7 +594,9 @@ func (s *Store) Tail(ctx context.Context, from eventbus.Offset) iter.Seq2[*event
 // ResumeFrom is OffsetOldest, from which a conforming server serves the
 // retained log. A read from OffsetOldest itself is never trimmed; there a 410
 // means the stream is gone (soft-deleted), so err is returned unchanged.
-// errors.Is still matches the client's ErrOffsetGone.
+// errors.Is still matches the client's ErrOffsetGone. A concrete offset that
+// a Tail resolved from OffsetNewest is treated the same way: retention that
+// dropped data after it is still a gap for that reader.
 func trimmedOffsetError(from eventbus.Offset, err error) error {
 	if from == eventbus.OffsetOldest || !errors.Is(err, durablestreams.ErrOffsetGone) {
 		return err
