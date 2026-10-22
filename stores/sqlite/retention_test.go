@@ -327,15 +327,19 @@ func TestTrimErrors(t *testing.T) {
 		t.Fatalf("cancelled Trim = %v", err)
 	}
 
-	// A corrupt boundary row surfaces on Trim and on reads.
-	if _, err := store.Trim(ctx, eventbus.RetentionPolicy{}); err != nil {
+	// A corrupt boundary row surfaces on Trim (as a query and as a write)
+	// and on reads. A policy that removes nothing still creates the table.
+	if _, err := store.Trim(ctx, eventbus.RetentionPolicy{MaxEvents: 100}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.db.Exec("INSERT INTO ebu_retention (id, trimmed_through) VALUES (1, 'garbage')"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Trim(ctx, eventbus.RetentionPolicy{}); err == nil || !strings.Contains(err.Error(), "read boundary") {
+	if _, err := store.Trim(ctx, eventbus.RetentionPolicy{MaxEvents: 100}); err == nil || !strings.Contains(err.Error(), "read boundary") {
 		t.Fatalf("Trim with a corrupt boundary = %v", err)
+	}
+	if _, err := store.Trim(ctx, eventbus.RetentionPolicy{}); err == nil || !strings.Contains(err.Error(), "read trim boundary") {
+		t.Fatalf("zero-policy Trim with a corrupt boundary = %v", err)
 	}
 	// A read that returns the immediate successor cannot have crossed a
 	// prefix trim and skips the lookup; any other read consults it.
@@ -356,7 +360,7 @@ func TestTrimErrors(t *testing.T) {
 		want                       string
 	}{
 		{"create", "DROP TABLE ebu_retention; CREATE INDEX ebu_retention ON events(type)", "DROP INDEX ebu_retention",
-			eventbus.RetentionPolicy{}, "create retention table"},
+			eventbus.RetentionPolicy{MaxEvents: 100}, "create retention table"},
 		{"timestamps", "ALTER TABLE events RENAME COLUMN timestamp TO ts", "ALTER TABLE events RENAME COLUMN ts TO timestamp",
 			eventbus.RetentionPolicy{OlderThan: trimEpoch.Add(time.Hour)}, "scan timestamps"},
 		{"count boundary", "ALTER TABLE events RENAME TO events_moved; CREATE VIEW events AS SELECT 'x' AS position, * FROM events_moved",
@@ -586,8 +590,17 @@ func TestTrimAgeScanIterationFailure(t *testing.T) {
 func TestTrimBoundaryTableWithoutABoundary(t *testing.T) {
 	store := newTrimStore(t)
 	offsets := appendTrimEvents(t, store, 3, nil)
+	// A zero policy is a query: it takes no write lock and creates nothing.
 	if result, err := store.Trim(t.Context(), eventbus.RetentionPolicy{}); err != nil || result.TrimmedThrough != eventbus.OffsetOldest {
 		t.Fatalf("zero Trim = %+v, %v", result, err)
+	}
+	var tables int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name = 'ebu_retention'`).Scan(&tables); err != nil || tables != 0 {
+		t.Fatalf("a zero-policy Trim created the retention table (%d, %v)", tables, err)
+	}
+	// A policy that removes nothing creates the table without a boundary.
+	if result, err := store.Trim(t.Context(), eventbus.RetentionPolicy{MaxEvents: 100}); err != nil || result.Deleted != 0 || result.TrimmedThrough != eventbus.OffsetOldest {
+		t.Fatalf("no-op Trim = %+v, %v", result, err)
 	}
 	// Reading from the tail returns nothing and so consults the table.
 	if events, next, err := store.Read(t.Context(), offsets[2], 0); err != nil || len(events) != 0 || next != offsets[2] {
@@ -679,5 +692,33 @@ func TestTrimConcreteZeroCheckpointIsChecked(t *testing.T) {
 	// The symbolic start of the log is never a gap.
 	if events, _, err := store.Read(ctx, eventbus.OffsetOldest, 0); err != nil || len(events) != 2 {
 		t.Fatalf("Read(OffsetOldest) = %d events, %v", len(events), err)
+	}
+}
+
+// A zero-policy Trim is a query and works while another connection holds
+// the write lock, unlike a Trim that removes events.
+func TestZeroPolicyTrimTakesNoWriteLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	store, err := New(path, WithBusyTimeout(20*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	offsets := appendTrimEvents(t, store, 3, nil)
+	if _, err := store.Trim(t.Context(), eventbus.RetentionPolicy{Through: offsets[0]}); err != nil {
+		t.Fatal(err)
+	}
+	holder, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close()
+	tx, err := holder.db.BeginTx(t.Context(), nil) // BEGIN IMMEDIATE
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if result, err := store.Trim(t.Context(), eventbus.RetentionPolicy{}); err != nil || result.TrimmedThrough != offsets[0] {
+		t.Fatalf("zero-policy Trim under a held write lock = %+v, %v", result, err)
 	}
 }
