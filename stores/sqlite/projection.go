@@ -72,7 +72,8 @@ type ProjectionConfig struct {
 	// runs inside the transaction that also advances the checkpoint, so its
 	// writes commit exactly when the checkpoint moves past the event. It must
 	// not have effects outside tx, and should stay fast: the batch holds the
-	// database's write lock, delaying appends to the same file. An error (or
+	// database's write lock, delaying appends to the same file (which wait
+	// up to the store's busy timeout, then fail). An error (or
 	// panic) rolls back the whole batch; CatchUp returns the error and the
 	// next CatchUp retries from the same checkpoint. Required.
 	Apply func(ctx context.Context, tx *sql.Tx, event *eventbus.StoredEvent) error
@@ -147,7 +148,7 @@ func (s *SQLiteStore) OpenProjection(ctx context.Context, cfg ProjectionConfig) 
 
 	var checkpoint string
 	err = s.inTx(ctx, fmt.Sprintf("sqlite: projection %q", cfg.Name), func(tx *sql.Tx) (txErr error) {
-		checkpoint, txErr = openProjectionInTx(ctx, tx, cfg, foreignTrimmed, foreignErr)
+		checkpoint, txErr = openProjectionInTx(ctx, tx, cfg, cfg.Source == eventbus.EventStore(s), foreignTrimmed, foreignErr)
 		return txErr
 	})
 	if err != nil {
@@ -161,7 +162,7 @@ func (s *SQLiteStore) OpenProjection(ctx context.Context, cfg ProjectionConfig) 
 
 // openProjectionInTx registers or resumes cfg.Name inside tx (see
 // OpenProjection) and returns the checkpoint to resume from.
-func openProjectionInTx(ctx context.Context, tx *sql.Tx, cfg ProjectionConfig, foreignTrimmed eventbus.Offset, foreignErr error) (string, error) {
+func openProjectionInTx(ctx context.Context, tx *sql.Tx, cfg ProjectionConfig, sameDB bool, foreignTrimmed eventbus.Offset, foreignErr error) (string, error) {
 	if _, err := tx.ExecContext(ctx, createProjectionsTable); err != nil {
 		return "", fmt.Errorf("sqlite: projection %q: create checkpoint table: %w", cfg.Name, err)
 	}
@@ -177,16 +178,14 @@ func openProjectionInTx(ctx context.Context, tx *sql.Tx, cfg ProjectionConfig, f
 		return "", fmt.Errorf("%w: projection %q is stored at version %d, newer than %d", ErrProjectionRebuild, cfg.Name, version, cfg.Version)
 	case version < cfg.Version:
 		if cfg.Reset == nil {
-			return "", fmt.Errorf("sqlite: projection %q is stored at version %d; rebuilding it at version %d requires Reset", cfg.Name, version, cfg.Version)
+			return "", fmt.Errorf("%w: projection %q is stored at version %d; rebuilding it at version %d requires Reset", ErrProjectionRebuild, cfg.Name, version, cfg.Version)
 		}
-		trimmed, err := foreignTrimmed, foreignErr
+		trimmed, trimErr := foreignTrimmed, foreignErr
 		if src, ok := cfg.Source.(*SQLiteStore); ok {
-			// A read on another connection; WAL readers do not wait for
-			// this transaction's write lock.
-			trimmed, err = sourceTrimmedThrough(ctx, src)
+			trimmed, trimErr = sqliteSourceTrimmedThrough(ctx, tx, src, sameDB)
 		}
-		if err != nil {
-			return "", fmt.Errorf("sqlite: projection %q: check source before rebuild: %w", cfg.Name, err)
+		if trimErr != nil {
+			return "", fmt.Errorf("sqlite: projection %q: check source before rebuild: %w", cfg.Name, trimErr)
 		}
 		if trimmed != eventbus.OffsetOldest {
 			return "", fmt.Errorf("%w: projection %q: the source was trimmed through %q, so a rebuild from OffsetOldest would be incomplete; migrate the tables in Setup and keep Version %d",
@@ -309,6 +308,12 @@ func (p *Projection) CatchUp(ctx context.Context) (eventbus.Offset, error) {
 		if err := p.applyBatch(ctx, from, events, next); err != nil {
 			return p.Checkpoint(), err
 		}
+		if len(events) == 0 {
+			// An empty read that only advanced the resume token: it is
+			// persisted, and there was nothing more to apply. Returning here
+			// also bounds a source that would advance its token forever.
+			return p.Checkpoint(), nil
+		}
 	}
 }
 
@@ -351,6 +356,23 @@ func (p *Projection) applyBatch(ctx context.Context, from eventbus.Offset, event
 		p.setCheckpoint(next)
 	}
 	return nil
+}
+
+// sqliteSourceTrimmedThrough reads the trim boundary of a SQLite source while
+// the projection's transaction holds this database's write lock. When the
+// source is this very store it reads through tx: a second connection might
+// not exist (a pool capped at one connection) and the transaction already
+// sees the database. Another SQLite store is read through its own pool; WAL
+// readers do not wait for this transaction.
+func sqliteSourceTrimmedThrough(ctx context.Context, tx *sql.Tx, src *SQLiteStore, sameDB bool) (eventbus.Offset, error) {
+	if !sameDB {
+		return sourceTrimmedThrough(ctx, src)
+	}
+	watermark, _, err := lookupBoundary(ctx, tx, false)
+	if err != nil || watermark == 0 {
+		return eventbus.OffsetOldest, err
+	}
+	return formatOffset(watermark), nil
 }
 
 // sourceTrimmedThrough reports the trim boundary of a projection source:

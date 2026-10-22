@@ -781,3 +781,73 @@ func TestProjectionCommittedLoadFailure(t *testing.T) {
 		t.Fatalf("CatchUp = %v", err)
 	}
 }
+
+// Review-bot finding: with the same store as source and a pool capped at one
+// connection, the rebuild guard must not need a second connection.
+func TestProjectionRebuildWithASingleConnection(t *testing.T) {
+	for _, trimmed := range []bool{false, true} {
+		store := newTrimStore(t)
+		offsets := appendGroups(t, store, 3)
+		if trimmed {
+			if _, err := store.Trim(t.Context(), eventbus.RetentionPolicy{Through: offsets[0]}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		store.db.SetMaxOpenConns(1)
+		cfg := (&counterProjection{}).config("groups", store, 0)
+		if _, err := store.OpenProjection(t.Context(), cfg); err != nil {
+			t.Fatal(err)
+		}
+		cfg.Version = 2
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		_, err := store.OpenProjection(ctx, cfg)
+		cancel()
+		switch {
+		case errors.Is(err, context.DeadlineExceeded):
+			t.Fatalf("trimmed=%v: the rebuild guard deadlocked on a single connection", trimmed)
+		case trimmed && !errors.Is(err, ErrProjectionRebuild):
+			t.Fatalf("rebuild over a trimmed source = %v, want ErrProjectionRebuild", err)
+		case !trimmed && err != nil:
+			t.Fatalf("rebuild = %v", err)
+		}
+	}
+}
+
+func TestProjectionMissingResetIsARebuildError(t *testing.T) {
+	store := newTrimStore(t)
+	cfg := (&counterProjection{}).config("groups", store, 0)
+	if _, err := store.OpenProjection(t.Context(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Version, cfg.Reset = 2, nil
+	if _, err := store.OpenProjection(t.Context(), cfg); !errors.Is(err, ErrProjectionRebuild) || !strings.Contains(err.Error(), "requires Reset") {
+		t.Fatalf("OpenProjection = %v", err)
+	}
+}
+
+// The rebuild guard reads another SQLite store's boundary through that
+// store's own pool.
+func TestProjectionRebuildOverAnotherSQLiteStore(t *testing.T) {
+	for _, trimmed := range []bool{false, true} {
+		source := newTrimStore(t)
+		offsets := appendGroups(t, source, 3)
+		if trimmed {
+			if _, err := source.Trim(t.Context(), eventbus.RetentionPolicy{Through: offsets[0]}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		db := newTrimStore(t)
+		cfg := (&counterProjection{}).config("groups", source, 0)
+		if _, err := db.OpenProjection(t.Context(), cfg); err != nil {
+			t.Fatal(err)
+		}
+		cfg.Version = 2
+		_, err := db.OpenProjection(t.Context(), cfg)
+		if trimmed && (!errors.Is(err, ErrProjectionRebuild) || !strings.Contains(err.Error(), string(offsets[0]))) {
+			t.Fatalf("rebuild over a trimmed SQLite source = %v", err)
+		}
+		if !trimmed && err != nil {
+			t.Fatalf("rebuild over an untrimmed SQLite source = %v", err)
+		}
+	}
+}

@@ -194,7 +194,9 @@ for `(msg.Type, msg.Key)`, mapping the fields you query into indexed columns.
   rolling back to an older binary never discards a newer projection; roll the
   projection forward, or reset it deliberately.
 - **Batches hold the write lock.** A batch runs inside one write transaction,
-  so a slow `Apply` or a large `BatchSize` delays appends to the same file.
+  so a slow `Apply` or a large `BatchSize` delays appends to the same file;
+  those appends wait up to the store's busy timeout (`WithBusyTimeout`), then
+  fail.
   Keep `Apply` free of external I/O, and lower `BatchSize` when `Apply` is
   heavy (larger batches amortize commits; smaller ones release the lock
   sooner). A panicking `Apply` rolls its batch back and releases the lock.
