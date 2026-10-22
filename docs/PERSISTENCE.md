@@ -1017,9 +1017,8 @@ positions are source offsets scoped by relationship ID and log generation.
 A successful destination Append carries that store's guarantees: MemoryStore is
 not durable, SQLite's default WAL `synchronous=NORMAL` is not a
 destination-power-loss guarantee for the latest commit (use
-`sqlite.WithSynchronous(sqlite.SynchronousFull)`), and a remote acknowledgement
-depends on server
-storage configuration. Use a destination outside the source worker's failure
+`sqlite.WithSynchronous(sqlite.SynchronousFull)`), and a remote
+acknowledgement depends on server storage configuration. Use a destination outside the source worker's failure
 domain and configure its acknowledgement policy explicitly. Replication cannot
 strengthen an acknowledgement returned too early by a backend.
 

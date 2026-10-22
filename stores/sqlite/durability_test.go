@@ -132,13 +132,14 @@ func TestDurabilityChildAppendsUntilKilled(t *testing.T) {
 	}
 }
 
-// TestFullSynchronousAcknowledgedAppendsSurviveProcessKill kills a writer
-// without any shutdown and checks that every acknowledged append is present
-// and that the recovered log is the ordered, gap-free prefix of what the
-// writer appended. A process kill cannot simulate power loss (the operating
-// system still flushes its page cache); the PRAGMA checks above cover the
-// setting that makes the same guarantee hold for power loss.
-func TestFullSynchronousAcknowledgedAppendsSurviveProcessKill(t *testing.T) {
+// TestAcknowledgedAppendsSurviveProcessKill is a crash-consistency smoke
+// test: it kills a SynchronousFull writer without any shutdown and checks
+// that every acknowledged append is present and that the recovered log is
+// the ordered, gap-free prefix of what the writer appended. It would also pass
+// with SynchronousNormal, because a process kill cannot simulate power loss
+// (the operating system still holds the written pages); the PRAGMA checks
+// above cover the setting that extends the guarantee to power loss.
+func TestAcknowledgedAppendsSurviveProcessKill(t *testing.T) {
 	if testing.Short() {
 		t.Skip("spawns a child process")
 	}
@@ -159,6 +160,11 @@ func TestFullSynchronousAcknowledgedAppendsSurviveProcessKill(t *testing.T) {
 			_ = cmd.Wait()
 		}
 	})
+
+	// Fail fast instead of hanging if the child stalls: killing it closes
+	// stdout and ends the scan below.
+	stall := time.AfterFunc(30*time.Second, func() { _ = cmd.Process.Kill() })
+	defer stall.Stop()
 
 	const killAfter = 50
 	acked := 0
