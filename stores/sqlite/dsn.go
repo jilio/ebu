@@ -11,6 +11,10 @@ import (
 // after construction. Running connection-scoped pragmas through db.Exec would
 // configure only the connection handed out by the pool at that moment.
 func buildDSN(cfg *config) (string, error) {
+	// Read-only stores never write, so their durability setting is ignored.
+	if !cfg.readOnly && cfg.synchronous != SynchronousNormal && cfg.synchronous != SynchronousFull {
+		return "", fmt.Errorf("sqlite: unsupported synchronous mode %v", cfg.synchronous)
+	}
 	if cfg.path == ":memory:" {
 		// Shared cache mode lets pooled connections see the same database.
 		// Each store gets a unique name so independent stores stay isolated.
@@ -38,7 +42,7 @@ func buildDSN(cfg *config) (string, error) {
 		query.Set("mode", "ro")
 		query.Add("_pragma", "query_only(1)")
 	} else {
-		query.Add("_pragma", "synchronous(NORMAL)")
+		query.Add("_pragma", "synchronous("+cfg.synchronous.String()+")")
 		// Immediate transactions take the write lock at BEGIN (honoring
 		// busy_timeout) instead of upgrading mid-transaction, which can
 		// return SQLITE_BUSY immediately. Only migrations use them here.

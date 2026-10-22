@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"fmt"
 	"time"
 )
 
@@ -32,6 +33,7 @@ type config struct {
 	busyTimeout     time.Duration
 	autoMigrate     bool
 	readOnly        bool
+	synchronous     Synchronous
 	logger          Logger
 	metricsHook     MetricsHook
 	streamBatchSize int
@@ -43,6 +45,53 @@ func defaultConfig() *config {
 		busyTimeout:     5 * time.Second,
 		autoMigrate:     true,
 		streamBatchSize: defaultStreamBatchSize,
+	}
+}
+
+// Synchronous selects how a writable file-backed store syncs commits to stable
+// storage: the trade-off between append latency and durability across power
+// loss or an operating-system crash. Every store runs in WAL mode, where both
+// settings keep the database consistent; they differ in which acknowledged
+// commits can be lost.
+type Synchronous int
+
+const (
+	// SynchronousNormal (the default) syncs the write-ahead log only when it is
+	// checkpointed. A process crash loses nothing, but a power loss or OS crash
+	// can roll back the most recent acknowledged commits — Append, SaveOffset,
+	// SaveSnapshot and TruncateBefore alike. Commits are never reordered: a
+	// rollback removes a suffix of commits, never one in the middle.
+	SynchronousNormal Synchronous = iota
+
+	// SynchronousFull syncs the write-ahead log before every commit returns, so
+	// an acknowledged commit survives power loss and OS crashes, provided the
+	// storage stack honors sync requests (on macOS, fsync does not flush the
+	// drive's cache). Each write pays for one sync; group writes into fewer
+	// commits when throughput matters.
+	SynchronousFull
+)
+
+// String returns the SQLite pragma value for the mode.
+func (s Synchronous) String() string {
+	switch s {
+	case SynchronousNormal:
+		return "NORMAL"
+	case SynchronousFull:
+		return "FULL"
+	default:
+		return fmt.Sprintf("Synchronous(%d)", int(s))
+	}
+}
+
+// WithSynchronous sets the synchronous mode of every pooled connection a
+// writable store opens (see Synchronous). The default, SynchronousNormal,
+// preserves the behavior of earlier releases; choose SynchronousFull when an
+// acknowledged write must survive power loss. Stores opened with OpenReadOnly
+// never write and ignore this option; :memory: stores have nothing to sync.
+// New rejects values other than the declared constants.
+func WithSynchronous(mode Synchronous) Option {
+	return func(c *config) {
+		c.synchronous = mode
 	}
 }
 

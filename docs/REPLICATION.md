@@ -18,8 +18,10 @@ the destination must be outside that worker's failure domain. Its successful
 `Append` must mean the storage durability you require: ebu cannot turn an
 in-memory store, buffered write, or HTTP server that acknowledges before durable
 storage into a durable replica. `MemoryStore` examples demonstrate the API only.
-SQLite uses WAL with `synchronous=NORMAL`; this is not a promise that the latest
-commit survives power loss on the destination. A Durable Streams acknowledgement
+SQLite uses WAL with `synchronous=NORMAL` by default; this is not a promise that
+the latest commit survives power loss on the destination. Open the destination
+with `sqlite.WithSynchronous(sqlite.SynchronousFull)` when it must be. A Durable
+Streams acknowledgement
 inherits the server/backend's configured guarantees. Do not silently downgrade
 an important operation when that destination is unavailable.
 
