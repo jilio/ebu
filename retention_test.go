@@ -374,3 +374,32 @@ func TestMemoryStoreTrimEmptyValueSharesTheKeylessPartition(t *testing.T) {
 		t.Fatalf("Trim = %+v, %v, retained %q", result, err, retainedIDs(t, store))
 	}
 }
+
+// Codex review finding: after Trim removed every event, OffsetNewest must
+// resolve to the trim boundary, not OffsetOldest, so a checkpoint taken then
+// still detects later gaps.
+func TestMemoryStoreNewestAfterTrimmingEverything(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	offsets := appendRetentionEvents(t, store, 3, nil)
+	if _, err := store.Trim(ctx, RetentionPolicy{Through: offsets[2]}); err != nil {
+		t.Fatal(err)
+	}
+	_, tail, err := store.Read(ctx, OffsetNewest, 0)
+	if err != nil || tail != offsets[2] {
+		t.Fatalf("Read(OffsetNewest) = %q, %v; want the boundary %q", tail, err, offsets[2])
+	}
+	if err := store.SaveOffset(ctx, "reader", OffsetNewest); err != nil {
+		t.Fatal(err)
+	}
+	if saved, _ := store.LoadOffset(ctx, "reader"); saved != offsets[2] {
+		t.Fatalf("SaveOffset(OffsetNewest) stored %q", saved)
+	}
+	more := appendRetentionEvents(t, store, 3, nil)
+	if _, err := store.Trim(ctx, RetentionPolicy{Through: more[1]}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.Read(ctx, tail, 0); !errors.Is(err, ErrOffsetTrimmed) {
+		t.Fatalf("Read from the checkpoint = %v, want ErrOffsetTrimmed", err)
+	}
+}

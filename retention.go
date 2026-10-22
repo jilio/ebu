@@ -60,6 +60,10 @@ func (e *OffsetTrimmedError) Unwrap() []error {
 // MaxPerPartition instead removes events from inside the log, like key-based
 // log compaction: it keeps the newest events of each partition. Readers are
 // not told about those removals; they observe only what remains.
+//
+// The rules combine: an event is removed when any rule selects it, so the
+// strictest prefix rule decides how far the prefix goes, and the partition
+// cap then applies to what remains.
 type RetentionPolicy struct {
 	// Through removes every event at or before this offset. It must be a
 	// concrete offset issued by the store; OffsetOldest disables the rule.
@@ -118,8 +122,9 @@ type TrimResult struct {
 // RetentionPolicy while keeping offsets stable: it bounds a log by offset,
 // age, total count and per-partition count, and gives readers whose position
 // fell behind the trimmed prefix a clear ErrOffsetTrimmed signal (see
-// RetentionPolicy). Trim with a zero policy removes nothing and reports the
-// current TrimmedThrough.
+// RetentionPolicy). Implementations must treat a zero policy as a query: it
+// removes nothing and reports the current TrimmedThrough, and callers rely on
+// that to read the boundary.
 //
 // Retention never consults subscriptions or snapshots. Trimming past a
 // checkpoint that a reader still needs makes that reader fail with

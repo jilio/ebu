@@ -283,6 +283,11 @@ func TestTrimKeepsSchemaReadableByEarlierReleases(t *testing.T) {
 	if _, err := reader.Trim(t.Context(), eventbus.RetentionPolicy{MaxEvents: 1}); !errors.Is(err, ErrReadOnly) {
 		t.Fatalf("read-only Trim = %v", err)
 	}
+	// The zero-policy boundary query works on read-only stores, with and
+	// without a retention table.
+	if result, err := reader.Trim(t.Context(), eventbus.RetentionPolicy{}); err != nil || result.TrimmedThrough != eventbus.OffsetOldest {
+		t.Fatalf("read-only boundary query without a table = %+v, %v", result, err)
+	}
 
 	writer, err := New(path)
 	if err != nil {
@@ -299,6 +304,9 @@ func TestTrimKeepsSchemaReadableByEarlierReleases(t *testing.T) {
 	// Readers opened before or after the first Trim see the boundary.
 	if _, _, err := reader.Read(t.Context(), offsets[0], 0); !errors.Is(err, eventbus.ErrOffsetTrimmed) {
 		t.Fatalf("existing read-only store missed the boundary: %v", err)
+	}
+	if result, err := reader.Trim(t.Context(), eventbus.RetentionPolicy{}); err != nil || result.TrimmedThrough != offsets[1] {
+		t.Fatalf("read-only boundary query = %+v, %v", result, err)
 	}
 	_ = reader.Close()
 	reopened, err := OpenReadOnly(path)
@@ -327,15 +335,19 @@ func TestTrimErrors(t *testing.T) {
 		t.Fatalf("cancelled Trim = %v", err)
 	}
 
-	// A corrupt boundary row surfaces on Trim and on reads.
-	if _, err := store.Trim(ctx, eventbus.RetentionPolicy{}); err != nil {
+	// A corrupt boundary row surfaces on Trim (as a query and as a write)
+	// and on reads. A policy that removes nothing still creates the table.
+	if _, err := store.Trim(ctx, eventbus.RetentionPolicy{MaxEvents: 100}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.db.Exec("INSERT INTO ebu_retention (id, trimmed_through) VALUES (1, 'garbage')"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Trim(ctx, eventbus.RetentionPolicy{}); err == nil || !strings.Contains(err.Error(), "read boundary") {
+	if _, err := store.Trim(ctx, eventbus.RetentionPolicy{MaxEvents: 100}); err == nil || !strings.Contains(err.Error(), "read boundary") {
 		t.Fatalf("Trim with a corrupt boundary = %v", err)
+	}
+	if _, err := store.Trim(ctx, eventbus.RetentionPolicy{}); err == nil || !strings.Contains(err.Error(), "read trim boundary") {
+		t.Fatalf("zero-policy Trim with a corrupt boundary = %v", err)
 	}
 	// A read that returns the immediate successor cannot have crossed a
 	// prefix trim and skips the lookup; any other read consults it.
@@ -356,7 +368,7 @@ func TestTrimErrors(t *testing.T) {
 		want                       string
 	}{
 		{"create", "DROP TABLE ebu_retention; CREATE INDEX ebu_retention ON events(type)", "DROP INDEX ebu_retention",
-			eventbus.RetentionPolicy{}, "create retention table"},
+			eventbus.RetentionPolicy{MaxEvents: 100}, "create retention table"},
 		{"timestamps", "ALTER TABLE events RENAME COLUMN timestamp TO ts", "ALTER TABLE events RENAME COLUMN ts TO timestamp",
 			eventbus.RetentionPolicy{OlderThan: trimEpoch.Add(time.Hour)}, "scan timestamps"},
 		{"count boundary", "ALTER TABLE events RENAME TO events_moved; CREATE VIEW events AS SELECT 'x' AS position, * FROM events_moved",
@@ -534,5 +546,187 @@ func TestTrimEmptyLog(t *testing.T) {
 	}
 	if offset, err := store.Append(t.Context(), &eventbus.Event{Type: "t", Data: json.RawMessage(`1`), Timestamp: time.Now()}); err != nil || offset != formatOffset(1) {
 		t.Fatalf("Append after an empty Trim = %q, %v", offset, err)
+	}
+}
+
+// TestTrimCommitFailureKeepsEvents makes COMMIT itself fail: a deferred
+// foreign key from another table references a trimmed event, and SQLite only
+// checks deferred constraints at commit.
+func TestTrimCommitFailureKeepsEvents(t *testing.T) {
+	store := newTrimStore(t)
+	offsets := appendTrimEvents(t, store, 3, nil)
+	store.db.SetMaxOpenConns(1) // the PRAGMA below is per connection
+	for _, statement := range []string{
+		"PRAGMA foreign_keys = ON",
+		"CREATE TABLE refs (event INTEGER REFERENCES events(position) DEFERRABLE INITIALLY DEFERRED)",
+		"INSERT INTO refs VALUES (1)",
+	} {
+		if _, err := store.db.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.Trim(t.Context(), eventbus.RetentionPolicy{Through: offsets[0]}); err == nil || !strings.Contains(err.Error(), "trim: commit") {
+		t.Fatalf("Trim = %v, want a commit failure", err)
+	}
+	if got := trimmedIDs(t, store); got != "e1,e2,e3" {
+		t.Fatalf("a failed commit removed events: %q", got)
+	}
+	if _, _, err := store.Read(t.Context(), offsets[0], 0); err != nil {
+		t.Fatalf("a failed commit recorded a boundary: %v", err)
+	}
+}
+
+// TestTrimAgeScanIterationFailure fails the timestamp scan between rows (a
+// step error, reported by rows.Err rather than by Query or Scan).
+func TestTrimAgeScanIterationFailure(t *testing.T) {
+	store := newTrimStore(t)
+	appendTrimEvents(t, store, 3, nil)
+	if _, err := store.db.Exec(`ALTER TABLE events RENAME TO events_moved;
+		CREATE VIEW events AS SELECT position, type, data,
+			CASE WHEN position = 2 THEN json_extract('not json', '$') ELSE timestamp END AS timestamp
+		FROM events_moved`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Trim(t.Context(), eventbus.RetentionPolicy{OlderThan: trimEpoch.Add(time.Hour)}); err == nil || !strings.Contains(err.Error(), "scan timestamps") || !strings.Contains(err.Error(), "malformed JSON") {
+		t.Fatalf("Trim = %v, want an iteration failure", err)
+	}
+}
+
+// TestTrimBoundaryTableWithoutABoundary covers a retention table that exists
+// but holds no boundary yet: a zero-policy Trim creates it without removing
+// anything, and readers must treat that as "nothing trimmed".
+func TestTrimBoundaryTableWithoutABoundary(t *testing.T) {
+	store := newTrimStore(t)
+	offsets := appendTrimEvents(t, store, 3, nil)
+	// A zero policy is a query: it takes no write lock and creates nothing.
+	if result, err := store.Trim(t.Context(), eventbus.RetentionPolicy{}); err != nil || result.TrimmedThrough != eventbus.OffsetOldest {
+		t.Fatalf("zero Trim = %+v, %v", result, err)
+	}
+	var tables int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name = 'ebu_retention'`).Scan(&tables); err != nil || tables != 0 {
+		t.Fatalf("a zero-policy Trim created the retention table (%d, %v)", tables, err)
+	}
+	// A policy that removes nothing creates the table without a boundary.
+	if result, err := store.Trim(t.Context(), eventbus.RetentionPolicy{MaxEvents: 100}); err != nil || result.Deleted != 0 || result.TrimmedThrough != eventbus.OffsetOldest {
+		t.Fatalf("no-op Trim = %+v, %v", result, err)
+	}
+	// Reading from the tail returns nothing and so consults the table.
+	if events, next, err := store.Read(t.Context(), offsets[2], 0); err != nil || len(events) != 0 || next != offsets[2] {
+		t.Fatalf("Read from the tail = %d, %q, %v", len(events), next, err)
+	}
+}
+
+// TestTrimBeginFailure holds the write lock on another connection, so the
+// Trim transaction cannot begin within the busy timeout.
+func TestTrimBeginFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	store, err := New(path, WithBusyTimeout(20*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	holder, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close()
+	tx, err := holder.db.BeginTx(t.Context(), nil) // BEGIN IMMEDIATE
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := store.Trim(t.Context(), eventbus.RetentionPolicy{MaxEvents: 1}); err == nil || !strings.Contains(err.Error(), "sqlite: trim: begin") {
+		t.Fatalf("Trim = %v, want a begin failure", err)
+	}
+}
+
+// Codex review finding: after Trim removed every event, OffsetNewest must
+// resolve to the trim boundary (not OffsetOldest or a concrete zero), and a
+// concrete zero checkpoint is checked like any other position.
+func TestTrimNewestAfterTrimmingEverything(t *testing.T) {
+	ctx := t.Context()
+	store := newTrimStore(t)
+	offsets := appendTrimEvents(t, store, 3, nil)
+	if _, err := store.Trim(ctx, eventbus.RetentionPolicy{Through: offsets[2]}); err != nil {
+		t.Fatal(err)
+	}
+	_, tail, err := store.Read(ctx, eventbus.OffsetNewest, 0)
+	if err != nil || tail != offsets[2] {
+		t.Fatalf("Read(OffsetNewest) = %q, %v; want the boundary %q", tail, err, offsets[2])
+	}
+	if err := store.SaveOffset(ctx, "reader", eventbus.OffsetNewest); err != nil {
+		t.Fatal(err)
+	}
+	if saved, _ := store.LoadOffset(ctx, "reader"); saved != offsets[2] {
+		t.Fatalf("SaveOffset(OffsetNewest) stored %q", saved)
+	}
+	more := appendTrimEvents(t, store, 3, nil)
+	if _, err := store.Trim(ctx, eventbus.RetentionPolicy{Through: more[1]}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.Read(ctx, tail, 0); !errors.Is(err, eventbus.ErrOffsetTrimmed) {
+		t.Fatalf("Read from the checkpoint = %v, want ErrOffsetTrimmed", err)
+	}
+	for _, err := range store.ReadStream(ctx, tail) {
+		if !errors.Is(err, eventbus.ErrOffsetTrimmed) {
+			t.Fatalf("ReadStream from the checkpoint = %v", err)
+		}
+	}
+}
+
+func TestTrimConcreteZeroCheckpointIsChecked(t *testing.T) {
+	ctx := t.Context()
+	store := newTrimStore(t)
+	// A checkpoint saved while the log was still empty.
+	if err := store.SaveOffset(ctx, "early", eventbus.OffsetNewest); err != nil {
+		t.Fatal(err)
+	}
+	zero, _ := store.LoadOffset(ctx, "early")
+	if zero != formatOffset(0) {
+		t.Fatalf("checkpoint = %q", zero)
+	}
+	offsets := appendTrimEvents(t, store, 4, nil)
+	if _, err := store.Trim(ctx, eventbus.RetentionPolicy{Through: offsets[1]}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.Read(ctx, zero, 0); !errors.Is(err, eventbus.ErrOffsetTrimmed) {
+		t.Fatalf("Read from a concrete zero checkpoint = %v, want ErrOffsetTrimmed", err)
+	}
+	for _, err := range store.ReadStream(ctx, zero) {
+		if !errors.Is(err, eventbus.ErrOffsetTrimmed) {
+			t.Fatalf("ReadStream from a concrete zero checkpoint = %v", err)
+		}
+	}
+	// The symbolic start of the log is never a gap.
+	if events, _, err := store.Read(ctx, eventbus.OffsetOldest, 0); err != nil || len(events) != 2 {
+		t.Fatalf("Read(OffsetOldest) = %d events, %v", len(events), err)
+	}
+}
+
+// A zero-policy Trim is a query and works while another connection holds
+// the write lock, unlike a Trim that removes events.
+func TestZeroPolicyTrimTakesNoWriteLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	store, err := New(path, WithBusyTimeout(20*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	offsets := appendTrimEvents(t, store, 3, nil)
+	if _, err := store.Trim(t.Context(), eventbus.RetentionPolicy{Through: offsets[0]}); err != nil {
+		t.Fatal(err)
+	}
+	holder, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close()
+	tx, err := holder.db.BeginTx(t.Context(), nil) // BEGIN IMMEDIATE
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if result, err := store.Trim(t.Context(), eventbus.RetentionPolicy{}); err != nil || result.TrimmedThrough != offsets[0] {
+		t.Fatalf("zero-policy Trim under a held write lock = %+v, %v", result, err)
 	}
 }

@@ -7,10 +7,19 @@ import (
 	"strings"
 )
 
+// absPath resolves database paths; injectable so tests can exercise the
+// failure path (filepath.Abs fails only when the working directory cannot be
+// determined).
+var absPath = filepath.Abs
+
 // buildDSN configures each pooled connection, including connections opened
 // after construction. Running connection-scoped pragmas through db.Exec would
 // configure only the connection handed out by the pool at that moment.
 func buildDSN(cfg *config) (string, error) {
+	// Read-only stores never write, so their durability setting is ignored.
+	if !cfg.readOnly && cfg.synchronous != SynchronousNormal && cfg.synchronous != SynchronousFull {
+		return "", fmt.Errorf("sqlite: unsupported synchronous mode %v", cfg.synchronous)
+	}
 	if cfg.path == ":memory:" {
 		// Shared cache mode lets pooled connections see the same database.
 		// Each store gets a unique name so independent stores stay isolated.
@@ -21,7 +30,7 @@ func buildDSN(cfg *config) (string, error) {
 	if strings.ContainsRune(cfg.path, '\x00') {
 		return "", fmt.Errorf("sqlite: path cannot contain NUL")
 	}
-	abs, err := filepath.Abs(cfg.path)
+	abs, err := absPath(cfg.path)
 	if err != nil {
 		return "", fmt.Errorf("sqlite: resolve database path: %w", err)
 	}
@@ -38,7 +47,8 @@ func buildDSN(cfg *config) (string, error) {
 		query.Set("mode", "ro")
 		query.Add("_pragma", "query_only(1)")
 	} else {
-		query.Add("_pragma", "synchronous(NORMAL)")
+		// Validated above: only declared modes reach the DSN.
+		query.Add("_pragma", "synchronous("+cfg.synchronous.pragma()+")")
 		// Immediate transactions take the write lock at BEGIN (honoring
 		// busy_timeout) instead of upgrading mid-transaction, which can
 		// return SQLITE_BUSY immediately. Only migrations use them here.

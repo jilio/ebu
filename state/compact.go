@@ -39,10 +39,13 @@ type CompactResult struct {
 // Otherwise it uses eventbus.EventStoreTruncator. A store with neither keeps
 // its events; only the snapshot is saved.
 //
-// Compact is serialized with SaveSnapshotTo, and the snapshot is durably
-// saved before anything is removed: when Compact fails after saving, the log
-// still holds every event the snapshot does not cover. Like SaveSnapshotTo it
-// refuses to run before any event was applied.
+// Compact is serialized with SaveSnapshotTo and LoadSnapshotFrom, and the
+// snapshot is durably saved before anything is removed: when Compact fails
+// after saving, the log still holds every event the snapshot does not cover,
+// and the returned result reports the saved Snapshot with Through at
+// OffsetOldest. A store that can remove nothing also yields Through
+// OffsetOldest and Removed 0. Like SaveSnapshotTo it refuses to run before
+// any event was applied.
 func (m *Materializer) Compact(ctx context.Context, store eventbus.EventStore, snapshotID string, keep ...eventbus.Offset) (CompactResult, error) {
 	snapshotter, ok := store.(eventbus.EventStoreSnapshotter)
 	if !ok {
@@ -77,6 +80,7 @@ func (m *Materializer) Compact(ctx context.Context, store eventbus.EventStore, s
 		}
 		cmp, err := comparer.CompareOffsets(k, result.Through)
 		if err != nil {
+			result.Through = eventbus.OffsetOldest // nothing was trimmed
 			return result, fmt.Errorf("state: compact: compare keep offset %q: %w", k, err)
 		}
 		if cmp < 0 {
@@ -88,13 +92,17 @@ func (m *Materializer) Compact(ctx context.Context, store eventbus.EventStore, s
 	case eventbus.EventStoreTrimmer:
 		trimmed, err := remover.Trim(ctx, eventbus.RetentionPolicy{Through: result.Through})
 		if err != nil {
-			return result, fmt.Errorf("state: compact: trim through %q: %w", result.Through, err)
+			failed := result.Through
+			result.Through = eventbus.OffsetOldest // nothing was trimmed
+			return result, fmt.Errorf("state: compact: trim through %q: %w", failed, err)
 		}
 		result.Removed = trimmed.Deleted
 	case eventbus.EventStoreTruncator:
 		deleted, err := remover.TruncateBefore(ctx, result.Through)
 		if err != nil {
-			return result, fmt.Errorf("state: compact: truncate through %q: %w", result.Through, err)
+			failed := result.Through
+			result.Through = eventbus.OffsetOldest // nothing is known to be removed
+			return result, fmt.Errorf("state: compact: truncate through %q: %w", failed, err)
 		}
 		result.Removed = deleted
 	default:

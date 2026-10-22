@@ -1444,7 +1444,7 @@ func (m *MemoryStore) Append(ctx context.Context, event *Event) (Offset, error) 
 
 	m.nextOffset++
 	// Use zero-padded format for correct lexicographic ordering
-	offset := Offset(fmt.Sprintf("%020d", m.nextOffset))
+	offset := Offset(fmt.Sprintf("%0*d", memoryOffsetDigits, m.nextOffset))
 
 	stored := &StoredEvent{
 		Offset:    offset,
@@ -1481,7 +1481,9 @@ func (m *MemoryStore) searchAfter(from Offset) int {
 // when the store is empty. Caller must hold at least a read lock.
 func (m *MemoryStore) tailOffset() Offset {
 	if len(m.events) == 0 {
-		return OffsetOldest
+		// After Trim removed everything, the tail is the trim boundary:
+		// OffsetOldest would let a checkpoint taken now skip later gaps.
+		return m.trimmedThrough
 	}
 	return m.events[len(m.events)-1].Offset
 }
@@ -1679,10 +1681,13 @@ func (m *MemoryStore) Trim(ctx context.Context, policy RetentionPolicy) (TrimRes
 	return TrimResult{Deleted: deleted, TrimmedThrough: m.trimmedThrough}, nil
 }
 
-// isMemoryOffset reports whether offset has the form MemoryStore issues: 20
-// zero-padded decimal digits.
+// memoryOffsetDigits is the width of the zero-padded decimal offsets
+// MemoryStore issues; the padding keeps their string order numeric.
+const memoryOffsetDigits = 20
+
+// isMemoryOffset reports whether offset has the form MemoryStore issues.
 func isMemoryOffset(offset Offset) bool {
-	if len(offset) != 20 {
+	if len(offset) != memoryOffsetDigits {
 		return false
 	}
 	for _, c := range []byte(offset) {
