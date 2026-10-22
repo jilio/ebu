@@ -25,6 +25,10 @@ type SQLiteStore struct {
 	logger      Logger
 	metricsHook MetricsHook
 
+	// retentionTable caches that the ebu_retention table exists (see
+	// trimmedThrough); it never disappears once created.
+	retentionTable atomic.Bool
+
 	// memConn pins one dedicated connection for :memory: stores. A
 	// shared-cache in-memory database is destroyed the moment its last
 	// connection closes, so without this pin the store would silently lose

@@ -331,7 +331,7 @@ func TestTrimErrors(t *testing.T) {
 	if _, err := store.Trim(ctx, eventbus.RetentionPolicy{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.db.Exec("INSERT INTO retention (id, trimmed_through) VALUES (1, 'garbage')"); err != nil {
+	if _, err := store.db.Exec("INSERT INTO ebu_retention (id, trimmed_through) VALUES (1, 'garbage')"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.Trim(ctx, eventbus.RetentionPolicy{}); err == nil || !strings.Contains(err.Error(), "read boundary") {
@@ -340,7 +340,7 @@ func TestTrimErrors(t *testing.T) {
 	if _, _, err := store.Read(ctx, formatOffset(1), 0); err == nil || !strings.Contains(err.Error(), "read trim boundary") {
 		t.Fatalf("Read with a corrupt boundary = %v", err)
 	}
-	if _, err := store.db.Exec("DELETE FROM retention"); err != nil {
+	if _, err := store.db.Exec("DELETE FROM ebu_retention"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -350,7 +350,7 @@ func TestTrimErrors(t *testing.T) {
 		policy                     eventbus.RetentionPolicy
 		want                       string
 	}{
-		{"create", "DROP TABLE retention; CREATE INDEX retention ON events(type)", "DROP INDEX retention",
+		{"create", "DROP TABLE ebu_retention; CREATE INDEX ebu_retention ON events(type)", "DROP INDEX ebu_retention",
 			eventbus.RetentionPolicy{}, "create retention table"},
 		{"timestamps", "ALTER TABLE events RENAME COLUMN timestamp TO ts", "ALTER TABLE events RENAME COLUMN ts TO timestamp",
 			eventbus.RetentionPolicy{OlderThan: trimEpoch.Add(time.Hour)}, "scan timestamps"},
@@ -360,7 +360,7 @@ func TestTrimErrors(t *testing.T) {
 			eventbus.RetentionPolicy{MaxEvents: 1}, "delete prefix"},
 		{"partition cap", "CREATE TRIGGER no_delete BEFORE DELETE ON events BEGIN SELECT RAISE(ABORT, 'kept'); END", "DROP TRIGGER no_delete",
 			eventbus.RetentionPolicy{PartitionKey: "tenant", MaxPerPartition: 1}, "apply partition cap"},
-		{"record boundary", createRetentionTable + "; CREATE TRIGGER no_boundary BEFORE INSERT ON retention BEGIN SELECT RAISE(ABORT, 'no'); END", "DROP TRIGGER no_boundary",
+		{"record boundary", createRetentionTable + "; CREATE TRIGGER no_boundary BEFORE INSERT ON ebu_retention BEGIN SELECT RAISE(ABORT, 'no'); END", "DROP TRIGGER no_boundary",
 			eventbus.RetentionPolicy{MaxEvents: 1}, "record boundary"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -472,5 +472,49 @@ func TestTrimLogs(t *testing.T) {
 	appendTrimEvents(t, store, 3, nil)
 	if result, err := store.Trim(t.Context(), eventbus.RetentionPolicy{MaxEvents: 1}); err != nil || result.Deleted != 2 {
 		t.Fatalf("Trim on a :memory: store = %+v, %v", result, err)
+	}
+}
+
+func TestTrimPartitionEdgeCases(t *testing.T) {
+	store := newTrimStore(t)
+	for i, md := range []map[string]string{nil, {"tenant": ""}, {"other": "x"}, {"tenant": "a"}} {
+		if _, err := store.Append(t.Context(), &eventbus.Event{ID: fmt.Sprintf("e%d", i+1), Type: "t", Data: json.RawMessage(`1`), Metadata: md, Timestamp: trimEpoch}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Metadata that is not valid JSON (never written by this store) counts as
+	// having no key instead of failing the whole Trim.
+	if _, err := store.db.Exec(`INSERT INTO events (type, data, timestamp, metadata) VALUES ('t', '1', ?, 'not json')`, trimEpoch); err != nil {
+		t.Fatal(err)
+	}
+	// A missing key, an empty value and malformed metadata share one partition.
+	result, err := store.Trim(t.Context(), eventbus.RetentionPolicy{PartitionKey: "tenant", MaxPerPartition: 1})
+	if err != nil || result.Deleted != 3 {
+		t.Fatalf("Trim = %+v, %v", result, err)
+	}
+	var remaining []int64
+	rows, err := store.db.Query(`SELECT position FROM events ORDER BY position`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var p int64
+		if err := rows.Scan(&p); err != nil {
+			t.Fatal(err)
+		}
+		remaining = append(remaining, p)
+	}
+	rows.Close()
+	if fmt.Sprint(remaining) != "[4 5]" {
+		t.Fatalf("remaining positions = %v, want the newest of each partition [4 5]", remaining)
+	}
+}
+
+func TestTrimBoundaryLookupFailure(t *testing.T) {
+	store := newTrimStore(t)
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := store.trimmedThrough(cancelled); err == nil || !strings.Contains(err.Error(), "look up trim boundary") {
+		t.Fatalf("trimmedThrough = %v", err)
 	}
 }

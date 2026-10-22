@@ -351,3 +351,17 @@ func TestMemoryStoreTrimConcurrentWithAppendAndRead(t *testing.T) {
 	close(stop)
 	wg.Wait()
 }
+
+func TestMemoryStoreTrimEmptyValueSharesTheKeylessPartition(t *testing.T) {
+	store := NewMemoryStore()
+	ctx := context.Background()
+	for i, md := range []map[string]string{nil, {"p": ""}, {"q": "x"}, {"p": "a"}} {
+		if _, err := store.Append(ctx, &Event{ID: fmt.Sprintf("e%d", i+1), Type: "t", Data: json.RawMessage(`1`), Metadata: md}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result, err := store.Trim(ctx, RetentionPolicy{PartitionKey: "p", MaxPerPartition: 1})
+	if err != nil || result.Deleted != 2 || retainedIDs(t, store) != "e3,e4" {
+		t.Fatalf("Trim = %+v, %v, retained %q", result, err, retainedIDs(t, store))
+	}
+}
