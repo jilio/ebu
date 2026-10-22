@@ -24,6 +24,7 @@ A lightweight, type-safe event bus for Go with generics support. Build decoupled
 - 🪞 **Log replication** - `Mirror` one store into another with envelopes preserved
 - **Confirmed replication** - `Replicator` lets important writes wait for an acknowledged prefix while ordinary writes remain asynchronous
 - 🌍 **Remote storage** - Native support for remote backends like [durable-streams](https://github.com/durable-streams/durable-streams)
+- **Retention** - Trim logs by offset, age, count or per-partition count with stable offsets and an explicit `ErrOffsetTrimmed` gap signal
 - 🔄 **Event upcasting** - Seamless event schema migration and versioning
 - ✅ **100% test coverage** - Thoroughly tested for reliability
 
@@ -325,6 +326,25 @@ eventbus.SubscribeContextWithReplay(ctx, bus, "email-sender",
 - Handlers can read the offset their event was persisted at with
   `eventbus.OffsetFromContext(ctx)` (context-aware handlers only).
 
+#### Retention
+
+Stores implementing `EventStoreTrimmer` (MemoryStore, SQLite) bound a log while
+keeping offsets stable. Every rule is optional; ebu applies no default policy:
+
+```go
+result, err := store.Trim(ctx, eventbus.RetentionPolicy{
+    OlderThan:       time.Now().Add(-retention), // age
+    MaxEvents:       100_000,                    // total count
+    PartitionKey:    "stream",                   // Metadata key set via ContextWithMetadata
+    MaxPerPartition: 1_000,                      // count per partition
+})
+```
+
+A reader whose offset falls behind a trimmed prefix gets
+`eventbus.ErrOffsetTrimmed` (`*OffsetTrimmedError` names where to resume)
+instead of silently skipping events; per-partition caps behave like key-based
+log compaction. See [Retention and Compaction](docs/PERSISTENCE.md#retention-and-compaction).
+
 See [**Persistence Guide**](docs/PERSISTENCE.md) for custom stores and advanced patterns.
 
 ### Remote Storage
@@ -602,6 +622,8 @@ user, ok, err := users.Get("user:1")  // User{Name: "Alice Smith", ...}
 
 Features:
 - **Type-safe helpers**: `Insert`, `Update`, `Delete` with Go generics
+- **Snapshots and compaction**: `SaveSnapshotTo` / `LoadSnapshotFrom`, and
+  `Compact` to snapshot and drop the covered log prefix in one step
 - **Options pattern**: `WithTxID`, `WithTimestamp`, `WithEntityType`
 - **Materializer**: Build typed state from event streams
 - **Control messages**: `SnapshotStart`, `SnapshotEnd`, `Reset`

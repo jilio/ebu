@@ -64,7 +64,10 @@
 // Retention rules of thumb: the MAIN stream may be head-trimmed by server
 // retention once snapshots cover the trimmed prefix — a read below the
 // earliest retained position fails with the protocol's 410 Gone (permanent
-// here); recover by loading a snapshot and resuming from its offset. The
+// here), reported as *eventbus.OffsetTrimmedError (errors.Is
+// eventbus.ErrOffsetTrimmed and the client's ErrOffsetGone); recover by
+// loading a snapshot and resuming from its offset, or acknowledge the gap and
+// resume from OffsetOldest. The
 // COMPANION stream must NOT be head-trimmed: LoadSnapshot reads it from the
 // beginning and the protocol offers no earliest-offset discovery, so a
 // partially trimmed companion stream makes surviving records unreachable
@@ -408,7 +411,7 @@ func (s *Store) Read(ctx context.Context, from eventbus.Offset, limit int) ([]*e
 	for {
 		chunk, tail, err := s.readChunk(ctx, offset)
 		if err != nil {
-			return nil, from, fmt.Errorf("durablestream: read: %w", err)
+			return nil, from, trimmedOffsetError(offset, fmt.Errorf("durablestream: read: %w", err))
 		}
 		if chunk == nil {
 			// Caught up with no data after offset.
@@ -577,7 +580,7 @@ func (s *Store) Tail(ctx context.Context, from eventbus.Offset) iter.Seq2[*event
 					return
 				}
 				if !isRetryable(err) {
-					yield(nil, fmt.Errorf("durablestream: tail: %w", err))
+					yield(nil, trimmedOffsetError(chunkStart, fmt.Errorf("durablestream: tail: %w", err)))
 					return
 				}
 				// The iterator may hold a stale connection or cursor; rebuild
@@ -617,6 +620,22 @@ func (s *Store) Tail(ctx context.Context, from eventbus.Offset) iter.Seq2[*event
 			chunkStart = next
 		}
 	}
+}
+
+// trimmedOffsetError marks a 410 Gone answer to a read from a concrete offset
+// as eventbus.ErrOffsetTrimmed: the server's retention dropped data after
+// that offset. The protocol offers no earliest-offset discovery, so
+// ResumeFrom is OffsetOldest, from which a conforming server serves the
+// retained log. A read from OffsetOldest itself is never trimmed; there a 410
+// means the stream is gone (soft-deleted), so err is returned unchanged.
+// errors.Is still matches the client's ErrOffsetGone. A concrete offset that
+// a Tail resolved from OffsetNewest is treated the same way: retention that
+// dropped data after it is still a gap for that reader.
+func trimmedOffsetError(from eventbus.Offset, err error) error {
+	if from == eventbus.OffsetOldest || !errors.Is(err, durablestreams.ErrOffsetGone) {
+		return err
+	}
+	return &eventbus.OffsetTrimmedError{Offset: from, ResumeFrom: eventbus.OffsetOldest, Err: err}
 }
 
 // resolveTail resolves OffsetNewest to the stream's current tail via a HEAD

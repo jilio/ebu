@@ -25,6 +25,10 @@ type SQLiteStore struct {
 	logger      Logger
 	metricsHook MetricsHook
 
+	// retentionTable caches that the ebu_retention table exists (see
+	// trimmedThrough); it never disappears once created.
+	retentionTable atomic.Bool
+
 	// memConn pins one dedicated connection for :memory: stores. A
 	// shared-cache in-memory database is destroyed the moment its last
 	// connection closes, so without this pin the store would silently lose
@@ -208,7 +212,14 @@ func (s *SQLiteStore) resolveNewest(ctx context.Context) (int64, error) {
 	if err := s.db.QueryRowContext(ctx, "SELECT MAX(position) FROM events").Scan(&position); err != nil {
 		return 0, fmt.Errorf("sqlite: resolve newest offset: %w", err)
 	}
-	return position.Int64, nil
+	if position.Valid {
+		return position.Int64, nil
+	}
+	// No events: if Trim removed them all, the tail is the trim boundary.
+	// Returning 0 would let a checkpoint taken now skip later gaps. Prefix
+	// rules always remove the newest events last, and partition caps never
+	// remove the newest event, so the boundary is the newest position issued.
+	return s.trimmedThrough(ctx)
 }
 
 // formatOffset converts an int64 position to an Offset.
@@ -292,7 +303,9 @@ type rowScanner interface {
 // Read returns events starting after the given offset.
 // OffsetNewest resolves at call time to the current tail of the log: no
 // events, nil error, and a concrete resumable offset (the last position,
-// or OffsetOldest when the store is empty) as nextOffset.
+// or OffsetOldest when the store is empty) as nextOffset. Reading from a
+// concrete offset older than the prefix removed by Trim fails with
+// *eventbus.OffsetTrimmedError (errors.Is eventbus.ErrOffsetTrimmed).
 func (s *SQLiteStore) Read(ctx context.Context, from eventbus.Offset, limit int) ([]*eventbus.StoredEvent, eventbus.Offset, error) {
 	start := time.Now()
 	var events []*eventbus.StoredEvent
@@ -336,6 +349,14 @@ func (s *SQLiteStore) Read(ctx context.Context, from eventbus.Offset, limit int)
 	if err != nil {
 		return nil, from, err
 	}
+	var first int64
+	if len(events) > 0 {
+		first, _ = parseOffset(events[0].Offset) // formatted by scanEvent
+	}
+	if err = s.checkTrimmed(ctx, from, position, first); err != nil {
+		events = nil
+		return nil, from, err
+	}
 
 	// Determine next offset
 	nextOffset := from
@@ -377,10 +398,12 @@ func marshalMetadata(md map[string]string) any {
 func scanEvent(rows rowScanner) (*eventbus.StoredEvent, int64, error) {
 	var position int64
 	var eventID, origin, metadata sql.NullString
+	var timestamp storedTime
 	event := &eventbus.StoredEvent{}
-	if err := rows.Scan(&position, &event.Type, &event.Data, &event.Timestamp, &eventID, &origin, &metadata); err != nil {
+	if err := rows.Scan(&position, &event.Type, &event.Data, &timestamp, &eventID, &origin, &metadata); err != nil {
 		return nil, 0, fmt.Errorf("sqlite: scan event: %w", err)
 	}
+	event.Timestamp = timestamp.Time
 	event.Offset = formatOffset(position)
 	event.ID = eventID.String
 	event.Origin = origin.String
@@ -592,7 +615,9 @@ func (s *SQLiteStore) Close() error {
 // - The context is cancelled
 //
 // OffsetNewest is the tail of the log at call time, so streaming from it
-// yields nothing.
+// yields nothing. Like Read, a stream whose position falls behind the prefix
+// removed by Trim yields *eventbus.OffsetTrimmedError instead of skipping
+// events; the check runs before each batch's first event.
 func (s *SQLiteStore) ReadStream(ctx context.Context, from eventbus.Offset) iter.Seq2[*eventbus.StoredEvent, error] {
 	return func(yield func(*eventbus.StoredEvent, error) bool) {
 		start := time.Now()
@@ -616,13 +641,14 @@ func (s *SQLiteStore) ReadStream(ctx context.Context, from eventbus.Offset) iter
 			return
 		}
 
-		s.streamBatched(ctx, position, &eventCount, &iterErr, yield)
+		s.streamBatched(ctx, from, position, &eventCount, &iterErr, yield)
 	}
 }
 
 // streamBatched fetches events in batches using cursor-based pagination
 func (s *SQLiteStore) streamBatched(
 	ctx context.Context,
+	from eventbus.Offset,
 	fromPosition int64,
 	eventCount *int,
 	iterErr *error,
@@ -647,7 +673,13 @@ func (s *SQLiteStore) streamBatched(
 			return
 		}
 
-		batchCount, lastPos, cont := s.streamBatch(ctx, rows, eventCount, iterErr, yield)
+		batchFrom := formatOffset(currentPos)
+		if currentPos == fromPosition {
+			batchFrom = from
+		}
+		cursor := currentPos
+		checkTrimmed := func(first int64) error { return s.checkTrimmed(ctx, batchFrom, cursor, first) }
+		batchCount, lastPos, cont := s.streamBatch(ctx, rows, checkTrimmed, eventCount, iterErr, yield)
 		if !cont {
 			return
 		}
@@ -668,9 +700,14 @@ func (s *SQLiteStore) streamBatched(
 
 // streamBatch processes a single batch of rows. Returns (batchCount, lastPos, shouldContinue).
 // shouldContinue is false if iteration should stop (error or early termination).
+// checkTrimmed runs once, with the batch's first position, before that event
+// is yielded (or with 0 after an empty batch): the batch query has then taken
+// its read snapshot, so no event behind a concurrent Trim boundary reaches
+// the consumer.
 func (s *SQLiteStore) streamBatch(
 	ctx context.Context,
 	rows rowScanner,
+	checkTrimmed func(first int64) error,
 	eventCount *int,
 	iterErr *error,
 	yield func(*eventbus.StoredEvent, error) bool,
@@ -693,6 +730,14 @@ func (s *SQLiteStore) streamBatch(
 			*iterErr = err
 			yield(nil, *iterErr)
 			return 0, 0, false
+		}
+		if batchCount == 0 {
+			if err := checkTrimmed(position); err != nil {
+				rows.Close() // Best effort close, the gap takes precedence
+				*iterErr = err
+				yield(nil, *iterErr)
+				return 0, 0, false
+			}
 		}
 
 		lastPos = position
@@ -720,6 +765,14 @@ func (s *SQLiteStore) streamBatch(
 		*iterErr = fmt.Errorf("sqlite: close rows: %w", err)
 		yield(nil, *iterErr)
 		return batchCount, lastPos, false
+	}
+
+	if batchCount == 0 {
+		if err := checkTrimmed(0); err != nil {
+			*iterErr = err
+			yield(nil, *iterErr)
+			return 0, 0, false
+		}
 	}
 
 	return batchCount, lastPos, true

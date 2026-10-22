@@ -9,6 +9,7 @@ Complete guide to event persistence, storage, and replay in ebu.
 - [Event Stores](#event-stores)
 - [Available Storage Backends](#available-storage-backends)
 - [Replay Patterns](#replay-patterns)
+- [Retention and Compaction](#retention-and-compaction)
 - [Resumable Subscriptions](#resumable-subscriptions)
 - [Custom Stores](#custom-stores)
 - [Best Practices](#best-practices)
@@ -506,6 +507,110 @@ bus.Replay(ctx, nextOffset, func(event *eventbus.StoredEvent) error {
 })
 ```
 
+## Retention and Compaction
+
+Stores implementing `eventbus.EventStoreTrimmer` (`MemoryStore` and the SQLite
+store) bound a log with a `RetentionPolicy`. Offsets of retained events never
+change and removed offsets are never reused, so checkpoints, subscriptions and
+replication positions stay valid:
+
+```go
+result, err := store.Trim(ctx, eventbus.RetentionPolicy{
+    OlderThan:       time.Now().Add(-retention), // age
+    MaxEvents:       1_000_000,                  // total count
+    PartitionKey:    "stream",                   // an event Metadata key
+    MaxPerPartition: 10_000,                     // count per partition
+})
+```
+
+Every rule is optional; a zero policy removes nothing and reports the current
+boundary. Run `Trim` periodically — it is a maintenance operation, not a
+per-append hook. ebu has no default policy: retention is always the caller's
+choice.
+
+| Rule | Removes | A reader behind the removed events |
+|------|---------|------------------------------------|
+| `Through` | every event at or before an offset | gets `ErrOffsetTrimmed` |
+| `OlderThan` | the oldest events, in log order, with a `Timestamp` before the cutoff; stops at the first event that is not older, so clock skew never punches holes | gets `ErrOffsetTrimmed` |
+| `MaxEvents` | all but the newest N events | gets `ErrOffsetTrimmed` |
+| `MaxPerPartition` | all but the newest N events of each `Metadata[PartitionKey]` value (events without the key form one partition) | is not told: like key-based log compaction, it observes only what remains |
+
+The first three rules remove a *prefix*; the store records the newest event they
+removed (`TrimResult.TrimmedThrough`). `Read`, `ReadStream` (and with Durable
+Streams, `Tail`) from an older concrete offset then fail with a clear gap
+signal instead of silently skipping events:
+
+```go
+events, next, err := store.Read(ctx, checkpoint, 100)
+var trimmed *eventbus.OffsetTrimmedError
+if errors.As(err, &trimmed) { // errors.Is(err, eventbus.ErrOffsetTrimmed)
+    // Events after checkpoint are gone. Rebuild from a snapshot, or
+    // acknowledge the gap and continue from trimmed.ResumeFrom.
+}
+```
+
+Reading from `OffsetOldest` is never an error; it starts at the oldest retained
+event. Once `Trim` has removed every event, `OffsetNewest` resolves to the trim
+boundary, so a checkpoint saved then still detects later gaps. A store that has
+never held an event resolves `OffsetNewest` to `OffsetOldest` (the `EventStore`
+contract), and a checkpoint equal to `OffsetOldest` is never reported as a gap.
+The SQLite store persists such a checkpoint as the concrete position zero, which
+is checked; with other stores, take the checkpoint after the first event when a
+reader must detect trimming from the very start. The condition is
+permanent for that offset, so consumers that retry reads (`Follow`, `Mirror`,
+resumable subscriptions) report it on every attempt until the checkpoint is
+moved. Retention never consults subscriptions or snapshots: bound `Through` by
+the checkpoints that must stay readable.
+
+Releases before retention existed (v0.20.1 and earlier) do not know the
+boundary: when they read a trimmed SQLite store from an offset behind the
+trimmed prefix, they silently skip the removed events. Upgrade every reader of a
+store before trimming it.
+
+Attach the partition key when publishing:
+
+```go
+ctx = eventbus.ContextWithMetadata(ctx, map[string]string{"stream": streamID})
+eventbus.PublishContext(bus, ctx, event)
+```
+
+In SQLite, `Through` is an indexed lookup, `OlderThan` scans only the events
+it removes (plus one), `MaxEvents` steps over the N newest events, and
+`MaxPerPartition` scans the retained log once. A `Trim` runs in one write
+transaction and delays appends to the same file while it runs, so a first
+`OlderThan` pass over a large backlog, or a partition pass over a large log,
+belongs in a quiet period (or can be split by trimming `Through` stepwise).
+A zero policy is a query that takes no write lock. Freed pages are reused by
+later appends. The retention boundary is kept in a table created by the first
+`Trim` that removes or could remove events, so databases that never trim are
+unchanged, and the schema version stays readable by earlier releases.
+
+`EventStoreTruncator.TruncateBefore` keeps its earlier, silent semantics and
+records no boundary; `Trim(ctx, RetentionPolicy{Through: offset})` is the
+gap-signaling equivalent. Durable Streams has no client-initiated trim — its
+retention is server policy — but a read below the server's retained head is
+reported as `ErrOffsetTrimmed` (with `ResumeFrom` = `OffsetOldest`).
+
+### Snapshot and compact a materializer
+
+A `state.Materializer` can snapshot its collections and drop the log prefix the
+snapshot covers in one call. Offsets after the snapshot ID are checkpoints of
+other readers of the same log; the log is trimmed only through the oldest of
+them and the snapshot:
+
+```go
+result, err := mat.Compact(ctx, store, "users", followerCheckpoint)
+// result.Snapshot: the snapshot's offset; result.Through: trimmed through.
+
+// Cold start: snapshot + tail.
+from, err := mat.LoadSnapshotFrom(ctx, store, "users")
+err = mat.Replay(ctx, bus, from)
+```
+
+`Compact` saves the snapshot before removing anything and uses `Trim` when the
+store supports it (so readers left behind get `ErrOffsetTrimmed`), else
+`TruncateBefore`.
+
 ## Resumable Subscriptions
 
 Subscribe with automatic offset tracking and at-least-once delivery:
@@ -975,7 +1080,9 @@ CREATE INDEX idx_events_timestamp ON events(timestamp);
 
 ### 4. Consider Event Retention
 
-Implement archival or cleanup for old events:
+Bundled stores support `Trim` with a `RetentionPolicy` (see
+[Retention and Compaction](#retention-and-compaction)). A custom store can
+implement `EventStoreTrimmer`, or archive and clean up old events itself:
 
 ```go
 // Archive events older than 90 days
