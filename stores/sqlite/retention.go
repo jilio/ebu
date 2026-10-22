@@ -62,15 +62,18 @@ var _ eventbus.EventStoreTrimmer = (*SQLiteStore)(nil)
 // removed offsets are never reused. The prefix rules (Through, OlderThan,
 // MaxEvents) record the newest position they removed; Read and ReadStream
 // from an older concrete offset then fail with *eventbus.OffsetTrimmedError.
-// MaxPerPartition partitions by an event metadata key and scans the retained
-// log once per call, so run it periodically rather than per append. The
-// write transaction lasts for the whole call: a first OlderThan run over a
-// large backlog, or a partition pass over a large log, delays concurrent
-// appends for that long. Removed
-// pages are reused by later appends (the database file does not shrink).
-// Unlike TruncateBefore, Trim leaves write-ahead-log checkpoints to SQLite's
-// automatic checkpointing: a TRUNCATE checkpoint waits for every open reader,
-// which a periodic retention job should not do.
+// MaxPerPartition partitions by an event metadata key with key-based
+// compaction semantics: used alone it can remove the oldest events without
+// moving the boundary, so readers are not told. It scans the retained log
+// once per call; run it periodically rather than per append.
+//
+// The write transaction lasts for the whole call: a first OlderThan run over
+// a large backlog, or a partition pass over a large log, delays concurrent
+// appends for that long. Removed pages are reused by later appends (the
+// database file does not shrink). Unlike TruncateBefore, Trim leaves
+// write-ahead-log checkpoints to SQLite's automatic checkpointing: a TRUNCATE
+// checkpoint waits for every open reader, which a periodic retention job
+// should not do.
 func (s *SQLiteStore) Trim(ctx context.Context, policy eventbus.RetentionPolicy) (result eventbus.TrimResult, err error) {
 	if s.cfg.readOnly {
 		return eventbus.TrimResult{}, ErrReadOnly
@@ -98,11 +101,10 @@ func (s *SQLiteStore) Trim(ctx context.Context, policy eventbus.RetentionPolicy)
 	if _, err = tx.ExecContext(ctx, createRetentionTable); err != nil {
 		return eventbus.TrimResult{}, fmt.Errorf("sqlite: trim: create retention table: %w", err)
 	}
-	var watermark int64
-	if err = tx.QueryRowContext(ctx, selectTrimmedThrough).Scan(&watermark); err != nil && !errors.Is(err, sql.ErrNoRows) {
+	watermark, err := optionalInt64(ctx, tx, selectTrimmedThrough)
+	if err != nil {
 		return eventbus.TrimResult{}, fmt.Errorf("sqlite: trim: read boundary: %w", err)
 	}
-	err = nil
 
 	cut := through
 	if !policy.OlderThan.IsZero() {
@@ -113,12 +115,10 @@ func (s *SQLiteStore) Trim(ctx context.Context, policy eventbus.RetentionPolicy)
 		cut = max(cut, old-1)
 	}
 	if policy.MaxEvents > 0 {
-		var position int64
-		err = tx.QueryRowContext(ctx, "SELECT position FROM events ORDER BY position DESC LIMIT 1 OFFSET ?", policy.MaxEvents).Scan(&position)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		position, err := optionalInt64(ctx, tx, "SELECT position FROM events ORDER BY position DESC LIMIT 1 OFFSET ?", policy.MaxEvents)
+		if err != nil {
 			return eventbus.TrimResult{}, fmt.Errorf("sqlite: trim: find count boundary: %w", err)
 		}
-		err = nil
 		cut = max(cut, position)
 	}
 
@@ -164,6 +164,16 @@ func (s *SQLiteStore) Trim(ctx context.Context, policy eventbus.RetentionPolicy)
 		result.TrimmedThrough = formatOffset(watermark)
 	}
 	return result, nil
+}
+
+// optionalInt64 runs a single-value query and returns 0 when it has no row.
+func optionalInt64(ctx context.Context, tx *sql.Tx, query string, args ...any) (int64, error) {
+	var value int64
+	err := tx.QueryRowContext(ctx, query, args...).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	return value, err
 }
 
 // firstNotOlder returns the position of the first event, in log order, whose

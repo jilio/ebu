@@ -518,3 +518,16 @@ func TestTrimBoundaryLookupFailure(t *testing.T) {
 		t.Fatalf("trimmedThrough = %v", err)
 	}
 }
+
+func TestTrimEmptyLog(t *testing.T) {
+	store := newTrimStore(t)
+	result, err := store.Trim(t.Context(), eventbus.RetentionPolicy{
+		Through: formatOffset(5), OlderThan: trimEpoch, MaxEvents: 1, PartitionKey: "tenant", MaxPerPartition: 1,
+	})
+	if err != nil || result.Deleted != 0 || result.TrimmedThrough != eventbus.OffsetOldest {
+		t.Fatalf("Trim on an empty log = %+v, %v", result, err)
+	}
+	if offset, err := store.Append(t.Context(), &eventbus.Event{Type: "t", Data: json.RawMessage(`1`), Timestamp: time.Now()}); err != nil || offset != formatOffset(1) {
+		t.Fatalf("Append after an empty Trim = %q, %v", offset, err)
+	}
+}
