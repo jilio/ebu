@@ -12,3 +12,7 @@ coverage.html
 # Workspace sums are machine-local; a stale committed one breaks
 # workspace resolution of the local modules.
 go.work.sum
+
+# Binaries from `go build ./...` in the single-package example modules.
+examples/observability/observability
+examples/observability/generator/generator

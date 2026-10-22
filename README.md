@@ -580,7 +580,7 @@ See [TypeNamer examples](docs/EXAMPLES.md#custom-event-type-names-typenamer) for
 |---------|---------|-------------|
 | MemoryStore | `github.com/jilio/ebu` | In-memory store for development/testing |
 | SQLite | `github.com/jilio/ebu/stores/sqlite` | Local persistent storage with WAL mode; opt-in power-loss durability with `WithSynchronous(SynchronousFull)` |
-| Durable-Streams | `github.com/jilio/ebu/stores/durablestream` | Remote HTTP-based storage |
+| Durable-Streams | `github.com/jilio/ebu/stores/durablestream` | Remote HTTP-based storage; opt-in idempotent, fenced producer with `WithProducer` |
 
 See [**Persistence Guide**](docs/PERSISTENCE.md) for detailed usage.
 
