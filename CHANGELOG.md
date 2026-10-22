@@ -9,28 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- SQLite `WithSynchronous(SynchronousNormal | SynchronousFull)` selects the
+  durability of every pooled writer connection. `SynchronousFull` syncs the
+  write-ahead log before each commit returns, so acknowledged appends,
+  checkpoints, snapshots and truncations survive power loss and OS crashes.
+  The default remains `SynchronousNormal` (the previous, faster behavior that
+  can roll back the latest commits on power loss); `OpenReadOnly` ignores the
+  option and `New` rejects undeclared modes.
 - `EventStoreTrimmer` and `RetentionPolicy`: bound a log by offset (`Through`),
   age (`OlderThan`), total count (`MaxEvents`) and per-partition count
   (`PartitionKey` + `MaxPerPartition`, partitioned by an event metadata key).
   Offsets of retained events never change and are never reused. ebu applies no
-  default policy. `MemoryStore` and the SQLite store implement it.
+  default policy; a zero policy is a query that reports the current boundary
+  (in SQLite without taking the write lock). `MemoryStore` and the SQLite
+  store implement it.
 - `ErrOffsetTrimmed` and `*OffsetTrimmedError`: a read from a concrete offset
   older than a prefix removed by `Trim` fails with this gap signal, naming an
   offset to resume from, instead of silently skipping events. Reading from
   `OffsetOldest` is never an error. Per-partition caps follow key-based
   compaction semantics and are not reported. The SQLite store checks the
   boundary after its event query, and before each `ReadStream` batch's first
-  event, so a concurrent `Trim` cannot slip events past a reader.
+  event, so a concurrent `Trim` cannot slip events past a reader. Once `Trim`
+  has removed every event, `OffsetNewest` resolves to the trim boundary
+  rather than `OffsetOldest`, so a checkpoint taken then still detects later
+  gaps.
 - `state.Materializer.Compact` saves a snapshot and then trims the log prefix
   it covers, bounded by caller-supplied checkpoints of other readers. It uses
-  `Trim` when available and falls back to `TruncateBefore`.
+  `Trim` when available and falls back to `TruncateBefore`. `Compact`,
+  `SaveSnapshotTo` and `LoadSnapshotFrom` are serialized with one another, so
+  a restore cannot slip between a compaction's capture and its trim.
 - SQLite `OpenProjection` and `Projection`: maintain caller-owned, indexed
   tables from any event log. Each batch of events is applied in the
   transaction that advances the projection's checkpoint (exactly once across
   crashes, so counters are safe); the tables are the snapshot, so restarts
-  apply only the tail and compaction is `Trim(Through: checkpoint)`. Several
-  instances may share a projection; raising `Version` rebuilds through
-  `Reset`, and stale instances stop with `ErrProjectionVersionChanged`. A
+  apply only the tail and compaction is `Trim(Through: committed)` with the
+  checkpoint `Committed` reads from the database. Several instances may share
+  a projection; raising `Version` rebuilds through `Reset`, and stale
+  instances, idle or not, stop with `ErrProjectionVersionChanged`. A
   lower `Version`, or a rebuild over a source that reports a trimmed prefix,
   is refused with `ErrProjectionRebuild`. Design and follow-ups:
   `docs/PROJECTIONS.md`.

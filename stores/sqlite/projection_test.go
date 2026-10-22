@@ -686,3 +686,225 @@ func TestProjectionRejectsASourceThatDoesNotAdvance(t *testing.T) {
 		t.Fatalf("applied %d events from a stuck source", counter.applied.Load())
 	}
 }
+
+// Codex review findings: after another instance rebuilt the projection, an
+// idle stale instance must not report a successful catch-up, and its cached
+// Checkpoint is not a retention bound (Committed is).
+func TestProjectionStaleInstanceAfterARebuild(t *testing.T) {
+	ctx := t.Context()
+	store := newTrimStore(t)
+	appendGroups(t, store, 4)
+	old := &counterProjection{}
+	a, err := store.OpenProjection(ctx, old.config("groups", store, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tail, err := a.CatchUp(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if committed, err := a.Committed(ctx); err != nil || committed != tail {
+		t.Fatalf("Committed = %q, %v; want %q", committed, err, tail)
+	}
+
+	cfg := (&counterProjection{}).config("groups", store, 0)
+	cfg.Version = 2
+	b, err := store.OpenProjection(ctx, cfg) // resets the tables
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No new events: the stale instance's read is empty, yet it must notice.
+	if _, err := a.CatchUp(ctx); !errors.Is(err, ErrProjectionVersionChanged) {
+		t.Fatalf("stale CatchUp = %v, want ErrProjectionVersionChanged", err)
+	}
+	if a.Checkpoint() != tail {
+		t.Fatalf("cached checkpoint = %q", a.Checkpoint())
+	}
+	if _, err := a.Committed(ctx); !errors.Is(err, ErrProjectionVersionChanged) {
+		t.Fatalf("stale Committed = %v, want ErrProjectionVersionChanged", err)
+	}
+	if committed, err := b.Committed(ctx); err != nil || committed != eventbus.OffsetOldest {
+		t.Fatalf("Committed during the rebuild = %q, %v; want OffsetOldest", committed, err)
+	}
+	if _, err := b.CatchUp(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if committed, err := b.Committed(ctx); err != nil || committed != tail {
+		t.Fatalf("Committed after the rebuild = %q, %v", committed, err)
+	}
+}
+
+// An instance whose source no longer holds the events another instance
+// applied (retention trimmed them through the committed checkpoint) adopts
+// the stored checkpoint instead of reporting an older one.
+func TestProjectionAdoptsACheckpointAdvancedElsewhere(t *testing.T) {
+	ctx := t.Context()
+	source := eventbus.NewMemoryStore()
+	db := newTrimStore(t)
+	appendGroups(t, source, 3)
+	a, err := db.OpenProjection(ctx, (&counterProjection{}).config("groups", source, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := db.OpenProjection(ctx, (&counterProjection{}).config("groups", source, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.CatchUp(ctx); err != nil {
+		t.Fatal(err)
+	}
+	committed, err := b.Committed(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.Trim(ctx, eventbus.RetentionPolicy{Through: committed}); err != nil {
+		t.Fatal(err)
+	}
+	if checkpoint, err := a.CatchUp(ctx); err != nil || checkpoint != committed || a.Checkpoint() != committed {
+		t.Fatalf("CatchUp = %q, %v; want the adopted %q", checkpoint, err, committed)
+	}
+}
+
+// Codex review (second round): an instance lagging behind another must not
+// be stranded when the source was trimmed through the other's committed
+// checkpoint; the tables already hold those events.
+func TestProjectionLaggingInstanceSurvivesSafeRetention(t *testing.T) {
+	ctx := t.Context()
+	source := eventbus.NewMemoryStore()
+	db := newTrimStore(t)
+	appendGroups(t, source, 2)
+	lagging := &counterProjection{}
+	a, err := db.OpenProjection(ctx, lagging.config("groups", source, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	early, err := a.CatchUp(ctx) // a concrete checkpoint, not OffsetOldest
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := db.OpenProjection(ctx, (&counterProjection{}).config("groups", source, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendGroups(t, source, 3)
+	if _, err := b.CatchUp(ctx); err != nil {
+		t.Fatal(err)
+	}
+	committed, err := b.Committed(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.Trim(ctx, eventbus.RetentionPolicy{Through: committed}); err != nil {
+		t.Fatal(err)
+	}
+	if a.Checkpoint() != early {
+		t.Fatalf("A moved unexpectedly to %q", a.Checkpoint())
+	}
+	if checkpoint, err := a.CatchUp(ctx); err != nil || checkpoint != committed {
+		t.Fatalf("lagging CatchUp = %q, %v; want the adopted %q", checkpoint, err, committed)
+	}
+	if lagging.applied.Load() != 2 {
+		t.Fatalf("A applied %d events; B's events must not be applied again", lagging.applied.Load())
+	}
+	// A source error with an unchanged stored checkpoint is still reported,
+	// and a rebuild by another instance still stops a stale one.
+	broken := (&counterProjection{}).config("broken", failingReadSource{source}, 0)
+	stale, err := db.OpenProjection(ctx, broken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	broken.Version = 2
+	if _, err := db.OpenProjection(ctx, broken); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stale.CatchUp(ctx); !errors.Is(err, ErrProjectionVersionChanged) {
+		t.Fatalf("stale CatchUp over a failing source = %v", err)
+	}
+}
+
+func TestProjectionCommittedLoadFailure(t *testing.T) {
+	store := newTrimStore(t)
+	p, err := store.OpenProjection(t.Context(), (&counterProjection{}).config("groups", store, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`DELETE FROM ebu_projections`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Committed(t.Context()); err == nil || !strings.Contains(err.Error(), "load checkpoint") {
+		t.Fatalf("Committed = %v", err)
+	}
+	if _, err := p.CatchUp(t.Context()); err == nil || !strings.Contains(err.Error(), "load checkpoint") {
+		t.Fatalf("CatchUp = %v", err)
+	}
+}
+
+// Review-bot finding: with the same store as source and a pool capped at one
+// connection, the rebuild guard must not need a second connection.
+func TestProjectionRebuildWithASingleConnection(t *testing.T) {
+	for _, trimmed := range []bool{false, true} {
+		store := newTrimStore(t)
+		offsets := appendGroups(t, store, 3)
+		if trimmed {
+			if _, err := store.Trim(t.Context(), eventbus.RetentionPolicy{Through: offsets[0]}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		store.db.SetMaxOpenConns(1)
+		cfg := (&counterProjection{}).config("groups", store, 0)
+		if _, err := store.OpenProjection(t.Context(), cfg); err != nil {
+			t.Fatal(err)
+		}
+		cfg.Version = 2
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		_, err := store.OpenProjection(ctx, cfg)
+		cancel()
+		switch {
+		case errors.Is(err, context.DeadlineExceeded):
+			t.Fatalf("trimmed=%v: the rebuild guard deadlocked on a single connection", trimmed)
+		case trimmed && !errors.Is(err, ErrProjectionRebuild):
+			t.Fatalf("rebuild over a trimmed source = %v, want ErrProjectionRebuild", err)
+		case !trimmed && err != nil:
+			t.Fatalf("rebuild = %v", err)
+		}
+	}
+}
+
+func TestProjectionMissingResetIsARebuildError(t *testing.T) {
+	store := newTrimStore(t)
+	cfg := (&counterProjection{}).config("groups", store, 0)
+	if _, err := store.OpenProjection(t.Context(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Version, cfg.Reset = 2, nil
+	if _, err := store.OpenProjection(t.Context(), cfg); !errors.Is(err, ErrProjectionRebuild) || !strings.Contains(err.Error(), "requires Reset") {
+		t.Fatalf("OpenProjection = %v", err)
+	}
+}
+
+// The rebuild guard reads another SQLite store's boundary through that
+// store's own pool.
+func TestProjectionRebuildOverAnotherSQLiteStore(t *testing.T) {
+	for _, trimmed := range []bool{false, true} {
+		source := newTrimStore(t)
+		offsets := appendGroups(t, source, 3)
+		if trimmed {
+			if _, err := source.Trim(t.Context(), eventbus.RetentionPolicy{Through: offsets[0]}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		db := newTrimStore(t)
+		cfg := (&counterProjection{}).config("groups", source, 0)
+		if _, err := db.OpenProjection(t.Context(), cfg); err != nil {
+			t.Fatal(err)
+		}
+		cfg.Version = 2
+		_, err := db.OpenProjection(t.Context(), cfg)
+		if trimmed && (!errors.Is(err, ErrProjectionRebuild) || !strings.Contains(err.Error(), string(offsets[0]))) {
+			t.Fatalf("rebuild over a trimmed SQLite source = %v", err)
+		}
+		if !trimmed && err != nil {
+			t.Fatalf("rebuild over an untrimmed SQLite source = %v", err)
+		}
+	}
+}

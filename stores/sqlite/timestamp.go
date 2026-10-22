@@ -50,11 +50,13 @@ func (t *storedTime) parse(text string) error {
 	// time.Time.String appends the monotonic clock reading (" m=+0.012")
 	// for values from time.Now, such as the bus's own timestamps; it has no
 	// bearing on the instant.
-	if i := strings.Index(text, " m="); i >= 0 {
+	if i := strings.LastIndex(text, " m="); i >= 0 && i+3 < len(text) && (text[i+3] == '+' || text[i+3] == '-') {
 		text = text[:i]
 	}
-	// Drop a trailing zone name ("UTC", "+0500", "UTC+5") after the offset.
-	if fields := strings.Fields(text); len(fields) == 4 {
+	// Keep the date, the clock and the numeric offset; the zone name after
+	// them ("UTC", "+0500", "UTC+5", "Custom Zone") only labels the offset
+	// and may contain spaces.
+	if fields := strings.Fields(text); len(fields) >= 4 {
 		text = strings.Join(fields[:3], " ")
 	}
 	for _, layout := range storedTimeLayouts {
