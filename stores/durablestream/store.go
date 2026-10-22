@@ -29,6 +29,22 @@
 // Appends are independent POSTs, safe for concurrent use; the server orders
 // them.
 //
+// # Idempotent, fenced producers
+//
+// WithProducer switches Append to the protocol's idempotent producer
+// (section 5.2.1). Each append carries Producer-Id, Producer-Epoch and a
+// per-epoch Producer-Seq; retries reuse the sequence number, so a retry whose
+// first attempt was committed is deduplicated by the server instead of being
+// written twice. A writer whose epoch is older than one the server has
+// accepted for the same producer ID is fenced: its appends fail with
+// ErrProducerFenced and nothing is written. Every live instance therefore
+// needs its own, newer epoch — supplied by the caller, or claimed from the
+// server at the first append with WithProducerAutoClaim. Producer appends are
+// serialized per Store. Exactly-once holds within an epoch to the extent the
+// server commits producer state atomically with the data (the protocol's
+// atomicity requirement); a server that loses producer state treats the
+// producer as new.
+//
 // # Snapshots and retention
 //
 // The store implements eventbus.EventStoreSnapshotter on a companion stream
@@ -96,6 +112,10 @@ type Store struct {
 	// snap tracks the lazily created snapshot companion stream (see
 	// snapshot.go).
 	snap snapState
+
+	// producer is the idempotent producer state (see WithProducer), or nil
+	// for plain at-least-once appends.
+	producer *producerState
 }
 
 // Ensure Store implements the EventStore and EventStoreTailer interfaces.
@@ -136,6 +156,9 @@ func NewWithContext(ctx context.Context, baseURL string, streamPath string, opts
 	cfg := defaultConfig()
 	for _, opt := range opts {
 		opt(cfg)
+	}
+	if err := validateProducer(cfg); err != nil {
+		return nil, err
 	}
 
 	// The client applies no global timeout of its own; a hung server would
@@ -179,6 +202,7 @@ func NewWithContext(ctx context.Context, baseURL string, streamPath string, opts
 		streamURL:  streamURL,
 		path:       streamPath,
 		cfg:        cfg,
+		producer:   newProducerState(cfg),
 	}, nil
 }
 
@@ -224,10 +248,17 @@ func fromWireOffset(o durablestreams.Offset) eventbus.Offset {
 // skipped. It is safe to persist (e.g., via SaveOffset).
 //
 // Transient failures (network errors, HTTP 5xx, 429) are retried with
-// exponential backoff; see WithRetry. Appends are at-least-once: a retry of
-// a request that committed server-side but lost its response stores the
-// event again. Duplicates are documented rather than masked; consumers
+// exponential backoff; see WithRetry. By default appends are at-least-once: a
+// retry of a request that committed server-side but lost its response stores
+// the event again. Duplicates are documented rather than masked; consumers
 // deduplicate on Event.ID.
+//
+// With WithProducer, appends use the protocol's idempotent producer instead:
+// the server deduplicates retries and fences writers with an older epoch
+// (ErrProducerFenced), and concurrent Append calls are serialized. When a
+// retry is deduplicated the server reports no offset; Append then recovers
+// the exact offset after the event, or returns ErrProducerIndeterminate when
+// none exists (see WithProducer).
 func (s *Store) Append(ctx context.Context, event *eventbus.Event) (eventbus.Offset, error) {
 	writeEvent := storedEventForWrite{
 		ID:       event.ID,
@@ -243,6 +274,9 @@ func (s *Store) Append(ctx context.Context, event *eventbus.Event) (eventbus.Off
 	data, err := json.Marshal(writeEvent)
 	if err != nil {
 		return "", fmt.Errorf("durablestream: marshal event: %w", err)
+	}
+	if s.producer != nil {
+		return s.appendAsProducer(ctx, event.ID, data)
 	}
 
 	var lastErr error
