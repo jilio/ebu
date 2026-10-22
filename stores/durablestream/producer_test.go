@@ -172,7 +172,7 @@ func TestProducer_DuplicateTailLookupFailureIsReported(t *testing.T) {
 		case 2:
 			w.WriteHeader(http.StatusServiceUnavailable) // may have landed
 		default:
-			w.Header().Set("Producer-Seq", "1")
+			w.Header().Set("Producer-Seq", r.Header.Get("Producer-Seq"))
 			w.WriteHeader(http.StatusNoContent) // ...and it had
 		}
 		return true
@@ -182,16 +182,29 @@ func TestProducer_DuplicateTailLookupFailureIsReported(t *testing.T) {
 		t.Fatal(err)
 	}
 	inner := ps.Config.Handler
+	var headFails atomic.Bool
 	ps.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet {
+		switch {
+		case r.Method == http.MethodHead && headFails.Load():
 			http.Error(w, "not found", http.StatusNotFound)
-			return
+		case r.Method == http.MethodHead:
+			w.Header().Set("Stream-Next-Offset", padOffset(9)) // the event lies before this tail
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet:
+			http.Error(w, "not found", http.StatusNotFound)
+		default:
+			inner.ServeHTTP(w, r)
 		}
-		inner.ServeHTTP(w, r)
 	})
 	_, err := store.Append(t.Context(), producerEvent(1))
 	if err == nil || !errors.Is(err, durablestreams.ErrStreamNotFound) || !strings.Contains(err.Error(), "append committed, but its offset is unknown") {
 		t.Fatalf("expected a committed-but-unknown-offset error, got %v", err)
+	}
+	// The tail lookup that bounds the scan can fail too.
+	headFails.Store(true)
+	posts.Store(1) // the next append: 503, then the duplicate
+	if _, err := store.Append(t.Context(), producerEvent(2)); err == nil || !strings.Contains(err.Error(), "append committed, but its offset is unknown") {
+		t.Fatalf("tail lookup failure = %v", err)
 	}
 }
 
@@ -699,8 +712,8 @@ func TestProducer_AutoClaimTransientThenForeignDuplicateIsNotSuccess(t *testing.
 	writeAsPredecessor(t, ps, 0, 3)
 	failFirstPosts(ps, 1, http.StatusServiceUnavailable)
 	fresh := newProducerStore(t, ps, "events", ds.WithProducer("w", 0), ds.WithProducerAutoClaim())
-	if _, err := fresh.Append(t.Context(), producerEvent(99)); !errors.Is(err, ds.ErrProducerConflict) {
-		t.Fatalf("Append = %v, want ErrProducerConflict (the duplicate is the predecessor's)", err)
+	if _, err := fresh.Append(t.Context(), producerEvent(99)); !errors.Is(err, ds.ErrProducerIndeterminate) {
+		t.Fatalf("Append = %v, want ErrProducerIndeterminate, never success", err)
 	}
 	if got := ps.storedMessages("events"); len(got) != 3 {
 		t.Fatalf("stored %d messages", len(got))
@@ -714,16 +727,21 @@ func TestProducer_AutoClaimTransientThenForeignDuplicateIsNotSuccess(t *testing.
 	}
 }
 
-// The same without auto-claim: a reused epoch stays a loud conflict even when
-// a transient failure preceded the duplicate (review probe).
-func TestProducer_ReusedEpochTransientThenDuplicateIsAConflict(t *testing.T) {
+// The same without auto-claim: a reused epoch is never a silent success when
+// a transient failure preceded the duplicate (review probe). Whether the
+// first attempt landed is unknown, so the outcome is indeterminate.
+func TestProducer_ReusedEpochTransientThenDuplicateIsNotSuccess(t *testing.T) {
 	for _, status := range []int{http.StatusServiceUnavailable, http.StatusTooManyRequests} {
 		ps := newProtoServer()
 		writeAsPredecessor(t, ps, 0, 3)
 		failFirstPosts(ps, 1, status)
 		fresh := newProducerStore(t, ps, "events", ds.WithProducer("w", 0))
-		if _, err := fresh.Append(t.Context(), producerEvent(99)); !errors.Is(err, ds.ErrProducerConflict) {
-			t.Fatalf("status %d: Append = %v, want ErrProducerConflict", status, err)
+		if _, err := fresh.Append(t.Context(), producerEvent(99)); !errors.Is(err, ds.ErrProducerIndeterminate) {
+			t.Fatalf("status %d: Append = %v, want ErrProducerIndeterminate", status, err)
+		}
+		// The next append is a definite conflict: no attempt of it landed.
+		if _, err := fresh.Append(t.Context(), producerEvent(100)); !errors.Is(err, ds.ErrProducerConflict) {
+			t.Fatalf("status %d: next Append = %v, want ErrProducerConflict", status, err)
 		}
 		if got := ps.storedMessages("events"); len(got) != 3 {
 			t.Fatalf("status %d: stored %d messages", status, len(got))
@@ -1210,6 +1228,11 @@ func TestProducer_LocateDefensivePaths(t *testing.T) {
 			w.Header().Set("Stream-Next-Offset", padOffset(5))
 			_, _ = w.Write([]byte("not json"))
 		}, "append committed, but its offset is unknown"},
+		{"caught up before the captured tail", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Stream-Next-Offset", r.URL.Query().Get("offset"))
+			w.Header().Set("Stream-Up-To-Date", "true")
+			w.WriteHeader(http.StatusNoContent)
+		}, "no exact offset follows it"},
 		{"chunk that does not advance", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("Stream-Next-Offset", r.URL.Query().Get("offset"))
@@ -1236,15 +1259,109 @@ func TestProducer_LocateDefensivePaths(t *testing.T) {
 			}
 			inner := ps.Config.Handler
 			ps.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.Method == http.MethodGet {
+				switch r.Method {
+				case http.MethodHead:
+					w.Header().Set("Stream-Next-Offset", padOffset(9))
+					w.WriteHeader(http.StatusOK)
+				case http.MethodGet:
 					tc.read(w, r)
-					return
+				default:
+					inner.ServeHTTP(w, r)
 				}
-				inner.ServeHTTP(w, r)
 			})
 			if _, err := store.Append(t.Context(), producerEvent(1)); err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("Append = %v, want %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// Codex review (third round): a higher server sequence does not prove that a
+// possibly landed attempt was rejected. Here sequence 0 lands with its
+// acknowledgement lost, then another writer in the same epoch appends
+// sequence 1 before the retry.
+func TestProducer_LandedAttemptBeforeAnotherWritersNumber(t *testing.T) {
+	ps := newProtoServer()
+	defer ps.Close()
+	var lost atomic.Bool
+	ps.loseAck = func(*http.Request) bool {
+		if !lost.CompareAndSwap(false, true) {
+			return false
+		}
+		ps.mu.Lock()
+		st := ps.streams["events"]
+		st.messages = append(st.messages, []byte(`{"id":"other","type":"other","data":1}`))
+		st.producers["w"].lastSeq = 1 // the other writer's sequence 1
+		ps.mu.Unlock()
+		return true
+	}
+	store := newProducerStore(t, ps, "events", ds.WithProducer("w", 0))
+	_, err := store.Append(t.Context(), producerEvent(0))
+	if errors.Is(err, ds.ErrProducerConflict) || !errors.Is(err, ds.ErrProducerIndeterminate) {
+		t.Fatalf("Append = %v, want ErrProducerIndeterminate (the event is stored)", err)
+	}
+	if got := ps.storedMessages("events"); len(got) != 2 || !strings.Contains(got[0], "event-0") {
+		t.Fatalf("messages = %v", got)
+	}
+}
+
+// Codex review (third round): an ID identifies a publish, so it can occur
+// more than once; the appended copy cannot then be told apart.
+func TestProducer_RepeatedEventIDIsIndeterminate(t *testing.T) {
+	ps := newProtoServer()
+	defer ps.Close()
+	store := newProducerStore(t, ps, "events", ds.WithProducer("w", 0))
+	if _, err := store.Append(t.Context(), producerEvent(0)); err != nil {
+		t.Fatal(err)
+	}
+	// An earlier publish of event-1 already reached the stream, after the
+	// store's last acknowledged offset (for example an indeterminate append
+	// that the caller retried).
+	ps.mu.Lock()
+	ps.streams["events"].messages = append(ps.streams["events"].messages, []byte(`{"id":"event-1","type":"produced","data":1}`))
+	ps.mu.Unlock()
+	ps.chunkLimit = 1 // each copy ends its own chunk
+	var lost atomic.Bool
+	ps.loseAck = func(*http.Request) bool { return lost.CompareAndSwap(false, true) }
+	if _, err := store.Append(t.Context(), producerEvent(1)); !errors.Is(err, ds.ErrProducerIndeterminate) {
+		t.Fatalf("Append = %v, want ErrProducerIndeterminate", err)
+	}
+}
+
+// Codex review (third round): offset recovery stops at the tail captured
+// before scanning, so writers extending the stream cannot keep it running.
+func TestProducer_OffsetRecoveryIsBoundedOnABusyStream(t *testing.T) {
+	ps := newProtoServer()
+	defer ps.Close()
+	ps.chunkLimit = 1
+	inner := ps.Config.Handler
+	var busy atomic.Bool
+	ps.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && busy.Load() {
+			// Another writer appends before every read.
+			ps.mu.Lock()
+			st := ps.streams["events"]
+			st.messages = append(st.messages, []byte(`{"id":"busy","type":"other","data":1}`))
+			ps.mu.Unlock()
+		}
+		inner.ServeHTTP(w, r)
+	})
+	store := newProducerStore(t, ps, "events", ds.WithProducer("w", 0))
+	if _, err := store.Append(t.Context(), producerEvent(0)); err != nil {
+		t.Fatal(err)
+	}
+	var lost atomic.Bool
+	ps.loseAck = func(*http.Request) bool {
+		if lost.CompareAndSwap(false, true) {
+			busy.Store(true)
+			return true
+		}
+		return false
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	offset, err := store.Append(ctx, producerEvent(1))
+	if err != nil || offset != eventbus.Offset(padOffset(2)) {
+		t.Fatalf("Append = %q, %v; want the exact %q, found within the captured tail", offset, err, padOffset(2))
 	}
 }

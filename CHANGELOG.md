@@ -20,9 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ErrProducerFenced` (`*ProducerFencedError`) and writes nothing; reusing an
   earlier instance's epoch fails with `ErrProducerConflict` rather than being
   silently dropped as a duplicate. A duplicate answer counts as success only
-  when it is provably this event's (the store owns its epoch and no earlier
-  request carried the number); otherwise the server's `Producer-Seq` decides
-  between a conflict and a claim, or `Append` returns
+  when it is provably this event's (an earlier attempt may have landed, the
+  store owns its epoch, and no earlier request carried the number); a
+  duplicate with no possibly landed attempt is another writer's (a conflict,
+  or a claim with auto-claim), and any other duplicate is
   `ErrProducerIndeterminate`. An event is never re-sent under another number
   or epoch while an earlier attempt of it may still arrive (that would store
   it twice); such an append is reported as `ErrProducerIndeterminate`. A first

@@ -54,10 +54,11 @@ var (
 	// this event: another writer is using the same producer ID and epoch (for
 	// example a restarted instance that reused its predecessor's epoch), or
 	// an abandoned request of this store arrived late. This event was not
-	// appended. Give every live writer its own epoch. A store that meets the
-	// conflict before it owns its epoch never takes that epoch over: without
-	// auto-claim every later Append fails with the same error, with auto-claim
-	// the next Append claims a fresh epoch.
+	// appended: it is reported only when no attempt of this event can have
+	// landed. Give every live writer its own epoch. A store that meets the
+	// conflict before it owns its epoch never takes that epoch over: every
+	// later Append fails with the same error (an auto-claim store claims a
+	// fresh epoch instead of reaching this error).
 	ErrProducerConflict = errors.New("durablestream: producer sequence already used by another writer")
 
 	// ErrProducerIndeterminate reports an Append whose outcome cannot be
@@ -249,9 +250,11 @@ type producerResponse struct {
 // A duplicate answer (204) proves this Append's event was stored only when an
 // earlier attempt of it may have landed, the store owns its epoch (no other
 // instance writes it), and the number was never sent by an earlier request
-// that might still arrive. Otherwise the server's Producer-Seq (the highest
-// accepted number) tells another writer's duplicate apart; when it cannot,
-// the outcome is reported as ErrProducerIndeterminate, never as success.
+// that might still arrive. A duplicate with no possibly landed attempt is
+// another writer's event; any other duplicate is reported as
+// ErrProducerIndeterminate, never as success (even a higher Producer-Seq
+// does not prove rejection: the attempt may have landed before another
+// writer's later numbers).
 func (s *Store) appendAsProducer(ctx context.Context, eventID string, data []byte) (eventbus.Offset, error) {
 	p := s.producer
 	if err := ctx.Err(); err != nil {
@@ -298,16 +301,12 @@ func (s *Store) appendAsProducer(ctx context.Context, eventID string, data []byt
 		return nil
 	}
 	// conflicted reports another writer's event under this store's epoch.
-	// Before the store owns its epoch that epoch is someone else's: without
-	// auto-claim the store stops for good; with it, the next Append claims a
-	// fresh epoch.
+	// Before the store owns its epoch that epoch is someone else's, so the
+	// store stops for good. (An auto-claim store never gets here unowned: it
+	// claims instead, or reports an indeterminate duplicate and claims next.)
 	conflicted := func(err error) error {
 		if !p.owned {
-			if p.autoClaim {
-				p.claimNext = true
-			} else {
-				p.conflict = err
-			}
+			p.conflict = err
 		}
 		return err
 	}
@@ -396,7 +395,11 @@ func (s *Store) appendAsProducer(ctx context.Context, eventID string, data []byt
 				// carried this number: an earlier attempt landed and only its
 				// acknowledgement was lost. Written once.
 				return s.producerAckOffset(ctx, p, eventID, epoch, seq)
-			case mayHaveLanded && (p.owned || !known || highest == seq):
+			case mayHaveLanded:
+				// An earlier attempt may have landed, but the duplicate is
+				// not attributable to it: a higher server sequence does not
+				// prove rejection either (the attempt may have landed before
+				// another writer's later numbers).
 				if !p.owned && p.autoClaim {
 					// The epoch may be another writer's: take a fresh one
 					// for the next event rather than ever owning this one.
@@ -501,14 +504,21 @@ func (s *Store) locate(ctx context.Context, from eventbus.Offset, eventID string
 	if eventID == "" {
 		return "", false, nil
 	}
-	found := false
-	for at := from; ; {
+	// The event was committed before the duplicate answer, so it lies before
+	// the tail captured now. Scanning stops there: other writers extending
+	// the stream cannot keep the scan (and the producer) busy forever.
+	tail, err := s.resolveTail(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	matches := 0
+	for at := from; at < tail; {
 		chunk, _, err := s.readChunk(ctx, at)
 		if err != nil {
 			return "", false, err
 		}
 		if chunk == nil {
-			return offset, found && exact, nil
+			break
 		}
 		next := eventbus.Offset(chunk.NextOffset)
 		events, _, err := s.decodeChunk(chunk.Data, next, at)
@@ -520,14 +530,19 @@ func (s *Store) locate(ctx context.Context, from eventbus.Offset, eventID string
 				// The record that ends a chunk carries the chunk's next
 				// offset; any other carries the chunk start (the same value
 				// when a chunk fails to advance, so that is never exact).
-				found, offset, exact = true, next, event.Offset == next && next != at
+				matches++
+				offset, exact = next, event.Offset == next && next != at
 			}
 		}
 		if next == at {
-			return offset, found && exact, nil
+			break
 		}
 		at = next
 	}
+	// An ID identifies a publish, not a physical record: with more than one
+	// copy (an earlier, retried publish of the same event) the appended
+	// record cannot be told apart, and either offset could skip events.
+	return offset, matches == 1 && exact, nil
 }
 
 // postAsProducer sends one append attempt with producer headers. Transport

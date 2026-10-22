@@ -302,12 +302,14 @@ store, err := durablestream.New(baseURL, "orders",
   with a sticky `ErrProducerIndeterminate` (open a new `Store` with a newer
   epoch) or, with auto-claim, claims a fresh epoch.
 - **A duplicate is success only when it is provably this event's.** That
-  requires the store to own its epoch and the
-  sequence number to be one no earlier request of the store carried. Otherwise
-  the server's `Producer-Seq` (its highest accepted number) identifies another
-  writer's event (`ErrProducerConflict`, or a claim with auto-claim), and when
-  even that cannot tell, `Append` returns `ErrProducerIndeterminate` instead of
-  claiming success.
+  requires an earlier attempt of the event that may have landed, a store that
+  owns its epoch, and a sequence number no earlier request of the store
+  carried. A duplicate with no possibly landed attempt is another writer's
+  event (`ErrProducerConflict`, or a claim with auto-claim); any other
+  duplicate is `ErrProducerIndeterminate`, never success. When the exact
+  offset is recovered by reading, an event ID that occurs more than once makes
+  the appended copy ambiguous (indeterminate), and the read stops at the tail
+  captured beforehand, so a busy stream cannot keep it running.
 - **Stale writers are fenced.** Once the server has accepted an append with a
   higher epoch for the same producer ID, appends from an older epoch fail with
   `durablestream.ErrProducerFenced` (`*ProducerFencedError` carries both
