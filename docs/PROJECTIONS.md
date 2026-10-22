@@ -154,6 +154,10 @@ for `(msg.Type, msg.Key)`, mapping the fields you query into indexed columns.
   not redeliver events (true for MemoryStore, SQLite and Durable Streams, which
   return whole chunks with the chunk's exact next offset). For other sources,
   make `Apply` idempotent, for example by recording applied event IDs.
+- **Cross-file sources.** When the source is another store or file, reading
+  a batch and committing it are not one transaction. That is safe because the
+  checkpoint commits with the tables and the source's `nextOffset` does not
+  redeliver; only the projection's own database must be consistent.
 - **Skipped records are invisible.** A Durable Streams source skips
   undecodable records by default; open it with `WithStrictDecoding()` so a
   corrupt record stops the projection instead.
