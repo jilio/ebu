@@ -16,6 +16,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The default remains `SynchronousNormal` (the previous, faster behavior that
   can roll back the latest commits on power loss); `OpenReadOnly` ignores the
   option and `New` rejects undeclared modes.
+- Durable Streams `WithProducer(id, epoch)` makes `Append` use the protocol's
+  idempotent producer (Producer-Id, Producer-Epoch, Producer-Seq). A retry
+  whose first attempt was committed is deduplicated by the server instead of
+  written twice; when the server reports no offset for it, `Append` recovers
+  the exact offset after the event (reading from its previous acknowledged
+  offset), or returns `ErrProducerIndeterminate` when another writer's events
+  follow it so that no exact offset exists. A writer whose epoch is older than
+  one the server has accepted is fenced with the permanent
+  `ErrProducerFenced` (`*ProducerFencedError`) and writes nothing; reusing an
+  earlier instance's epoch fails with `ErrProducerConflict` rather than being
+  silently dropped as a duplicate. A duplicate answer counts as success only
+  when it is provably this event's (an earlier attempt may have landed, the
+  store owns its epoch, and no earlier request carried the number); a
+  duplicate with no possibly landed attempt is another writer's (a conflict,
+  or a claim with auto-claim), and any other duplicate is
+  `ErrProducerIndeterminate`. An event is never re-sent under another number
+  or epoch while an earlier attempt of it may still arrive (that would store
+  it twice); such an append is reported as `ErrProducerIndeterminate`. A first
+  append that gives up before a new epoch is established does not wedge the
+  store: the next append restarts the epoch at sequence 0. A store that finds
+  its epoch in use before owning it never takes that epoch over (a sticky
+  `ErrProducerConflict`, or a fresh claim with auto-claim), and ownership
+  comes only from an acknowledged sequence 0. Requests abandoned after a
+  timeout can still arrive late; exactly-once holds for acknowledged appends,
+  and consumers still deduplicate on `Event.ID`. `WithProducerAutoClaim()`
+  claims the next free epoch at the first append (newest instance wins; an
+  instance that owns its epoch never re-claims), and `ProducerEpoch` reports
+  the epoch in use.
+  Producer appends are serialized per store; a queued `Append` gives up when
+  its context ends. If the offset lookup after a deduplicated retry fails,
+  `Append` reports an error although the event is stored, like any
+  indeterminate append. Stores without the option send no producer headers
+  and keep their at-least-once behavior.
 - `EventStoreTrimmer` and `RetentionPolicy`: bound a log by offset (`Through`),
   age (`OlderThan`), total count (`MaxEvents`) and per-partition count
   (`PartitionKey` + `MaxPerPartition`, partitioned by an event metadata key).
