@@ -536,3 +536,85 @@ func TestTrimEmptyLog(t *testing.T) {
 		t.Fatalf("Append after an empty Trim = %q, %v", offset, err)
 	}
 }
+
+// TestTrimCommitFailureKeepsEvents makes COMMIT itself fail: a deferred
+// foreign key from another table references a trimmed event, and SQLite only
+// checks deferred constraints at commit.
+func TestTrimCommitFailureKeepsEvents(t *testing.T) {
+	store := newTrimStore(t)
+	offsets := appendTrimEvents(t, store, 3, nil)
+	store.db.SetMaxOpenConns(1) // the PRAGMA below is per connection
+	for _, statement := range []string{
+		"PRAGMA foreign_keys = ON",
+		"CREATE TABLE refs (event INTEGER REFERENCES events(position) DEFERRABLE INITIALLY DEFERRED)",
+		"INSERT INTO refs VALUES (1)",
+	} {
+		if _, err := store.db.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.Trim(t.Context(), eventbus.RetentionPolicy{Through: offsets[0]}); err == nil || !strings.Contains(err.Error(), "trim: commit") {
+		t.Fatalf("Trim = %v, want a commit failure", err)
+	}
+	if got := trimmedIDs(t, store); got != "e1,e2,e3" {
+		t.Fatalf("a failed commit removed events: %q", got)
+	}
+	if _, _, err := store.Read(t.Context(), offsets[0], 0); err != nil {
+		t.Fatalf("a failed commit recorded a boundary: %v", err)
+	}
+}
+
+// TestTrimAgeScanIterationFailure fails the timestamp scan between rows (a
+// step error, reported by rows.Err rather than by Query or Scan).
+func TestTrimAgeScanIterationFailure(t *testing.T) {
+	store := newTrimStore(t)
+	appendTrimEvents(t, store, 3, nil)
+	if _, err := store.db.Exec(`ALTER TABLE events RENAME TO events_moved;
+		CREATE VIEW events AS SELECT position, type, data,
+			CASE WHEN position = 2 THEN json_extract('not json', '$') ELSE timestamp END AS timestamp
+		FROM events_moved`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Trim(t.Context(), eventbus.RetentionPolicy{OlderThan: trimEpoch.Add(time.Hour)}); err == nil || !strings.Contains(err.Error(), "scan timestamps") || !strings.Contains(err.Error(), "malformed JSON") {
+		t.Fatalf("Trim = %v, want an iteration failure", err)
+	}
+}
+
+// TestTrimBoundaryTableWithoutABoundary covers a retention table that exists
+// but holds no boundary yet: a zero-policy Trim creates it without removing
+// anything, and readers must treat that as "nothing trimmed".
+func TestTrimBoundaryTableWithoutABoundary(t *testing.T) {
+	store := newTrimStore(t)
+	offsets := appendTrimEvents(t, store, 3, nil)
+	if result, err := store.Trim(t.Context(), eventbus.RetentionPolicy{}); err != nil || result.TrimmedThrough != eventbus.OffsetOldest {
+		t.Fatalf("zero Trim = %+v, %v", result, err)
+	}
+	// Reading from the tail returns nothing and so consults the table.
+	if events, next, err := store.Read(t.Context(), offsets[2], 0); err != nil || len(events) != 0 || next != offsets[2] {
+		t.Fatalf("Read from the tail = %d, %q, %v", len(events), next, err)
+	}
+}
+
+// TestTrimBeginFailure holds the write lock on another connection, so the
+// Trim transaction cannot begin within the busy timeout.
+func TestTrimBeginFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	store, err := New(path, WithBusyTimeout(20*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	holder, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close()
+	tx, err := holder.db.BeginTx(t.Context(), nil) // BEGIN IMMEDIATE
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := store.Trim(t.Context(), eventbus.RetentionPolicy{MaxEvents: 1}); err == nil || !strings.Contains(err.Error(), "sqlite: trim: begin") {
+		t.Fatalf("Trim = %v, want a begin failure", err)
+	}
+}
