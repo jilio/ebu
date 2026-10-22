@@ -50,9 +50,9 @@ func defaultConfig() *config {
 
 // Synchronous selects how a writable file-backed store syncs commits to stable
 // storage: the trade-off between append latency and durability across power
-// loss or an operating-system crash. Every store runs in WAL mode, where both
-// settings keep the database consistent; they differ in which acknowledged
-// commits can be lost.
+// loss or an operating-system crash. Writable file-backed stores opened with
+// New run in WAL mode, where both settings keep the database consistent; they
+// differ in which acknowledged commits can be lost.
 type Synchronous int
 
 const (
