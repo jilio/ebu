@@ -71,6 +71,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Trim` when available and falls back to `TruncateBefore`. `Compact`,
   `SaveSnapshotTo` and `LoadSnapshotFrom` are serialized with one another, so
   a restore cannot slip between a compaction's capture and its trim.
+- SQLite `OpenProjection` and `Projection`: maintain caller-owned, indexed
+  tables from any event log. Each batch of events is applied in the
+  transaction that advances the projection's checkpoint (exactly once across
+  crashes, so counters are safe); the tables are the snapshot, so restarts
+  apply only the tail and compaction is `Trim(Through: committed)` with the
+  checkpoint `Committed` reads from the database. Several instances may share
+  a projection; raising `Version` rebuilds through `Reset`, and stale
+  instances, idle or not, stop with `ErrProjectionVersionChanged`. A
+  lower `Version`, or a rebuild over a source that reports a trimmed prefix,
+  is refused with `ErrProjectionRebuild`. Design and follow-ups:
+  `docs/PROJECTIONS.md`.
 - Durable Streams reads and tails that the server answers with 410 Gone from a
   concrete offset (server-side retention) now also match `ErrOffsetTrimmed`,
   with `ResumeFrom` = `OffsetOldest`; `errors.Is(err,

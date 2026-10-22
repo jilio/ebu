@@ -224,25 +224,33 @@ func firstNotOlder(ctx context.Context, tx *sql.Tx, cutoff time.Time) (int64, er
 // boundary, so its absence proves no trim committed; once seen, it is never
 // looked up again.
 func (s *SQLiteStore) trimmedThrough(ctx context.Context) (int64, error) {
-	if !s.retentionTable.Load() {
-		var exists bool
-		if err := s.db.QueryRowContext(ctx, retentionTableExists).Scan(&exists); err != nil {
-			return 0, fmt.Errorf("sqlite: look up trim boundary: %w", err)
-		}
-		if !exists {
-			return 0, nil
-		}
+	watermark, exists, err := lookupBoundary(ctx, s.db, s.retentionTable.Load())
+	if exists {
 		s.retentionTable.Store(true)
 	}
-	var watermark int64
-	err := s.db.QueryRowContext(ctx, selectTrimmedThrough).Scan(&watermark)
+	return watermark, err
+}
+
+// lookupBoundary reads the trim boundary through q, a pool or a transaction.
+// Unless the retention table is known to exist it checks sqlite_master first;
+// exists reports whether the table was found.
+func lookupBoundary(ctx context.Context, q queryRower, knownToExist bool) (watermark int64, exists bool, err error) {
+	if !knownToExist {
+		if err := q.QueryRowContext(ctx, retentionTableExists).Scan(&exists); err != nil {
+			return 0, false, fmt.Errorf("sqlite: look up trim boundary: %w", err)
+		}
+		if !exists {
+			return 0, false, nil
+		}
+	}
+	err = q.QueryRowContext(ctx, selectTrimmedThrough).Scan(&watermark)
 	switch {
 	case err == nil:
-		return watermark, nil
+		return watermark, true, nil
 	case errors.Is(err, sql.ErrNoRows):
-		return 0, nil
+		return 0, true, nil
 	default:
-		return 0, fmt.Errorf("sqlite: read trim boundary: %w", err)
+		return 0, true, fmt.Errorf("sqlite: read trim boundary: %w", err)
 	}
 }
 

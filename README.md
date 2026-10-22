@@ -24,6 +24,7 @@ A lightweight, type-safe event bus for Go with generics support. Build decoupled
 - 🪞 **Log replication** - `Mirror` one store into another with envelopes preserved
 - **Confirmed replication** - `Replicator` lets important writes wait for an acknowledged prefix while ordinary writes remain asynchronous
 - 🌍 **Remote storage** - Native support for remote backends like [durable-streams](https://github.com/durable-streams/durable-streams)
+- **Indexed projections** - Maintain queryable SQLite tables from a log, each event applied exactly once with its checkpoint ([guide](docs/PROJECTIONS.md))
 - **Retention** - Trim logs by offset, age, count or per-partition count with stable offsets and an explicit `ErrOffsetTrimmed` gap signal
 - 🔄 **Event upcasting** - Seamless event schema migration and versioning
 - ✅ **100% test coverage** - Thoroughly tested for reliability
@@ -571,6 +572,7 @@ See [TypeNamer examples](docs/EXAMPLES.md#custom-event-type-names-typenamer) for
 - 📖 [**Complete Examples**](docs/EXAMPLES.md) - Comprehensive usage examples
 - 💾 [**Persistence Guide**](docs/PERSISTENCE.md) - Event storage and replay patterns
 - 🔗 [**Distributed Guide**](docs/DISTRIBUTED.md) - Cross-process delivery with Follow
+- [**Indexed Projections**](docs/PROJECTIONS.md) - Queryable SQL tables maintained from a log
 - 📝 [**Changelog**](CHANGELOG.md) - Release notes and migration-relevant changes
 - 📚 [**API Reference**](https://godoc.org/github.com/jilio/ebu) - Complete API documentation
 

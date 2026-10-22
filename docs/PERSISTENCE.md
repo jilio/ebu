@@ -219,6 +219,14 @@ guarantee holds only if the storage stack honors sync requests (on macOS,
 connection. `OpenReadOnly` stores never write and ignore it; `New` rejects
 undeclared modes.
 
+#### Indexed projections
+
+`store.OpenProjection` maintains caller-owned tables (with real SQL indexes)
+from any event log: each batch of events is applied in the same transaction
+that advances the projection's checkpoint, so every event is applied exactly
+once across crashes, the tables are the snapshot, and compaction never rewrites
+payloads. Query them through `p.DB()`. See [Indexed Projections](PROJECTIONS.md).
+
 Use `sqlite.OpenReadOnly(path, options...)` to read an existing store without
 creating a database, migrating its schema, or changing its journal mode. The
 stored schema version must be supported; an uninitialized or incompatible
