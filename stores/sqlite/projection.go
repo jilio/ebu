@@ -59,8 +59,10 @@ type ProjectionConfig struct {
 	Source eventbus.EventStore
 
 	// Setup creates the projection's tables and indexes. It runs on every
-	// OpenProjection, inside the transaction that registers the checkpoint, so
-	// it must be idempotent (CREATE TABLE IF NOT EXISTS, ...). Optional.
+	// OpenProjection, inside the transaction that registers the checkpoint
+	// (holding the write lock), so it must be idempotent and cheap when there
+	// is nothing to do (CREATE TABLE/INDEX IF NOT EXISTS returns at once once
+	// they exist). Optional.
 	Setup func(ctx context.Context, tx *sql.Tx) error
 
 	// Reset discards the projection's tables or rows before a rebuild; Setup
