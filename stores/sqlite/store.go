@@ -350,7 +350,11 @@ func (s *SQLiteStore) Read(ctx context.Context, from eventbus.Offset, limit int)
 	if err != nil {
 		return nil, from, err
 	}
-	if err = s.checkTrimmed(ctx, from, position); err != nil {
+	var first int64
+	if len(events) > 0 {
+		first, _ = parseOffset(events[0].Offset) // formatted by scanEvent
+	}
+	if err = s.checkTrimmed(ctx, from, position, first); err != nil {
 		events = nil
 		return nil, from, err
 	}
@@ -671,7 +675,7 @@ func (s *SQLiteStore) streamBatched(
 		}
 
 		cursor := currentPos
-		checkTrimmed := func() error { return s.checkTrimmed(ctx, formatOffset(cursor), cursor) }
+		checkTrimmed := func(first int64) error { return s.checkTrimmed(ctx, formatOffset(cursor), cursor, first) }
 		batchCount, lastPos, cont := s.streamBatch(ctx, rows, checkTrimmed, eventCount, iterErr, yield)
 		if !cont {
 			return
@@ -693,26 +697,19 @@ func (s *SQLiteStore) streamBatched(
 
 // streamBatch processes a single batch of rows. Returns (batchCount, lastPos, shouldContinue).
 // shouldContinue is false if iteration should stop (error or early termination).
-// checkTrimmed runs once, before the first event of the batch is yielded (or
-// after an empty batch): the batch query has then taken its read snapshot, so
-// no event behind a concurrent Trim boundary reaches the consumer.
+// checkTrimmed runs once, with the batch's first position, before that event
+// is yielded (or with 0 after an empty batch): the batch query has then taken
+// its read snapshot, so no event behind a concurrent Trim boundary reaches
+// the consumer.
 func (s *SQLiteStore) streamBatch(
 	ctx context.Context,
 	rows rowScanner,
-	checkTrimmed func() error,
+	checkTrimmed func(first int64) error,
 	eventCount *int,
 	iterErr *error,
 	yield func(*eventbus.StoredEvent, error) bool,
 ) (batchCount int, lastPos int64, cont bool) {
 	for rows.Next() {
-		if batchCount == 0 {
-			if err := checkTrimmed(); err != nil {
-				rows.Close() // Best effort close, the gap takes precedence
-				*iterErr = err
-				yield(nil, *iterErr)
-				return 0, 0, false
-			}
-		}
 		// Checked per row, not just per batch, so a large batch still
 		// responds promptly to cancellation.
 		select {
@@ -730,6 +727,14 @@ func (s *SQLiteStore) streamBatch(
 			*iterErr = err
 			yield(nil, *iterErr)
 			return 0, 0, false
+		}
+		if batchCount == 0 {
+			if err := checkTrimmed(position); err != nil {
+				rows.Close() // Best effort close, the gap takes precedence
+				*iterErr = err
+				yield(nil, *iterErr)
+				return 0, 0, false
+			}
 		}
 
 		lastPos = position
@@ -760,7 +765,7 @@ func (s *SQLiteStore) streamBatch(
 	}
 
 	if batchCount == 0 {
-		if err := checkTrimmed(); err != nil {
+		if err := checkTrimmed(0); err != nil {
 			*iterErr = err
 			yield(nil, *iterErr)
 			return 0, 0, false

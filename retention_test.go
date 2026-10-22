@@ -261,6 +261,15 @@ func TestMemoryStoreTrimRejections(t *testing.T) {
 	if _, err := store.Trim(context.Background(), RetentionPolicy{MaxEvents: -1}); err == nil {
 		t.Fatal("invalid policy accepted")
 	}
+	appendRetentionEvents(t, store, 3, nil)
+	for _, through := range []Offset{"zzz", "5", "0000000000000000000x", "000000000000000000001"} {
+		if _, err := store.Trim(context.Background(), RetentionPolicy{Through: through}); err == nil || !strings.Contains(err.Error(), "invalid trim offset") {
+			t.Fatalf("Trim(Through: %q) = %v", through, err)
+		}
+	}
+	if got := retainedIDs(t, store); got != "e1,e2,e3" {
+		t.Fatalf("a rejected Trim removed events: %q", got)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := store.Trim(ctx, RetentionPolicy{MaxEvents: 1}); !errors.Is(err, context.Canceled) {

@@ -1622,6 +1622,11 @@ func (m *MemoryStore) Trim(ctx context.Context, policy RetentionPolicy) (TrimRes
 	if err := ctx.Err(); err != nil {
 		return TrimResult{}, err
 	}
+	if policy.Through != OffsetOldest && !isMemoryOffset(policy.Through) {
+		// Offsets compare as strings: a foreign token would sort after every
+		// event and remove the whole log.
+		return TrimResult{}, fmt.Errorf("memory store: invalid trim offset %q", policy.Through)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -1672,4 +1677,18 @@ func (m *MemoryStore) Trim(ctx context.Context, policy RetentionPolicy) (TrimRes
 		}
 	}
 	return TrimResult{Deleted: deleted, TrimmedThrough: m.trimmedThrough}, nil
+}
+
+// isMemoryOffset reports whether offset has the form MemoryStore issues: 20
+// zero-padded decimal digits.
+func isMemoryOffset(offset Offset) bool {
+	if len(offset) != 20 {
+		return false
+	}
+	for _, c := range []byte(offset) {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
