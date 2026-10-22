@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.20.2] - 2026-10-22
 
 ### Added
 
@@ -52,6 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Publish `0.20.2` as one shared release across the core, SQLite, Durable
+  Streams, and OpenTelemetry modules, and align nested-module and example
+  dependency pins with it.
 - `TruncateBefore` is unchanged and records no trim boundary; readers behind a
   truncation keep their previous behavior. The SQLite retention boundary lives
   in a table created by the first `Trim`, so stores that never trim keep schema
@@ -1010,7 +1013,7 @@ Initial release of ebu (Event BUs) - a lightweight, type-safe event bus for Go.
 - `ClearAll`: Remove all handlers
 - `WaitAsync`: Wait for async handlers to complete
 
-[Unreleased]: https://github.com/jilio/ebu/compare/v0.20.1...HEAD
+[0.20.2]: https://github.com/jilio/ebu/compare/v0.20.1...v0.20.2
 [0.20.1]: https://github.com/jilio/ebu/compare/v0.20.0...v0.20.1
 [0.20.0]: https://github.com/jilio/ebu/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/jilio/ebu/compare/v0.18.1...v0.19.0
