@@ -281,7 +281,19 @@ func (p *Projection) CatchUp(ctx context.Context) (eventbus.Offset, error) {
 		}
 		events, next, err := p.cfg.Source.Read(ctx, from, p.cfg.BatchSize)
 		if err != nil {
-			return from, fmt.Errorf("sqlite: projection %q: read after %q: %w", p.cfg.Name, from, err)
+			readErr := fmt.Errorf("sqlite: projection %q: read after %q: %w", p.cfg.Name, from, err)
+			// Another instance may have applied past this offset, and the
+			// source may since have been trimmed through its checkpoint
+			// (ErrOffsetTrimmed): the tables already hold those events.
+			stored, cerr := p.Committed(ctx)
+			switch {
+			case errors.Is(cerr, ErrProjectionVersionChanged):
+				return from, cerr
+			case cerr != nil || stored == from:
+				return from, readErr
+			}
+			p.setCheckpoint(stored)
+			continue
 		}
 		// Sources return a nextOffset that never moves backwards (the
 		// EventStore contract), so an empty read either ends the loop or

@@ -765,6 +765,63 @@ func TestProjectionAdoptsACheckpointAdvancedElsewhere(t *testing.T) {
 	}
 }
 
+// Codex review (second round): an instance lagging behind another must not
+// be stranded when the source was trimmed through the other's committed
+// checkpoint; the tables already hold those events.
+func TestProjectionLaggingInstanceSurvivesSafeRetention(t *testing.T) {
+	ctx := t.Context()
+	source := eventbus.NewMemoryStore()
+	db := newTrimStore(t)
+	appendGroups(t, source, 2)
+	lagging := &counterProjection{}
+	a, err := db.OpenProjection(ctx, lagging.config("groups", source, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	early, err := a.CatchUp(ctx) // a concrete checkpoint, not OffsetOldest
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := db.OpenProjection(ctx, (&counterProjection{}).config("groups", source, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendGroups(t, source, 3)
+	if _, err := b.CatchUp(ctx); err != nil {
+		t.Fatal(err)
+	}
+	committed, err := b.Committed(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.Trim(ctx, eventbus.RetentionPolicy{Through: committed}); err != nil {
+		t.Fatal(err)
+	}
+	if a.Checkpoint() != early {
+		t.Fatalf("A moved unexpectedly to %q", a.Checkpoint())
+	}
+	if checkpoint, err := a.CatchUp(ctx); err != nil || checkpoint != committed {
+		t.Fatalf("lagging CatchUp = %q, %v; want the adopted %q", checkpoint, err, committed)
+	}
+	if lagging.applied.Load() != 2 {
+		t.Fatalf("A applied %d events; B's events must not be applied again", lagging.applied.Load())
+	}
+	// A source error with an unchanged stored checkpoint is still reported,
+	// and a rebuild by another instance still stops a stale one.
+	broken := (&counterProjection{}).config("broken", failingReadSource{source}, 0)
+	stale, err := db.OpenProjection(ctx, broken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	broken.Version = 2
+	if _, err := db.OpenProjection(ctx, broken); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stale.CatchUp(ctx); !errors.Is(err, ErrProjectionVersionChanged) {
+		t.Fatalf("stale CatchUp over a failing source = %v", err)
+	}
+}
+
 func TestProjectionCommittedLoadFailure(t *testing.T) {
 	store := newTrimStore(t)
 	p, err := store.OpenProjection(t.Context(), (&counterProjection{}).config("groups", store, 0))
