@@ -386,10 +386,12 @@ func marshalMetadata(md map[string]string) (any, error) {
 func scanEvent(rows rowScanner) (*eventbus.StoredEvent, int64, error) {
 	var position int64
 	var eventID, origin, metadata sql.NullString
+	var timestamp storedTime
 	event := &eventbus.StoredEvent{}
-	if err := rows.Scan(&position, &event.Type, &event.Data, &event.Timestamp, &eventID, &origin, &metadata); err != nil {
+	if err := rows.Scan(&position, &event.Type, &event.Data, &timestamp, &eventID, &origin, &metadata); err != nil {
 		return nil, 0, fmt.Errorf("sqlite: scan event: %w", err)
 	}
+	event.Timestamp = timestamp.Time
 	event.Offset = formatOffset(position)
 	event.ID = eventID.String
 	event.Origin = origin.String
