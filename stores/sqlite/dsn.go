@@ -42,6 +42,7 @@ func buildDSN(cfg *config) (string, error) {
 		query.Set("mode", "ro")
 		query.Add("_pragma", "query_only(1)")
 	} else {
+		// Validated above, so String yields only NORMAL or FULL here.
 		query.Add("_pragma", "synchronous("+cfg.synchronous.String()+")")
 		// Immediate transactions take the write lock at BEGIN (honoring
 		// busy_timeout) instead of upgrading mid-transaction, which can

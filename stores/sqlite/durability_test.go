@@ -43,6 +43,8 @@ func TestWithSynchronousAppliesToEveryPooledConnection(t *testing.T) {
 			if _, err := store.Append(t.Context(), &eventbus.Event{Type: "t", Data: json.RawMessage(`{}`), Timestamp: time.Now()}); err != nil {
 				t.Fatal(err)
 			}
+			// The writer pool is unbounded by default, so holding three
+			// connections at once forces three distinct SQLite connections.
 			store.db.SetMaxIdleConns(0)
 			store.db.SetMaxIdleConns(2)
 			store.db.SetMaxOpenConns(3)
@@ -106,7 +108,7 @@ func TestSynchronousString(t *testing.T) {
 }
 
 // durabilityChildEnv carries the database path to the child process that
-// TestFullSynchronousAcknowledgedAppendsSurviveProcessKill kills mid-write.
+// TestAcknowledgedAppendsSurviveProcessKill kills mid-write.
 const durabilityChildEnv = "EBU_SQLITE_DURABILITY_CHILD_DB"
 
 // TestDurabilityChildAppendsUntilKilled is the child half of the process-kill
