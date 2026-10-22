@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"strconv"
-	"sync"
 	"sync/atomic"
 
 	durablestreams "github.com/durable-streams/durable-streams/packages/client-go"
@@ -90,7 +89,11 @@ func (e *ProducerFencedError) Unwrap() error { return ErrProducerFenced }
 // ErrProducerConflict instead of being silently discarded as a duplicate.
 //
 // Appends of a producer Store are serialized: concurrent Append calls wait for
-// one another, because the sequence numbers must reach the server in order.
+// one another (honoring their contexts), because the sequence numbers must
+// reach the server in order. When a retry is deduplicated the server reports
+// no offset and Append looks up the stream tail; if that lookup fails, Append
+// returns an error although the event is stored — like any indeterminate
+// Append error, consumers still deduplicate on Event.ID.
 // Read, Tail and snapshots are unaffected; snapshots on the companion stream
 // are not fenced. Without this option Append keeps its at-least-once behavior.
 func WithProducer(id string, epoch int64) Option {
@@ -141,13 +144,14 @@ func validateProducer(cfg *config) error {
 	return nil
 }
 
-// producerState is the live sequence state of a producer Store. mu is held
-// for an entire Append, including retries and backoff, so sequence numbers
-// reach the server in order.
+// producerState is the live sequence state of a producer Store. The turn
+// token is held for an entire Append, including retries and backoff, so
+// sequence numbers reach the server in order; it guards nextSeq, owned and
+// fenced. Waiting for it honors the caller's context.
 type producerState struct {
-	mu sync.Mutex
-	id string
-	// epoch is written only under mu but read lock-free by ProducerEpoch, so
+	turn chan struct{}
+	id   string
+	// epoch is written only under turn but read lock-free by ProducerEpoch, so
 	// a status query never waits for an Append's retries.
 	epoch     atomic.Int64
 	nextSeq   int64
@@ -163,7 +167,7 @@ func newProducerState(cfg *config) *producerState {
 	if cfg.producer == nil {
 		return nil
 	}
-	p := &producerState{id: cfg.producer.id, autoClaim: cfg.producerAutoClaim}
+	p := &producerState{turn: make(chan struct{}, 1), id: cfg.producer.id, autoClaim: cfg.producerAutoClaim}
 	p.epoch.Store(cfg.producer.epoch)
 	return p
 }
@@ -198,8 +202,12 @@ type producerResponse struct {
 // event down to the expected number cannot duplicate or lose anything.
 func (s *Store) appendAsProducer(ctx context.Context, data []byte) (eventbus.Offset, error) {
 	p := s.producer
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	select {
+	case p.turn <- struct{}{}:
+	case <-ctx.Done():
+		return "", fmt.Errorf("durablestream: append: waiting for the producer: %w", ctx.Err())
+	}
+	defer func() { <-p.turn }()
 	if p.fenced != nil {
 		return "", p.fenced
 	}
@@ -269,7 +277,10 @@ func (s *Store) appendAsProducer(ctx context.Context, data []byte) (eventbus.Off
 		case http.StatusForbidden:
 			current, parseErr := strconv.ParseInt(resp.epoch, 10, 64)
 			if parseErr != nil || current < epoch {
-				return "", fmt.Errorf("durablestream: append: stale-epoch response carries invalid %s %q", headerProducerEpoch, resp.epoch)
+				// Not a fencing answer (for example a 403 from an
+				// authorizing proxy): report it without fencing the store.
+				return "", &durablestreams.StreamError{Op: "append", URL: s.streamURL, StatusCode: http.StatusForbidden,
+					Err: fmt.Errorf("403 without a newer %s (got %q): not a producer fencing response", headerProducerEpoch, resp.epoch)}
 			}
 			// Claim only while no attempt of this event can have landed:
 			// re-sending it under a new epoch could otherwise write it twice.
