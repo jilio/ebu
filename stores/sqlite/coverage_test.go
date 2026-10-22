@@ -12,6 +12,8 @@ import (
 // Tests for error paths that the rest of the suite does not reach, so every
 // statement of the module is exercised.
 
+// It replaces a package variable, so it must not run in parallel with other
+// tests of this package (none call t.Parallel).
 func TestNewReportsAnUnresolvablePath(t *testing.T) {
 	absPath = func(string) (string, error) { return "", errors.New("getwd: no such file or directory") }
 	t.Cleanup(func() { absPath = filepath.Abs })
