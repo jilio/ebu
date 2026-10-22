@@ -29,9 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transaction that advances the projection's checkpoint (exactly once across
   crashes, so counters are safe); the tables are the snapshot, so restarts
   apply only the tail and compaction is `Trim(Through: checkpoint)`. Several
-  instances may share a projection; a `Version` change rebuilds through
-  `Reset`, and stale instances stop with `ErrProjectionVersionChanged`. Design
-  and follow-ups: `docs/PROJECTIONS.md`.
+  instances may share a projection; raising `Version` rebuilds through
+  `Reset`, and stale instances stop with `ErrProjectionVersionChanged`. A
+  lower `Version`, or a rebuild over a source that reports a trimmed prefix,
+  is refused with `ErrProjectionRebuild`. Design and follow-ups:
+  `docs/PROJECTIONS.md`.
 - Durable Streams reads and tails that the server answers with 410 Gone from a
   concrete offset (server-side retention) now also match `ErrOffsetTrimmed`,
   with `ResumeFrom` = `OffsetOldest`; `errors.Is(err,

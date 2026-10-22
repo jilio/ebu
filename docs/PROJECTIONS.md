@@ -25,7 +25,7 @@ A projection is a set of **caller-owned SQL tables** plus **one checkpoint
 row**, both in the same SQLite database:
 
 ```
-events (the log, optional)   projections (name, version, checkpoint)   your tables + indexes
+events (the log, optional)   ebu_projections (name, version, checkpoint)   your tables + indexes
 ```
 
 - **Apply in the checkpoint's transaction.** `CatchUp` reads a batch from the
@@ -55,7 +55,7 @@ example.
 ```go
 p, err := store.OpenProjection(ctx, sqlite.ProjectionConfig{
     Name:    "jobs",       // checkpoint identity in this database
-    Version: 1,            // bump to rebuild (Reset + replay from OffsetOldest)
+    Version: 1,            // raise to rebuild (Reset + replay from OffsetOldest)
     Source:  store,        // any eventbus.EventStore
     Setup: func(ctx context.Context, tx *sql.Tx) error { // idempotent DDL
         _, err := tx.ExecContext(ctx, `
@@ -83,7 +83,7 @@ rows, err := p.DB().QueryContext(ctx,
 
 | Call | Contract |
 |------|----------|
-| `OpenProjection` | Creates the checkpoint table on first use, registers or resumes `Name`, runs `Reset` when `Version` changed, then `Setup` — one transaction. Read-only stores return `ErrReadOnly`. |
+| `OpenProjection` | Creates the checkpoint table on first use, registers or resumes `Name`, runs `Reset` when `Version` increased, then `Setup` — one transaction. A lower `Version`, or a rebuild over a source that reports a trimmed prefix, is refused with `ErrProjectionRebuild` and changes nothing. Read-only stores return `ErrReadOnly`. |
 | `CatchUp` | Applies batches until a read returns no events; returns the committed checkpoint. A source error (including `ErrOffsetTrimmed`) or an `Apply` error stops at the last committed batch; the failed batch is rolled back and retried by the next call. |
 | `Checkpoint` | The committed source offset this instance last observed. |
 | `DB` | The database holding the tables, for queries. |
@@ -161,10 +161,21 @@ for `(msg.Type, msg.Key)`, mapping the fields you query into indexed columns.
   rolled back with a failed batch.
 - **Durability** follows the database's `WithSynchronous` mode; use
   `SynchronousFull` when an applied batch must survive power loss.
-- **Rebuilds need the whole log.** A `Version` bump replays from
-  `OffsetOldest`. After the source was trimmed, migrate the tables in `Setup`
-  and keep the version instead; a rebuild over a trimmed source would silently
-  start from the retained suffix (see follow-ups).
+- **Rebuilds need the whole log.** Raising `Version` replays from
+  `OffsetOldest`. When the source reports a trimmed prefix (SQLite and
+  MemoryStore `Trim`), the rebuild is refused with `ErrProjectionRebuild`
+  before `Reset` runs; migrate the tables in `Setup` and keep the version
+  instead. A prefix removed with the legacy `TruncateBefore` cannot be
+  detected, so do not raise `Version` over a log compacted that way.
+- **No downgrades.** A `Version` lower than the stored one is refused, so
+  rolling back to an older binary never discards a newer projection; roll the
+  projection forward, or reset it deliberately.
+- **Batches hold the write lock.** A batch runs inside one write transaction,
+  so a slow `Apply` or a large `BatchSize` delays appends to the same file.
+  Keep `Apply` free of external I/O.
+- **Name your tables freely, except `events`, `subscription_positions`,
+  `snapshots`, `schema_version` and the `ebu_` prefix**, which belong to the
+  store.
 - **Gaps are reported.** If the source is trimmed past the checkpoint, `CatchUp`
   returns `ErrOffsetTrimmed` and does not move.
 
@@ -179,10 +190,10 @@ for `(msg.Type, msg.Key)`, mapping the fields you query into indexed columns.
 2. **Background runner.** A `Run(ctx)` that tails sources implementing
    `EventStoreTailer` and wakes on local appends, instead of caller-driven
    `CatchUp`.
-3. **Rebuild guard.** Refuse a `Version` rebuild when the source reports a
-   trimmed prefix. This needs a read-only way to ask a store for its trim
-   boundary (today `Trim` with a zero policy reports it, but it is a write
-   operation).
+3. **Read-only trim boundary.** The rebuild guard asks non-SQLite sources
+   through `Trim` with a zero policy, which by contract removes nothing but is
+   formally a write. A read-only accessor on `EventStoreTrimmer` stores would
+   make that cleaner.
 4. **Idempotent mode** for sources whose `nextOffset` can redeliver: record
    applied event IDs in the batch transaction.
 5. **Read-only query access.** Processes that open the database with

@@ -341,6 +341,10 @@ func TestProjectionRebuildsOnVersionChange(t *testing.T) {
 	if err != nil || p2.Checkpoint() != eventbus.OffsetOldest || len(groupCounts(t, store.db)) != 0 {
 		t.Fatalf("rebuild open = %q, %v, %v", p2.Checkpoint(), err, groupCounts(t, store.db))
 	}
+	// An older binary must not discard the newer projection.
+	if _, err := store.OpenProjection(t.Context(), counter.config("groups", store, 0)); !errors.Is(err, ErrProjectionRebuild) || !strings.Contains(err.Error(), "newer than 1") {
+		t.Fatalf("downgrade = %v", err)
+	}
 	// The old instance notices instead of applying stale logic.
 	appendGroups(t, store, 1)
 	if _, err := p.CatchUp(t.Context()); !errors.Is(err, ErrProjectionVersionChanged) {
@@ -405,7 +409,7 @@ func TestProjectionPersistsAnAdvancedEmptyRead(t *testing.T) {
 		t.Fatalf("CatchUp = %q, %v", checkpoint, err)
 	}
 	var stored string
-	if err := store.db.QueryRow(`SELECT checkpoint FROM projections WHERE name = 'groups'`).Scan(&stored); err != nil || stored != "token-1" {
+	if err := store.db.QueryRow(`SELECT checkpoint FROM ebu_projections WHERE name = 'groups'`).Scan(&stored); err != nil || stored != "token-1" {
 		t.Fatalf("stored checkpoint = %q, %v", stored, err)
 	}
 }
@@ -456,26 +460,26 @@ func TestProjectionStorageErrors(t *testing.T) {
 	if _, err := store.OpenProjection(cancelled, cfg); err == nil || !strings.Contains(err.Error(), "begin") {
 		t.Fatalf("cancelled OpenProjection = %v", err)
 	}
-	if _, err := store.db.Exec(`CREATE INDEX projections ON events(type)`); err != nil {
+	if _, err := store.db.Exec(`CREATE INDEX ebu_projections ON events(type)`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.OpenProjection(ctx, cfg); err == nil || !strings.Contains(err.Error(), "create checkpoint table") {
 		t.Fatalf("OpenProjection = %v", err)
 	}
-	if _, err := store.db.Exec(`DROP INDEX projections; ` + createProjectionsTable + `;
-		CREATE TRIGGER no_register BEFORE INSERT ON projections BEGIN SELECT RAISE(ABORT, 'no'); END`); err != nil {
+	if _, err := store.db.Exec(`DROP INDEX ebu_projections; ` + createProjectionsTable + `;
+		CREATE TRIGGER no_register BEFORE INSERT ON ebu_projections BEGIN SELECT RAISE(ABORT, 'no'); END`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.OpenProjection(ctx, cfg); err == nil || !strings.Contains(err.Error(), "register") {
 		t.Fatalf("OpenProjection = %v", err)
 	}
-	if _, err := store.db.Exec(`DROP TRIGGER no_register; INSERT INTO projections (name, version, checkpoint) VALUES ('groups', 'one', '')`); err != nil {
+	if _, err := store.db.Exec(`DROP TRIGGER no_register; INSERT INTO ebu_projections (name, version, checkpoint) VALUES ('groups', 'one', '')`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.OpenProjection(ctx, cfg); err == nil || !strings.Contains(err.Error(), "load checkpoint") {
 		t.Fatalf("OpenProjection = %v", err)
 	}
-	if _, err := store.db.Exec(`UPDATE projections SET version = 9`); err != nil {
+	if _, err := store.db.Exec(`UPDATE ebu_projections SET version = 0`); err != nil {
 		t.Fatal(err)
 	}
 	failingReset := cfg
@@ -483,13 +487,13 @@ func TestProjectionStorageErrors(t *testing.T) {
 	if _, err := store.OpenProjection(ctx, failingReset); err == nil || !strings.Contains(err.Error(), "reset: cannot reset") {
 		t.Fatalf("OpenProjection = %v", err)
 	}
-	if _, err := store.db.Exec(`CREATE TRIGGER no_reset BEFORE UPDATE ON projections BEGIN SELECT RAISE(ABORT, 'no'); END`); err != nil {
+	if _, err := store.db.Exec(`CREATE TRIGGER no_reset BEFORE UPDATE ON ebu_projections BEGIN SELECT RAISE(ABORT, 'no'); END`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.OpenProjection(ctx, cfg); err == nil || !strings.Contains(err.Error(), "reset checkpoint") {
 		t.Fatalf("OpenProjection = %v", err)
 	}
-	if _, err := store.db.Exec(`DROP TRIGGER no_reset; UPDATE projections SET version = 1`); err != nil {
+	if _, err := store.db.Exec(`DROP TRIGGER no_reset; UPDATE ebu_projections SET version = 1`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -501,7 +505,7 @@ func TestProjectionStorageErrors(t *testing.T) {
 	if _, err := p.CatchUp(cancelled); err == nil {
 		t.Fatal("CatchUp with a cancelled context succeeded")
 	}
-	if _, err := store.db.Exec(`CREATE TRIGGER no_save BEFORE UPDATE ON projections BEGIN SELECT RAISE(ABORT, 'no'); END`); err != nil {
+	if _, err := store.db.Exec(`CREATE TRIGGER no_save BEFORE UPDATE ON ebu_projections BEGIN SELECT RAISE(ABORT, 'no'); END`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := p.CatchUp(ctx); err == nil || !strings.Contains(err.Error(), "save checkpoint") {
@@ -510,7 +514,7 @@ func TestProjectionStorageErrors(t *testing.T) {
 	if counts := groupCounts(t, store.db); len(counts) != 0 {
 		t.Fatalf("a failed checkpoint save leaked applied rows: %v", counts)
 	}
-	if _, err := store.db.Exec(`DROP TRIGGER no_save; DELETE FROM projections`); err != nil {
+	if _, err := store.db.Exec(`DROP TRIGGER no_save; DELETE FROM ebu_projections`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := p.CatchUp(ctx); err == nil || !strings.Contains(err.Error(), "load checkpoint") {
@@ -533,4 +537,82 @@ type failingReadSource struct{ eventbus.EventStore }
 
 func (failingReadSource) Read(context.Context, eventbus.Offset, int) ([]*eventbus.StoredEvent, eventbus.Offset, error) {
 	return nil, "", errors.New("source unavailable")
+}
+
+// trimmerSource reports a trim boundary (or fails) through Trim.
+type trimmerSource struct {
+	eventbus.EventStore
+	boundary eventbus.Offset
+	err      error
+}
+
+func (s trimmerSource) Trim(context.Context, eventbus.RetentionPolicy) (eventbus.TrimResult, error) {
+	return eventbus.TrimResult{TrimmedThrough: s.boundary}, s.err
+}
+
+func TestProjectionRefusesRebuildOverATrimmedSource(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		source func(t *testing.T, store *SQLiteStore) eventbus.EventStore
+		want   string
+	}{
+		{"same sqlite store", func(t *testing.T, store *SQLiteStore) eventbus.EventStore {
+			offsets := appendGroups(t, store, 3)
+			if _, err := store.Trim(t.Context(), eventbus.RetentionPolicy{Through: offsets[0]}); err != nil {
+				t.Fatal(err)
+			}
+			return store
+		}, "trimmed through"},
+		{"memory store", func(t *testing.T, _ *SQLiteStore) eventbus.EventStore {
+			source := eventbus.NewMemoryStore()
+			offsets := appendGroups(t, source, 3)
+			if _, err := source.Trim(t.Context(), eventbus.RetentionPolicy{Through: offsets[0]}); err != nil {
+				t.Fatal(err)
+			}
+			return source
+		}, "trimmed through"},
+		{"failing boundary lookup", func(t *testing.T, store *SQLiteStore) eventbus.EventStore {
+			return trimmerSource{EventStore: store, err: errors.New("boundary unavailable")}
+		}, "check source before rebuild: boundary unavailable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newTrimStore(t)
+			source := tc.source(t, store)
+			cfg := (&counterProjection{}).config("groups", source, 0)
+			if _, err := store.OpenProjection(t.Context(), cfg); err != nil {
+				t.Fatal(err)
+			}
+			cfg.Version = 2
+			_, err := store.OpenProjection(t.Context(), cfg)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("rebuild = %v, want %q", err, tc.want)
+			}
+			if tc.want == "trimmed through" && !errors.Is(err, ErrProjectionRebuild) {
+				t.Fatalf("rebuild = %v, want ErrProjectionRebuild", err)
+			}
+			var version int
+			if err := store.db.QueryRow(`SELECT version FROM ebu_projections WHERE name = 'groups'`).Scan(&version); err != nil || version != 1 {
+				t.Fatalf("a refused rebuild changed the stored version to %d (%v)", version, err)
+			}
+		})
+	}
+	// A source that cannot report trimming does not block a rebuild, and an
+	// untrimmed trimmer allows it.
+	for _, source := range []eventbus.EventStore{struct{ eventbus.EventStore }{eventbus.NewMemoryStore()}, eventbus.NewMemoryStore()} {
+		store := newTrimStore(t)
+		cfg := (&counterProjection{}).config("groups", source, 0)
+		if _, err := store.OpenProjection(t.Context(), cfg); err != nil {
+			t.Fatal(err)
+		}
+		cfg.Version = 2
+		if _, err := store.OpenProjection(t.Context(), cfg); err != nil {
+			t.Fatalf("rebuild over %T = %v", source, err)
+		}
+	}
+}
+
+func TestZeroProjectionCheckpoint(t *testing.T) {
+	if got := (&Projection{}).Checkpoint(); got != eventbus.OffsetOldest {
+		t.Fatalf("zero Projection checkpoint = %q", got)
+	}
 }
