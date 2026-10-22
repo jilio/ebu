@@ -253,8 +253,9 @@ func fromWireOffset(o durablestreams.Offset) eventbus.Offset {
 // With WithProducer, appends use the protocol's idempotent producer instead:
 // the server deduplicates retries and fences writers with an older epoch
 // (ErrProducerFenced), and concurrent Append calls are serialized. When a
-// retry is deduplicated the server reports no offset; Append then returns the
-// stream's current tail, which covers the event.
+// retry is deduplicated the server reports no offset; Append then recovers
+// the exact offset after the event, or returns ErrProducerIndeterminate when
+// none exists (see WithProducer).
 func (s *Store) Append(ctx context.Context, event *eventbus.Event) (eventbus.Offset, error) {
 	writeEvent := storedEventForWrite{
 		ID:       event.ID,
@@ -272,7 +273,7 @@ func (s *Store) Append(ctx context.Context, event *eventbus.Event) (eventbus.Off
 		return "", fmt.Errorf("durablestream: marshal event: %w", err)
 	}
 	if s.producer != nil {
-		return s.appendAsProducer(ctx, data)
+		return s.appendAsProducer(ctx, event.ID, data)
 	}
 
 	var lastErr error

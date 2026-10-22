@@ -183,7 +183,7 @@ func TestProducer_DuplicateTailLookupFailureIsReported(t *testing.T) {
 	}
 	inner := ps.Config.Handler
 	ps.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodHead {
+		if r.Method == http.MethodGet {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
@@ -1082,5 +1082,169 @@ func TestProducer_LargeResponseBodiesAreNotReadInFull(t *testing.T) {
 	store := newProducerStore(t, ps, "events", ds.WithProducer("w", 0))
 	if offset, err := store.Append(t.Context(), producerEvent(0)); err != nil || offset != eventbus.Offset(padOffset(1)) {
 		t.Fatalf("Append = %q, %v", offset, err)
+	}
+}
+
+// Codex review (second round): Append must return the exact offset after a
+// deduplicated event. When another writer's event follows it in the same
+// read chunk no such offset exists, and the stream tail would skip that
+// later event for a resuming reader: the outcome is indeterminate instead.
+func TestProducer_DeduplicatedAppendReturnsTheExactOffset(t *testing.T) {
+	interleave := func(ps *protoServer) func(*http.Request) bool {
+		var lost atomic.Bool
+		return func(*http.Request) bool {
+			if !lost.CompareAndSwap(false, true) {
+				return false
+			}
+			// Another writer appends before the retry.
+			ps.mu.Lock()
+			st := ps.streams["events"]
+			st.messages = append(st.messages, []byte(`{"id":"other","type":"other","data":1}`))
+			ps.mu.Unlock()
+			return true
+		}
+	}
+	t.Run("another writer's event follows in the chunk", func(t *testing.T) {
+		ps := newProtoServer()
+		defer ps.Close()
+		store := newProducerStore(t, ps, "events", ds.WithProducer("w", 0))
+		if _, err := store.Append(t.Context(), producerEvent(0)); err != nil {
+			t.Fatal(err)
+		}
+		ps.loseAck = interleave(ps)
+		if _, err := store.Append(t.Context(), producerEvent(1)); !errors.Is(err, ds.ErrProducerIndeterminate) || !strings.Contains(err.Error(), "the event is stored") {
+			t.Fatalf("Append = %v, want ErrProducerIndeterminate (the tail would skip the other event)", err)
+		}
+		if got := ps.storedMessages("events"); len(got) != 3 {
+			t.Fatalf("messages = %v", got)
+		}
+		// The store keeps working, with exact offsets.
+		ps.loseAck = nil
+		if offset, err := store.Append(t.Context(), producerEvent(2)); err != nil || offset != eventbus.Offset(padOffset(4)) {
+			t.Fatalf("next Append = %q, %v", offset, err)
+		}
+	})
+	t.Run("the event ends its chunk", func(t *testing.T) {
+		ps := newProtoServer()
+		defer ps.Close()
+		ps.chunkLimit = 1 // every record is its own chunk
+		store := newProducerStore(t, ps, "events", ds.WithProducer("w", 0))
+		if _, err := store.Append(t.Context(), producerEvent(0)); err != nil {
+			t.Fatal(err)
+		}
+		ps.loseAck = interleave(ps)
+		offset, err := store.Append(t.Context(), producerEvent(1))
+		if err != nil || offset != eventbus.Offset(padOffset(2)) {
+			t.Fatalf("Append = %q, %v; want the exact %q before the other writer's event", offset, err, padOffset(2))
+		}
+	})
+	t.Run("the event cannot be found", func(t *testing.T) {
+		ps := newProtoServer()
+		defer ps.Close()
+		ps.omitProducerOffset = true
+		store := newProducerStore(t, ps, "events", ds.WithProducer("w", 0))
+		event := producerEvent(0)
+		event.ID = "" // nothing to look for
+		if _, err := store.Append(t.Context(), event); !errors.Is(err, ds.ErrProducerIndeterminate) {
+			t.Fatalf("Append = %v", err)
+		}
+	})
+}
+
+// Codex review (second round): only an acknowledged sequence 0 makes an
+// epoch the store's. A store whose first acknowledged number is later cannot
+// tell whether the epoch's earlier numbers were its own.
+func TestProducer_OwnershipComesOnlyFromSequenceZero(t *testing.T) {
+	t.Run("without auto-claim the store stops after the ambiguous append", func(t *testing.T) {
+		ps := newProtoServer()
+		defer ps.Close()
+		writeAsPredecessor(t, ps, 0, 1) // a live writer holds epoch 0 with sequence 0
+		failFirstPosts(ps, 1, http.StatusServiceUnavailable)
+		reused := newProducerStore(t, ps, "events", ds.WithProducer("w", 0))
+		if _, err := reused.Append(t.Context(), producerEvent(10)); !errors.Is(err, ds.ErrProducerIndeterminate) {
+			t.Fatalf("first Append = %v", err)
+		}
+		// Sequence 1 is accepted, but the epoch is not provably this store's.
+		if _, err := reused.Append(t.Context(), producerEvent(11)); err != nil {
+			t.Fatalf("second Append = %v (its event is written)", err)
+		}
+		log := ps.recordPosts()
+		if _, err := reused.Append(t.Context(), producerEvent(12)); !errors.Is(err, ds.ErrProducerIndeterminate) || !strings.Contains(err.Error(), "cannot establish ownership") {
+			t.Fatalf("third Append = %v, want the sticky ownership error", err)
+		}
+		if got := log.snapshot(); len(got) != 0 {
+			t.Fatalf("a store without ownership contacted the server: %v", got)
+		}
+	})
+	t.Run("with auto-claim the next append claims a fresh epoch", func(t *testing.T) {
+		ps := newProtoServer()
+		defer ps.Close()
+		var lost atomic.Bool
+		ps.loseAck = func(*http.Request) bool { return lost.CompareAndSwap(false, true) }
+		store := newProducerStore(t, ps, "events", ds.WithProducer("w", 0), ds.WithProducerAutoClaim(), ds.WithRetry(1, time.Millisecond))
+		if _, err := store.Append(t.Context(), producerEvent(0)); err == nil {
+			t.Fatal("expected the lost acknowledgement to fail the single attempt")
+		}
+		if _, err := store.Append(t.Context(), producerEvent(1)); err != nil {
+			t.Fatal(err) // sequence 1 of epoch 0: written, ownership ambiguous
+		}
+		if _, err := store.Append(t.Context(), producerEvent(2)); err != nil {
+			t.Fatal(err)
+		}
+		if epoch, _ := store.ProducerEpoch(); epoch != 1 {
+			t.Fatalf("epoch = %d, want a fresh claim", epoch)
+		}
+	})
+}
+
+// locate's defensive paths: an undecodable chunk, and a server whose chunk
+// does not advance the offset.
+func TestProducer_LocateDefensivePaths(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		read func(w http.ResponseWriter, r *http.Request)
+		want string
+	}{
+		{"undecodable chunk", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Stream-Next-Offset", padOffset(5))
+			_, _ = w.Write([]byte("not json"))
+		}, "append committed, but its offset is unknown"},
+		{"chunk that does not advance", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Stream-Next-Offset", r.URL.Query().Get("offset"))
+			_, _ = w.Write([]byte(`[{"id":"event-1","type":"produced","data":1},{"id":"x","type":"t","data":1}]`))
+		}, "no exact offset follows it"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var posts atomic.Int32
+			ps := scriptedServer(t, func(w http.ResponseWriter, r *http.Request) bool {
+				switch posts.Add(1) {
+				case 1:
+					return false // accepted: the store owns its epoch
+				case 2:
+					w.WriteHeader(http.StatusServiceUnavailable) // may have landed
+				default:
+					w.Header().Set("Producer-Seq", "1")
+					w.WriteHeader(http.StatusNoContent)
+				}
+				return true
+			})
+			store := newProducerStore(t, ps, "events", ds.WithProducer("w", 0))
+			if _, err := store.Append(t.Context(), producerEvent(0)); err != nil {
+				t.Fatal(err)
+			}
+			inner := ps.Config.Handler
+			ps.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet {
+					tc.read(w, r)
+					return
+				}
+				inner.ServeHTTP(w, r)
+			})
+			if _, err := store.Append(t.Context(), producerEvent(1)); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Append = %v, want %q", err, tc.want)
+			}
+		})
 	}
 }

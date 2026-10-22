@@ -288,13 +288,21 @@ store, err := durablestream.New(baseURL, "orders",
 
 - **Retries are written once.** Retries reuse the append's sequence number, so
   the server recognizes a retry of a committed attempt and does not write it
-  again. Such a deduplicated append reports no offset; `Append` returns the
-  stream's current tail, which covers the event but may also cover later
-  events of other writers, so it is a barrier, not an exact per-event offset. If that tail lookup fails,
-  `Append` returns an error although the event is stored; as with any
-  indeterminate `Append` error, consumers still deduplicate on `Event.ID`.
+  again. Such a deduplicated append reports no offset; `Append` recovers the
+  exact offset after the event by reading from the store's previous
+  acknowledged offset and finding the event by its ID. If another writer's
+  events follow it in the same read chunk, no offset both covers the event and
+  skips nothing later, so `Append` returns `ErrProducerIndeterminate` although
+  the event is stored (as it does if that read fails); consumers still
+  deduplicate on `Event.ID`.
+- **Ownership comes only from an acknowledged sequence 0.** A store whose
+  first acknowledged append in its epoch is a later number (because an
+  earlier append's outcome was lost) cannot tell whether the epoch's first
+  numbers were its own. That append succeeds, but afterwards the store stops
+  with a sticky `ErrProducerIndeterminate` (open a new `Store` with a newer
+  epoch) or, with auto-claim, claims a fresh epoch.
 - **A duplicate is success only when it is provably this event's.** That
-  requires the store to own its epoch (its first append was accepted) and the
+  requires the store to own its epoch and the
   sequence number to be one no earlier request of the store carried. Otherwise
   the server's `Producer-Seq` (its highest accepted number) identifies another
   writer's event (`ErrProducerConflict`, or a claim with auto-claim), and when

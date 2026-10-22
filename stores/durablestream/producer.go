@@ -114,9 +114,14 @@ func (e *ProducerFencedError) Unwrap() error { return ErrProducerFenced }
 // Appends of a producer Store are serialized: concurrent Append calls wait for
 // one another (honoring their contexts), because the sequence numbers must
 // reach the server in order. When a retry is deduplicated the server reports
-// no offset and Append looks up the stream tail; if that lookup fails, Append
-// returns an error although the event is stored — like any indeterminate
-// Append error, consumers still deduplicate on Event.ID.
+// no offset: Append reads from its previous acknowledged offset to recover
+// the exact offset after the event. If that read fails, or another writer's
+// events follow the event in the same read chunk (no offset then covers the
+// event without skipping later ones), Append returns an error although the
+// event is stored — like any indeterminate Append error, consumers still
+// deduplicate on Event.ID. Ownership of the epoch comes only from an
+// acknowledged sequence 0; a store whose first acknowledged number is later
+// stops after that append (or, with auto-claim, claims a fresh epoch).
 // Read, Tail and snapshots are unaffected; snapshots on the companion stream
 // are not fenced. Without this option Append keeps its at-least-once behavior.
 func WithProducer(id string, epoch int64) Option {
@@ -189,10 +194,15 @@ type producerState struct {
 	sentThrough int64
 	// fenced is the sticky ErrProducerFenced once a newer epoch was seen.
 	fenced error
-	// conflict is the sticky ErrProducerConflict of a store that found its
-	// epoch in use by another writer before owning it (without auto-claim):
-	// it must never later take over that epoch.
+	// conflict is the sticky error of a store that must never take over its
+	// epoch (without auto-claim): it found another writer's event under it
+	// before owning it, or could not establish that the epoch's first
+	// numbers were its own.
 	conflict error
+	// lastAck is the exact offset after this store's latest acknowledged
+	// append (OffsetOldest before the first): a lower bound for any later
+	// event of the store, from which its exact offset can be recovered.
+	lastAck eventbus.Offset
 	// claimNext makes the next Append claim a fresh epoch first: an
 	// auto-claim store found its epoch in use but could not claim at once.
 	claimNext bool
@@ -242,7 +252,7 @@ type producerResponse struct {
 // that might still arrive. Otherwise the server's Producer-Seq (the highest
 // accepted number) tells another writer's duplicate apart; when it cannot,
 // the outcome is reported as ErrProducerIndeterminate, never as success.
-func (s *Store) appendAsProducer(ctx context.Context, data []byte) (eventbus.Offset, error) {
+func (s *Store) appendAsProducer(ctx context.Context, eventID string, data []byte) (eventbus.Offset, error) {
 	p := s.producer
 	if err := ctx.Err(); err != nil {
 		return "", fmt.Errorf("durablestream: append: %w", err)
@@ -354,11 +364,28 @@ func (s *Store) appendAsProducer(ctx context.Context, data []byte) (eventbus.Off
 
 		switch resp.status {
 		case http.StatusOK:
-			p.owned = true
-			if resp.nextOffset != "" {
-				return eventbus.Offset(resp.nextOffset), nil
+			if !p.owned {
+				if seq == 0 {
+					// Only an acknowledged sequence 0 makes the epoch this
+					// store's: nobody else wrote in it before.
+					p.owned = true
+				} else {
+					// The epoch already held numbers this store never had
+					// acknowledged (an earlier append's outcome was lost):
+					// they may be another writer's. This event is written,
+					// but the store must not keep writing in this epoch.
+					p.conflict = fmt.Errorf("durablestream: append: producer %q cannot establish ownership of epoch %d (its first sequence numbers may be another writer's); open a new Store with a newer epoch: %w",
+						p.id, epoch, ErrProducerIndeterminate)
+					if p.autoClaim {
+						p.conflict, p.claimNext = nil, true
+					}
+				}
 			}
-			return s.producerAckOffset(ctx)
+			if resp.nextOffset != "" {
+				p.lastAck = eventbus.Offset(resp.nextOffset)
+				return p.lastAck, nil
+			}
+			return s.producerAckOffset(ctx, p, eventID, epoch, seq)
 
 		case http.StatusNoContent:
 			highest, parseErr := strconv.ParseInt(resp.seq, 10, 64)
@@ -368,7 +395,7 @@ func (s *Store) appendAsProducer(ctx context.Context, data []byte) (eventbus.Off
 				// Only this store writes its epoch and nothing else ever
 				// carried this number: an earlier attempt landed and only its
 				// acknowledgement was lost. Written once.
-				return s.producerAckOffset(ctx)
+				return s.producerAckOffset(ctx, p, eventID, epoch, seq)
 			case mayHaveLanded && (p.owned || !known || highest == seq):
 				if !p.owned && p.autoClaim {
 					// The epoch may be another writer's: take a fresh one
@@ -446,16 +473,61 @@ func producerCorrectionsError(p *producerState) error {
 	return fmt.Errorf("durablestream: append: producer %q gave up after %d epoch or sequence corrections", p.id, maxProducerCorrections)
 }
 
-// producerAckOffset returns the offset for an append the server acknowledged
-// without a resume offset (a deduplicated retry). The stream tail covers the
-// committed event, so it is a valid replication barrier; it may also cover
-// events other writers appended since.
-func (s *Store) producerAckOffset(ctx context.Context) (eventbus.Offset, error) {
-	tail, err := s.resolveTail(ctx)
-	if err != nil {
+// producerAckOffset returns the exact offset after an event the server
+// acknowledged without one (a deduplicated retry, or a server that omitted
+// Stream-Next-Offset). It reads from the store's previous acknowledged offset
+// and finds the event by its ID. The offset after the event is exact only
+// when the event ends a read chunk; when another writer's events follow it in
+// the same chunk, no offset satisfies the Append contract (it must cover the
+// event and skip nothing later), so the outcome is reported as
+// ErrProducerIndeterminate although the event is stored.
+func (s *Store) producerAckOffset(ctx context.Context, p *producerState, eventID string, epoch, seq int64) (eventbus.Offset, error) {
+	offset, exact, err := s.locate(ctx, p.lastAck, eventID)
+	switch {
+	case err != nil:
 		return "", fmt.Errorf("durablestream: append committed, but its offset is unknown: %w", err)
+	case !exact:
+		return "", fmt.Errorf("durablestream: append: producer %q epoch %d sequence %d: the event is stored, but no exact offset follows it: %w",
+			p.id, epoch, seq, ErrProducerIndeterminate)
 	}
-	return tail, nil
+	p.lastAck = offset
+	return offset, nil
+}
+
+// locate scans the stream from from, which must not lie after the event, for
+// the last record carrying eventID. It returns the offset after that record
+// and whether that offset is exact (the record ended its chunk).
+func (s *Store) locate(ctx context.Context, from eventbus.Offset, eventID string) (offset eventbus.Offset, exact bool, err error) {
+	if eventID == "" {
+		return "", false, nil
+	}
+	found := false
+	for at := from; ; {
+		chunk, _, err := s.readChunk(ctx, at)
+		if err != nil {
+			return "", false, err
+		}
+		if chunk == nil {
+			return offset, found && exact, nil
+		}
+		next := eventbus.Offset(chunk.NextOffset)
+		events, _, err := s.decodeChunk(chunk.Data, next, at)
+		if err != nil {
+			return "", false, err
+		}
+		for _, event := range events {
+			if event.ID == eventID {
+				// The record that ends a chunk carries the chunk's next
+				// offset; any other carries the chunk start (the same value
+				// when a chunk fails to advance, so that is never exact).
+				found, offset, exact = true, next, event.Offset == next && next != at
+			}
+		}
+		if next == at {
+			return offset, found && exact, nil
+		}
+		at = next
+	}
 }
 
 // postAsProducer sends one append attempt with producer headers. Transport
