@@ -50,16 +50,21 @@ var (
 	// this event: another writer is using the same producer ID and epoch (for
 	// example a restarted instance that reused its predecessor's epoch), or
 	// an abandoned request of this store arrived late. This event was not
-	// appended. Give every live writer its own epoch.
+	// appended. Give every live writer its own epoch. A store that meets the
+	// conflict before it owns its epoch never takes that epoch over: without
+	// auto-claim every later Append fails with the same error, with auto-claim
+	// the next Append claims a fresh epoch.
 	ErrProducerConflict = errors.New("durablestream: producer sequence already used by another writer")
 
-	// ErrProducerIndeterminate reports that the server answered a retry with
-	// a duplicate that cannot be attributed: an earlier attempt of this
-	// Append may have landed, but the same sequence number may also have been
-	// used by another writer (before this store owns its epoch) or by an
-	// earlier, abandoned request of this store. The event may or may not be
-	// stored; like any indeterminate Append error, retrying may store it
-	// twice, so consumers deduplicate on Event.ID.
+	// ErrProducerIndeterminate reports an Append whose outcome cannot be
+	// established: the server answered a retry with a duplicate that cannot
+	// be attributed (the same sequence number may also have been used by
+	// another writer, before this store owns its epoch, or by an earlier,
+	// abandoned request of this store), or it asked for a different sequence
+	// number while an earlier attempt of this event may still arrive (re-sending
+	// the event under the new number could store it twice). The event may or
+	// may not be stored; like any indeterminate Append error, retrying may
+	// store it twice, so consumers deduplicate on Event.ID.
 	ErrProducerIndeterminate = errors.New("durablestream: producer append outcome is indeterminate")
 )
 
@@ -180,6 +185,13 @@ type producerState struct {
 	sentThrough int64
 	// fenced is the sticky ErrProducerFenced once a newer epoch was seen.
 	fenced error
+	// conflict is the sticky ErrProducerConflict of a store that found its
+	// epoch in use by another writer before owning it (without auto-claim):
+	// it must never later take over that epoch.
+	conflict error
+	// claimNext makes the next Append claim a fresh epoch first: an
+	// auto-claim store found its epoch in use but could not claim at once.
+	claimNext bool
 }
 
 func newProducerState(cfg *config) *producerState {
@@ -240,6 +252,18 @@ func (s *Store) appendAsProducer(ctx context.Context, data []byte) (eventbus.Off
 	if p.fenced != nil {
 		return "", p.fenced
 	}
+	if p.conflict != nil {
+		return "", p.conflict
+	}
+	if p.claimNext {
+		epoch := p.epoch.Load()
+		if epoch >= maxProducerEpochOrSeq {
+			return "", fmt.Errorf("durablestream: append: producer %q cannot claim an epoch beyond %d", p.id, epoch)
+		}
+		p.claimNext = false
+		p.epoch.Store(epoch + 1)
+		p.nextSeq, p.sentThrough = 0, -1
+	}
 
 	seq := p.nextSeq
 	p.nextSeq++
@@ -248,14 +272,33 @@ func (s *Store) appendAsProducer(ctx context.Context, data []byte) (eventbus.Off
 	sentBefore := p.sentThrough
 	// mayHaveLanded records that an earlier attempt of this exact
 	// (epoch, seq, body) may have been committed although no acknowledgement
-	// arrived.
-	mayHaveLanded := false
+	// arrived. anyMayLand records the same for any number or epoch this event
+	// was sent under: such a request can still arrive later, so the event is
+	// never re-sent under another number or epoch (it would be stored twice).
+	mayHaveLanded, anyMayLand := false, false
 	corrections := 0
 	correct := func() error {
 		if corrections++; corrections > maxProducerCorrections {
 			return producerCorrectionsError(p)
 		}
 		return nil
+	}
+	// conflicted reports another writer's event under this store's epoch.
+	// Before the store owns its epoch that epoch is someone else's: without
+	// auto-claim the store stops for good; with it, the next Append claims a
+	// fresh epoch.
+	conflicted := func(err error) error {
+		if !p.owned {
+			if p.autoClaim {
+				p.claimNext = true
+			} else {
+				p.conflict = err
+			}
+		}
+		return err
+	}
+	indeterminate := func(epoch int64, why string) error {
+		return fmt.Errorf("durablestream: append: producer %q epoch %d sequence %d: %s: %w", p.id, epoch, seq, why, ErrProducerIndeterminate)
 	}
 	// claim moves to a new epoch whose sequence starts at 0.
 	claim := func(epoch int64) {
@@ -279,7 +322,12 @@ func (s *Store) appendAsProducer(ctx context.Context, data []byte) (eventbus.Off
 		if err == nil && resp.status == http.StatusBadRequest && !p.owned && seq > 0 {
 			// A new epoch must start at sequence 0 (protocol section 5.2.1):
 			// an earlier call that gave up never established it. Nothing was
-			// appended; start the epoch with this event.
+			// appended; start the epoch with this event — unless an earlier
+			// attempt of it may still arrive, which would then be accepted
+			// as sequence 1 and store the event twice.
+			if anyMayLand {
+				return "", indeterminate(epoch, "the epoch is not established, and an earlier attempt may still arrive")
+			}
 			if err := correct(); err != nil {
 				return "", err
 			}
@@ -295,7 +343,7 @@ func (s *Store) appendAsProducer(ctx context.Context, data []byte) (eventbus.Off
 			if ctx.Err() != nil || !isRetryable(err) {
 				return "", lastErr
 			}
-			mayHaveLanded = true
+			mayHaveLanded, anyMayLand = true, true
 			attempt++
 			continue
 		}
@@ -318,9 +366,13 @@ func (s *Store) appendAsProducer(ctx context.Context, data []byte) (eventbus.Off
 				// acknowledgement was lost. Written once.
 				return s.producerAckOffset(ctx)
 			case mayHaveLanded && (p.owned || !known || highest == seq):
-				return "", fmt.Errorf("durablestream: append: producer %q epoch %d sequence %d: duplicate after a lost acknowledgement: %w",
-					p.id, epoch, seq, ErrProducerIndeterminate)
-			case p.autoClaim && !p.owned && !mayHaveLanded:
+				if !p.owned && p.autoClaim {
+					// The epoch may be another writer's: take a fresh one
+					// for the next event rather than ever owning this one.
+					p.claimNext = true
+				}
+				return "", indeterminate(epoch, "duplicate after a lost acknowledgement")
+			case p.autoClaim && !p.owned && !anyMayLand:
 				// The configured epoch is already in use: claim the next.
 				if err := correct(); err != nil {
 					return "", err
@@ -334,8 +386,8 @@ func (s *Store) appendAsProducer(ctx context.Context, data []byte) (eventbus.Off
 				// The server holds another writer's event under this
 				// number (its highest accepted number differs, or no attempt
 				// of this event can have landed).
-				return "", fmt.Errorf("durablestream: append: producer %q epoch %d sequence %d (server holds through %q): %w",
-					p.id, epoch, seq, resp.seq, ErrProducerConflict)
+				return "", conflicted(fmt.Errorf("durablestream: append: producer %q epoch %d sequence %d (server holds through %q): %w",
+					p.id, epoch, seq, resp.seq, ErrProducerConflict))
 			}
 
 		case http.StatusForbidden:
@@ -348,7 +400,7 @@ func (s *Store) appendAsProducer(ctx context.Context, data []byte) (eventbus.Off
 			}
 			// Claim only while no attempt of this event can have landed:
 			// re-sending it under a new epoch could otherwise write it twice.
-			if p.autoClaim && !p.owned && !mayHaveLanded && current < maxProducerEpochOrSeq {
+			if p.autoClaim && !p.owned && !anyMayLand && current < maxProducerEpochOrSeq {
 				if err := correct(); err != nil {
 					return "", err
 				}
@@ -363,6 +415,11 @@ func (s *Store) appendAsProducer(ctx context.Context, data []byte) (eventbus.Off
 			if parseErr != nil || expected < 0 || expected >= seq {
 				return "", fmt.Errorf("durablestream: append: producer %q epoch %d sequence %d: server expects sequence %q: %w",
 					p.id, epoch, seq, resp.expectedSeq, durablestreams.ErrSeqConflict)
+			}
+			if anyMayLand {
+				// Renumbering would let a delayed earlier attempt store the
+				// event a second time under its old number.
+				return "", indeterminate(epoch, fmt.Sprintf("the server expects sequence %d, and an earlier attempt may still arrive", expected))
 			}
 			if err := correct(); err != nil {
 				return "", err

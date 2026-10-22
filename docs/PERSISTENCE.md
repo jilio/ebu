@@ -318,14 +318,22 @@ store, err := durablestream.New(baseURL, "orders",
   the next append learns which from the server (a 409 naming the expected
   number, or a 400 while a new epoch is not yet established) and renumbers its
   event, so a failed first append never wedges the store.
-- **Abandoned requests are the limit of exactly-once.** A request that timed
-  out can still reach the server later. If it arrives after the next append
-  was renumbered onto its sequence number, the server keeps whichever arrived
-  first and drops the other as a duplicate (the renumbered append then fails
-  rather than reporting success). And because an `Append` error is
-  indeterminate, a caller that retries an event whose timed-out attempt did
-  land writes it twice. Exactly-once holds for acknowledged appends; consumers
-  still deduplicate on `Event.ID`.
+- **An event is never re-sent under another number or epoch while an earlier
+  attempt of it may still arrive.** A timed-out request can reach the server
+  later; had the event been renumbered meanwhile, the late request would store
+  it a second time. Such an `Append` returns `ErrProducerIndeterminate`
+  instead, and the next append renumbers normally.
+- **A conflict before ownership is permanent.** A store that finds its epoch in
+  use before its first accepted append never takes that epoch over: without
+  auto-claim every later `Append` returns the same `ErrProducerConflict`; with
+  auto-claim the next `Append` claims a fresh epoch.
+- **Abandoned requests are the limit of exactly-once.** A request abandoned by
+  an earlier `Append` can still arrive after the next append took its number;
+  the server then keeps whichever arrived first and drops the other as a
+  duplicate (the later append fails rather than reporting success). And
+  because an `Append` error is indeterminate, a caller that retries an event
+  whose timed-out attempt did land writes it twice. Exactly-once holds for
+  acknowledged appends; consumers still deduplicate on `Event.ID`.
 
 Exactly-once within an epoch depends on the server committing producer state
 atomically with the data (the protocol's atomicity requirement). Snapshots on

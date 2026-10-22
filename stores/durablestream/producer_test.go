@@ -1,10 +1,13 @@
 package durablestream_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"sync"
@@ -895,6 +898,167 @@ func TestProducer_RequestConstructionFailure(t *testing.T) {
 	_, err := store.Append(t.Context(), producerEvent(0))
 	var streamErr *durablestreams.StreamError
 	if !errors.As(err, &streamErr) || streamErr.StatusCode != 0 || !strings.Contains(err.Error(), "missing ']'") {
+		t.Fatalf("Append = %v", err)
+	}
+}
+
+// holdingServer delays chosen POSTs: their body is read at once, but the
+// request is only processed when released, after the client gave up on it —
+// a request that arrives late.
+type holdingServer struct {
+	*protoServer
+	hold        atomic.Bool   // hold the next POST
+	release     chan struct{} // closes to process the held POST
+	releaseOnce sync.Once
+	done        chan struct{} // closed once the held POST was processed
+}
+
+// releaseHeld processes the held POST and waits until it was handled.
+func (hs *holdingServer) releaseHeld() {
+	hs.releaseOnce.Do(func() { close(hs.release) })
+	<-hs.done
+}
+
+func newHoldingServer(t *testing.T) *holdingServer {
+	t.Helper()
+	hs := &holdingServer{protoServer: newProtoServer(), release: make(chan struct{}), done: make(chan struct{})}
+	t.Cleanup(hs.Close)
+	// Runs first (cleanups are LIFO): a failing test must not leave the held
+	// handler blocking the server's shutdown.
+	t.Cleanup(func() { hs.releaseOnce.Do(func() { close(hs.release) }) })
+	inner := hs.Config.Handler
+	hs.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && hs.hold.CompareAndSwap(true, false) {
+			body, _ := io.ReadAll(r.Body)
+			<-hs.release
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			inner.ServeHTTP(httptest.NewRecorder(), r) // the client is long gone
+			close(hs.done)
+			return
+		}
+		inner.ServeHTTP(w, r)
+	})
+	return hs
+}
+
+// Codex review finding: an event whose earlier attempt may still arrive must
+// not be re-sent under another number, or the late request stores it twice.
+func TestProducer_NeverResendsAnEventThatMayStillArrive(t *testing.T) {
+	opts := []ds.Option{ds.WithRetry(2, time.Millisecond), ds.WithTimeout(150 * time.Millisecond)}
+	t.Run("409 renumbering", func(t *testing.T) {
+		hs := newHoldingServer(t)
+		store := newProducerStore(t, hs.protoServer, "events", append(opts, ds.WithProducer("w", 0))...)
+		if _, err := store.Append(t.Context(), producerEvent(0)); err != nil {
+			t.Fatal(err)
+		}
+		failFirstPosts(hs.protoServer, 2, http.StatusServiceUnavailable) // sequence 1 is abandoned
+		if _, err := store.Append(t.Context(), producerEvent(1)); err == nil {
+			t.Fatal("expected the abandoned append to fail")
+		}
+		hs.hold.Store(true) // the first attempt of sequence 2 arrives late
+		if _, err := store.Append(t.Context(), producerEvent(2)); !errors.Is(err, ds.ErrProducerIndeterminate) {
+			t.Fatalf("Append = %v, want ErrProducerIndeterminate instead of renumbering", err)
+		}
+		hs.releaseHeld()
+		if got := hs.storedMessages("events"); len(got) != 1 {
+			t.Fatalf("stored %d messages: %v", len(got), got)
+		}
+		// The next event is renumbered normally and stored once.
+		if _, err := store.Append(t.Context(), producerEvent(3)); err != nil {
+			t.Fatal(err)
+		}
+		if got := hs.storedMessages("events"); len(got) != 2 || !strings.Contains(got[1], "event-3") {
+			t.Fatalf("messages = %v", got)
+		}
+	})
+	t.Run("400 epoch restart", func(t *testing.T) {
+		hs := newHoldingServer(t)
+		writeAsPredecessor(t, hs.protoServer, 0, 1)
+		store := newProducerStore(t, hs.protoServer, "events", append(opts, ds.WithProducer("w", 1))...)
+		failFirstPosts(hs.protoServer, 2, http.StatusServiceUnavailable) // sequence 0 never establishes epoch 1
+		if _, err := store.Append(t.Context(), producerEvent(1)); err == nil {
+			t.Fatal("expected the first append to give up")
+		}
+		hs.hold.Store(true) // the first attempt of sequence 1 arrives late
+		if _, err := store.Append(t.Context(), producerEvent(2)); !errors.Is(err, ds.ErrProducerIndeterminate) {
+			t.Fatalf("Append = %v, want ErrProducerIndeterminate instead of restarting the epoch", err)
+		}
+		hs.releaseHeld()
+		if got := hs.storedMessages("events"); len(got) != 1 {
+			t.Fatalf("stored %d messages: %v", len(got), got)
+		}
+		if _, err := store.Append(t.Context(), producerEvent(3)); err != nil {
+			t.Fatal(err)
+		}
+		if got := hs.storedMessages("events"); len(got) != 2 || !strings.Contains(got[1], "event-3") {
+			t.Fatalf("messages = %v", got)
+		}
+	})
+}
+
+// Codex review finding: a store that found its epoch in use before owning it
+// must never take that epoch over later (a later 200 would let it attribute
+// the other writer's duplicates to itself).
+func TestProducer_ConflictBeforeOwnershipIsSticky(t *testing.T) {
+	ps := newProtoServer()
+	defer ps.Close()
+	owner := newProducerStore(t, ps, "events", ds.WithProducer("w", 0))
+	if _, err := owner.Append(t.Context(), producerEvent(0)); err != nil {
+		t.Fatal(err)
+	}
+	reused := newProducerStore(t, ps, "events", ds.WithProducer("w", 0))
+	if _, err := reused.Append(t.Context(), producerEvent(10)); !errors.Is(err, ds.ErrProducerConflict) {
+		t.Fatalf("first Append = %v", err)
+	}
+	log := ps.recordPosts()
+	// Sequence 1 would be accepted in epoch 0; the store must not try.
+	if _, err := reused.Append(t.Context(), producerEvent(11)); !errors.Is(err, ds.ErrProducerConflict) {
+		t.Fatalf("second Append = %v, want the sticky conflict", err)
+	}
+	if got := log.snapshot(); len(got) != 0 {
+		t.Fatalf("a conflicted store contacted the server: %v", got)
+	}
+	ps.reject = nil
+	if _, err := owner.Append(t.Context(), producerEvent(1)); err != nil {
+		t.Fatalf("the owner must keep working: %v", err)
+	}
+	if got := ps.storedMessages("events"); len(got) != 2 {
+		t.Fatalf("messages = %v", got)
+	}
+}
+
+// With auto-claim, an unattributable duplicate before owning the epoch makes
+// the next append claim a fresh epoch instead of joining the old one.
+func TestProducer_AutoClaimAfterAnUnattributableDuplicate(t *testing.T) {
+	ps := newProtoServer()
+	defer ps.Close()
+	writeAsPredecessor(t, ps, 0, 1) // the predecessor holds only sequence 0
+	failFirstPosts(ps, 1, http.StatusServiceUnavailable)
+	store := newProducerStore(t, ps, "events", ds.WithProducer("w", 0), ds.WithProducerAutoClaim())
+	if _, err := store.Append(t.Context(), producerEvent(99)); !errors.Is(err, ds.ErrProducerIndeterminate) {
+		t.Fatalf("Append = %v", err)
+	}
+	if _, err := store.Append(t.Context(), producerEvent(100)); err != nil {
+		t.Fatal(err)
+	}
+	if epoch, _ := store.ProducerEpoch(); epoch != 1 {
+		t.Fatalf("epoch = %d, want a freshly claimed 1 (sequence 1 of epoch 0 would have been accepted)", epoch)
+	}
+	if e, lastSeq, _ := ps.producerOf("events", "w"); e != 1 || lastSeq != 0 {
+		t.Fatalf("server producer state epoch %d lastSeq %d", e, lastSeq)
+	}
+}
+
+func TestProducer_PendingClaimAtTheEpochCeiling(t *testing.T) {
+	ps := newProtoServer()
+	defer ps.Close()
+	writeAsPredecessor(t, ps, 1<<53-1, 1)
+	failFirstPosts(ps, 1, http.StatusServiceUnavailable)
+	store := newProducerStore(t, ps, "events", ds.WithProducer("w", 1<<53-1), ds.WithProducerAutoClaim())
+	if _, err := store.Append(t.Context(), producerEvent(1)); !errors.Is(err, ds.ErrProducerIndeterminate) {
+		t.Fatalf("Append = %v", err)
+	}
+	if _, err := store.Append(t.Context(), producerEvent(2)); err == nil || !strings.Contains(err.Error(), "cannot claim an epoch beyond") {
 		t.Fatalf("Append = %v", err)
 	}
 }

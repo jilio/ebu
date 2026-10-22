@@ -21,11 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when it is provably this event's (the store owns its epoch and no earlier
   request carried the number); otherwise the server's `Producer-Seq` decides
   between a conflict and a claim, or `Append` returns
-  `ErrProducerIndeterminate`. A first append that gives up before a new epoch
-  is established no longer wedges the store: the next append restarts the
-  epoch at sequence 0. Requests abandoned after a timeout can still arrive
-  late; exactly-once holds for acknowledged appends, and consumers still
-  deduplicate on `Event.ID`. `WithProducerAutoClaim()` claims the next
+  `ErrProducerIndeterminate`. An event is never re-sent under another number
+  or epoch while an earlier attempt of it may still arrive (that would store
+  it twice); such an append is reported as `ErrProducerIndeterminate`. A first
+  append that gives up before a new epoch is established does not wedge the
+  store: the next append restarts the epoch at sequence 0. A store that finds
+  its epoch in use before owning it never takes that epoch over (a sticky
+  `ErrProducerConflict`, or a fresh claim with auto-claim). Requests abandoned
+  after a timeout can still arrive late; exactly-once holds for acknowledged
+  appends, and consumers still deduplicate on `Event.ID`. `WithProducerAutoClaim()` claims the next
   free epoch at the first append (newest instance wins; an instance that owns
   its epoch never re-claims), and `ProducerEpoch` reports the epoch in use.
   Producer appends are serialized per store; a queued `Append` gives up when
