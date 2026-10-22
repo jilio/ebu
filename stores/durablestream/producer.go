@@ -101,7 +101,9 @@ func (e *ProducerFencedError) Unwrap() error { return ErrProducerFenced }
 //   - fences stale writers: once any append with a higher epoch for the same
 //     ID is accepted, appends with an older epoch fail with ErrProducerFenced.
 //
-// id must be non-empty and stable across restarts of the logical writer.
+// id must be non-empty and stable across restarts of the logical writer; it
+// is sent as an HTTP header, so it may contain neither control characters
+// nor leading or trailing spaces.
 // epoch must be within [0, 2^53-1]. Each Store instance needs its own epoch,
 // strictly greater than that of every earlier instance using the same ID — for
 // example a lease generation or a durable counter incremented at startup — or
@@ -172,6 +174,11 @@ func validateProducer(cfg *config) error {
 		// HTTP header values cannot carry control characters; fail at New
 		// rather than on every append.
 		return fmt.Errorf("durablestream: producer ID %q contains control characters", cfg.producer.id)
+	}
+	if strings.Trim(cfg.producer.id, " ") != cfg.producer.id {
+		// HTTP trims spaces around header values, so " w " would share
+		// producer state with "w" (and " " would arrive empty).
+		return fmt.Errorf("durablestream: producer ID %q must not start or end with spaces", cfg.producer.id)
 	}
 	if cfg.producer.epoch < 0 || cfg.producer.epoch > maxProducerEpochOrSeq {
 		return fmt.Errorf("durablestream: producer epoch %d is outside [0, 2^53-1]", cfg.producer.epoch)

@@ -398,6 +398,8 @@ func TestProducer_OptionValidation(t *testing.T) {
 		{"epoch too large", []ds.Option{ds.WithProducer("w", 1<<53)}, "outside [0, 2^53-1]"},
 		{"auto-claim alone", []ds.Option{ds.WithProducerAutoClaim()}, "requires WithProducer"},
 		{"control characters", []ds.Option{ds.WithProducer("w\r\nX-Injected: 1", 0)}, "contains control characters"},
+		{"padded", []ds.Option{ds.WithProducer(" writer ", 0)}, "must not start or end with spaces"},
+		{"all spaces", []ds.Option{ds.WithProducer("   ", 0)}, "must not start or end with spaces"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := ds.New(ps.URL+"/v1/stream", "events", tc.opts...); err == nil || !strings.Contains(err.Error(), tc.want) {
