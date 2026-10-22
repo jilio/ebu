@@ -4,5 +4,5 @@ go 1.25.1
 
 require (
 	github.com/durable-streams/durable-streams/packages/client-go v0.2.0
-	github.com/jilio/ebu v0.20.1
+	github.com/jilio/ebu v0.20.2-0.20261022004710-0f7403a4b188
 )
