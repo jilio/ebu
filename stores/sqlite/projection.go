@@ -44,7 +44,8 @@ type ProjectionConfig struct {
 	// Name identifies the projection's checkpoint in the database. Required.
 	Name string
 
-	// Version is the version of the projection's tables and Apply logic. When
+	// Version is the version of the projection's tables and Apply logic, any
+	// integer (versions compare numerically; 0 is valid). When
 	// it is greater than the version stored for Name, OpenProjection calls
 	// Reset and the projection is rebuilt from OffsetOldest. A rebuild needs
 	// the complete source log: it is refused (ErrProjectionRebuild) when the
@@ -284,6 +285,9 @@ func (p *Projection) CatchUp(ctx context.Context) (eventbus.Offset, error) {
 		if err := ctx.Err(); err != nil {
 			return from, fmt.Errorf("sqlite: projection %q: %w", p.cfg.Name, err)
 		}
+		// The read runs outside the batch transaction; if another instance
+		// commits meanwhile, applyBatch notices the moved checkpoint and adopts
+		// it (one wasted read).
 		events, next, err := p.cfg.Source.Read(ctx, from, p.cfg.BatchSize)
 		if err != nil {
 			readErr := fmt.Errorf("sqlite: projection %q: read after %q: %w", p.cfg.Name, from, err)
