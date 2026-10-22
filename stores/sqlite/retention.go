@@ -234,12 +234,16 @@ func (s *SQLiteStore) trimmedThrough(ctx context.Context) (int64, error) {
 // read snapshot: if a trim committed before that snapshot, the boundary read
 // here already includes it; if it committed later, the query saw every event.
 //
+// Only the symbolic OffsetOldest ("start of the retained log") is exempt; a
+// concrete zero checkpoint, saved before any event existed, is checked like
+// any other position.
+//
 // first is the position of the first event the query returned (0: none).
 // When it is position+1 the read cannot have crossed a prefix trim — that
 // would have removed position+1 — so the common tailing read skips the
 // boundary lookup.
 func (s *SQLiteStore) checkTrimmed(ctx context.Context, from eventbus.Offset, position, first int64) error {
-	if position <= 0 || first == position+1 {
+	if from == eventbus.OffsetOldest || first == position+1 {
 		return nil
 	}
 	watermark, err := s.trimmedThrough(ctx)

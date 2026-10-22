@@ -27,10 +27,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `OffsetOldest` is never an error. Per-partition caps follow key-based
   compaction semantics and are not reported. The SQLite store checks the
   boundary after its event query, and before each `ReadStream` batch's first
-  event, so a concurrent `Trim` cannot slip events past a reader.
+  event, so a concurrent `Trim` cannot slip events past a reader. Once `Trim`
+  has removed every event, `OffsetNewest` resolves to the trim boundary
+  rather than `OffsetOldest`, so a checkpoint taken then still detects later
+  gaps.
 - `state.Materializer.Compact` saves a snapshot and then trims the log prefix
   it covers, bounded by caller-supplied checkpoints of other readers. It uses
-  `Trim` when available and falls back to `TruncateBefore`.
+  `Trim` when available and falls back to `TruncateBefore`. `Compact`,
+  `SaveSnapshotTo` and `LoadSnapshotFrom` are serialized with one another, so
+  a restore cannot slip between a compaction's capture and its trim.
 - Durable Streams reads and tails that the server answers with 410 Gone from a
   concrete offset (server-side retention) now also match `ErrOffsetTrimmed`,
   with `ResumeFrom` = `OffsetOldest`; `errors.Is(err,

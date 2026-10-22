@@ -1481,7 +1481,9 @@ func (m *MemoryStore) searchAfter(from Offset) int {
 // when the store is empty. Caller must hold at least a read lock.
 func (m *MemoryStore) tailOffset() Offset {
 	if len(m.events) == 0 {
-		return OffsetOldest
+		// After Trim removed everything, the tail is the trim boundary:
+		// OffsetOldest would let a checkpoint taken now skip later gaps.
+		return m.trimmedThrough
 	}
 	return m.events[len(m.events)-1].Offset
 }

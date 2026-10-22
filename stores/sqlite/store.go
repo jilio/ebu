@@ -212,7 +212,14 @@ func (s *SQLiteStore) resolveNewest(ctx context.Context) (int64, error) {
 	if err := s.db.QueryRowContext(ctx, "SELECT MAX(position) FROM events").Scan(&position); err != nil {
 		return 0, fmt.Errorf("sqlite: resolve newest offset: %w", err)
 	}
-	return position.Int64, nil
+	if position.Valid {
+		return position.Int64, nil
+	}
+	// No events: if Trim removed them all, the tail is the trim boundary.
+	// Returning 0 would let a checkpoint taken now skip later gaps. Prefix
+	// rules always remove the newest events last, and partition caps never
+	// remove the newest event, so the boundary is the newest position issued.
+	return s.trimmedThrough(ctx)
 }
 
 // formatOffset converts an int64 position to an Offset.
@@ -634,13 +641,14 @@ func (s *SQLiteStore) ReadStream(ctx context.Context, from eventbus.Offset) iter
 			return
 		}
 
-		s.streamBatched(ctx, position, &eventCount, &iterErr, yield)
+		s.streamBatched(ctx, from, position, &eventCount, &iterErr, yield)
 	}
 }
 
 // streamBatched fetches events in batches using cursor-based pagination
 func (s *SQLiteStore) streamBatched(
 	ctx context.Context,
+	from eventbus.Offset,
 	fromPosition int64,
 	eventCount *int,
 	iterErr *error,
@@ -665,8 +673,12 @@ func (s *SQLiteStore) streamBatched(
 			return
 		}
 
+		batchFrom := formatOffset(currentPos)
+		if currentPos == fromPosition {
+			batchFrom = from
+		}
 		cursor := currentPos
-		checkTrimmed := func(first int64) error { return s.checkTrimmed(ctx, formatOffset(cursor), cursor, first) }
+		checkTrimmed := func(first int64) error { return s.checkTrimmed(ctx, batchFrom, cursor, first) }
 		batchCount, lastPos, cont := s.streamBatch(ctx, rows, checkTrimmed, eventCount, iterErr, yield)
 		if !cont {
 			return

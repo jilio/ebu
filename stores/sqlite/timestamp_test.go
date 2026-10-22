@@ -28,6 +28,8 @@ func TestTimestampsInAnyZoneReadBack(t *testing.T) {
 		time.Date(2026, 1, 2, 3, 4, 5, 6, time.Local),
 		time.Date(2026, 1, 2, 3, 4, 5, 0, time.FixedZone("UTC+5", 5*3600)),
 		time.Date(2026, 1, 2, 3, 4, 5, 0, time.FixedZone("", -7*3600)),
+		time.Date(2026, 1, 2, 3, 4, 5, 7, time.FixedZone("Custom Zone", 3600)), // a name with a space
+		time.Date(2026, 1, 2, 3, 4, 5, 0, time.FixedZone("x m=y", -1800)),      // a name that looks odd
 		parsedOffset,
 	}
 	for _, ts := range stamps {

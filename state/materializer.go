@@ -265,7 +265,8 @@ type Materializer struct {
 	// restore, which needs a consistent view across collections.
 	applyMu sync.Mutex
 
-	// snapshotMu serializes SaveSnapshotTo calls end to end, including the
+	// snapshotMu serializes SaveSnapshotTo, Compact and LoadSnapshotFrom end
+	// to end. For SaveSnapshotTo it covers the
 	// SaveSnapshot I/O that runs after applyMu is released: two racing
 	// savers could otherwise overwrite a newer snapshot with an older one,
 	// and a truncation based on the newer offset would then lose events.
@@ -732,6 +733,11 @@ func validateLegacySnapshotKeys(collections map[string]map[string]json.RawMessag
 // left empty with LastOffset reset to OffsetOldest, so a full replay from
 // OffsetOldest rebuilds the state.
 func (m *Materializer) LoadSnapshotFrom(ctx context.Context, s eventbus.EventStoreSnapshotter, snapshotID string) (eventbus.Offset, error) {
+	// Serialized with SaveSnapshotTo and Compact: restoring an older snapshot
+	// between Compact's capture and its trim would leave the materializer
+	// behind a log prefix that is then removed.
+	m.snapshotMu.Lock()
+	defer m.snapshotMu.Unlock()
 	m.applyMu.Lock()
 	defer m.applyMu.Unlock()
 

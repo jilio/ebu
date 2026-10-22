@@ -466,7 +466,8 @@ if errors.As(err, &trimmed) { // errors.Is(err, eventbus.ErrOffsetTrimmed)
 ```
 
 Reading from `OffsetOldest` is never an error; it starts at the oldest retained
-event. The condition is permanent for that offset, so consumers that retry
+event. Once `Trim` has removed every event, `OffsetNewest` resolves to the trim
+boundary, so a checkpoint saved then still detects later gaps. The condition is permanent for that offset, so consumers that retry
 reads (`Follow`, `Mirror`, resumable subscriptions) report it on every attempt
 until the checkpoint is moved. Retention never consults subscriptions or
 snapshots: bound `Through` by the checkpoints that must stay readable.

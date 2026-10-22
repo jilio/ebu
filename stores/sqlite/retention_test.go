@@ -618,3 +618,66 @@ func TestTrimBeginFailure(t *testing.T) {
 		t.Fatalf("Trim = %v, want a begin failure", err)
 	}
 }
+
+// Codex review finding: after Trim removed every event, OffsetNewest must
+// resolve to the trim boundary (not OffsetOldest or a concrete zero), and a
+// concrete zero checkpoint is checked like any other position.
+func TestTrimNewestAfterTrimmingEverything(t *testing.T) {
+	ctx := t.Context()
+	store := newTrimStore(t)
+	offsets := appendTrimEvents(t, store, 3, nil)
+	if _, err := store.Trim(ctx, eventbus.RetentionPolicy{Through: offsets[2]}); err != nil {
+		t.Fatal(err)
+	}
+	_, tail, err := store.Read(ctx, eventbus.OffsetNewest, 0)
+	if err != nil || tail != offsets[2] {
+		t.Fatalf("Read(OffsetNewest) = %q, %v; want the boundary %q", tail, err, offsets[2])
+	}
+	if err := store.SaveOffset(ctx, "reader", eventbus.OffsetNewest); err != nil {
+		t.Fatal(err)
+	}
+	if saved, _ := store.LoadOffset(ctx, "reader"); saved != offsets[2] {
+		t.Fatalf("SaveOffset(OffsetNewest) stored %q", saved)
+	}
+	more := appendTrimEvents(t, store, 3, nil)
+	if _, err := store.Trim(ctx, eventbus.RetentionPolicy{Through: more[1]}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.Read(ctx, tail, 0); !errors.Is(err, eventbus.ErrOffsetTrimmed) {
+		t.Fatalf("Read from the checkpoint = %v, want ErrOffsetTrimmed", err)
+	}
+	for _, err := range store.ReadStream(ctx, tail) {
+		if !errors.Is(err, eventbus.ErrOffsetTrimmed) {
+			t.Fatalf("ReadStream from the checkpoint = %v", err)
+		}
+	}
+}
+
+func TestTrimConcreteZeroCheckpointIsChecked(t *testing.T) {
+	ctx := t.Context()
+	store := newTrimStore(t)
+	// A checkpoint saved while the log was still empty.
+	if err := store.SaveOffset(ctx, "early", eventbus.OffsetNewest); err != nil {
+		t.Fatal(err)
+	}
+	zero, _ := store.LoadOffset(ctx, "early")
+	if zero != formatOffset(0) {
+		t.Fatalf("checkpoint = %q", zero)
+	}
+	offsets := appendTrimEvents(t, store, 4, nil)
+	if _, err := store.Trim(ctx, eventbus.RetentionPolicy{Through: offsets[1]}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.Read(ctx, zero, 0); !errors.Is(err, eventbus.ErrOffsetTrimmed) {
+		t.Fatalf("Read from a concrete zero checkpoint = %v, want ErrOffsetTrimmed", err)
+	}
+	for _, err := range store.ReadStream(ctx, zero) {
+		if !errors.Is(err, eventbus.ErrOffsetTrimmed) {
+			t.Fatalf("ReadStream from a concrete zero checkpoint = %v", err)
+		}
+	}
+	// The symbolic start of the log is never a gap.
+	if events, _, err := store.Read(ctx, eventbus.OffsetOldest, 0); err != nil || len(events) != 2 {
+		t.Fatalf("Read(OffsetOldest) = %d events, %v", len(events), err)
+	}
+}
