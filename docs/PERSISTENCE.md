@@ -291,6 +291,7 @@ Durable-streams features:
 - Configurable timeouts and HTTP client
 - Server-assigned opaque offsets
 - Projection snapshots (`EventStoreSnapshotter`) on a companion stream
+- Opt-in idempotent, fenced producer (`WithProducer`)
 
 Snapshots live on a reserved companion stream (`<stream>.snap` — the
 constructor rejects stream paths with that suffix): each `SaveSnapshot`
@@ -304,6 +305,89 @@ prefix; the companion stream must **not** be head-trimmed (no earliest-offset
 discovery in the protocol — `LoadSnapshot` fails loudly on a trimmed head),
 though expiring it whole is safe and reads as "no snapshot". See the package
 documentation for details.
+
+#### Idempotent, fenced producers
+
+By default every `Append` is an independent POST and a retry whose first
+attempt was committed (but whose response was lost) stores the event twice;
+consumers deduplicate on `Event.ID`. `WithProducer` switches the store to the
+protocol's idempotent producer (Producer-Id / Producer-Epoch / Producer-Seq):
+
+```go
+store, err := durablestream.New(baseURL, "orders",
+    durablestream.WithProducer("orders-writer", epoch),
+)
+```
+
+- **Retries are written once.** Retries reuse the append's sequence number, so
+  the server recognizes a retry of a committed attempt and does not write it
+  again. Such a deduplicated append reports no offset; `Append` recovers the
+  exact offset after the event by reading from the store's previous
+  acknowledged offset and finding the event by its ID. If another writer's
+  events follow it in the same read chunk, no offset both covers the event and
+  skips nothing later, so `Append` returns `ErrProducerIndeterminate` although
+  the event is stored (as it does if that read fails); consumers still
+  deduplicate on `Event.ID`.
+- **Ownership comes only from an acknowledged sequence 0.** A store whose
+  first acknowledged append in its epoch is a later number (because an
+  earlier append's outcome was lost) cannot tell whether the epoch's first
+  numbers were its own. That append succeeds, but afterwards the store stops
+  with a sticky `ErrProducerIndeterminate` (open a new `Store` with a newer
+  epoch) or, with auto-claim, claims a fresh epoch.
+- **A duplicate is success only when it is provably this event's.** That
+  requires an earlier attempt of the event that may have landed, a store that
+  owns its epoch, and a sequence number no earlier request of the store
+  carried. A duplicate with no possibly landed attempt is another writer's
+  event (`ErrProducerConflict`, or a claim with auto-claim); any other
+  duplicate is `ErrProducerIndeterminate`, never success. When the exact
+  offset is recovered by reading, an event ID that occurs more than once makes
+  the appended copy ambiguous (indeterminate), and the read stops at the tail
+  captured beforehand, so a busy stream cannot keep it running; a read that
+  ends before that tail proves nothing (indeterminate). The read is linear in
+  what was appended since the store's previous acknowledgement and runs while
+  the store's appends wait.
+- **Stale writers are fenced.** Once the server has accepted an append with a
+  higher epoch for the same producer ID, appends from an older epoch fail with
+  `durablestream.ErrProducerFenced` (`*ProducerFencedError` carries both
+  epochs) and nothing is written. Fencing is permanent for that `Store`.
+- **Every live instance needs its own, newer epoch.** Pass one that is strictly
+  greater than any earlier instance's (a lease generation, a durable counter),
+  or add `WithProducerAutoClaim()` to claim the next free epoch from the server
+  at the first append: the newest instance then wins. Claiming happens only
+  before the store's first accepted append, so two live instances cannot keep
+  taking the producer from each other. `ProducerEpoch` reports the epoch in use.
+  Reusing an old epoch is reported as `ErrProducerConflict` (or
+  `ErrProducerIndeterminate`) instead of the event being discarded as a
+  duplicate.
+- **Appends are serialized per store**, because sequence numbers must reach the
+  server in order: one append is in flight at a time, retries and backoff
+  included, which bounds a store's append rate by the server round trip. A
+  queued `Append` gives up when its context ends. When an
+  `Append` gives up, its sequence number may or may not have been committed;
+  the next append learns which from the server (a 409 naming the expected
+  number, or a 400 while a new epoch is not yet established) and renumbers its
+  event, so a failed first append never wedges the store.
+- **An event is never re-sent under another number or epoch while an earlier
+  attempt of it may still arrive.** A timed-out request can reach the server
+  later; had the event been renumbered meanwhile, the late request would store
+  it a second time. Such an `Append` returns `ErrProducerIndeterminate`
+  instead, and the next append renumbers normally.
+- **A conflict before ownership is permanent.** A store that finds its epoch in
+  use before its first accepted append never takes that epoch over: without
+  auto-claim every later `Append` returns the same `ErrProducerConflict`; with
+  auto-claim the next `Append` claims a fresh epoch.
+- **Abandoned requests are the limit of exactly-once.** A request abandoned by
+  an earlier `Append` can still arrive after the next append took its number;
+  the server then keeps whichever arrived first and drops the other as a
+  duplicate (the later append fails rather than reporting success). And
+  because an `Append` error is indeterminate, a caller that retries an event
+  whose timed-out attempt did land writes it twice. Exactly-once holds for
+  acknowledged appends; consumers still deduplicate on `Event.ID`.
+
+Exactly-once within an epoch depends on the server committing producer state
+atomically with the data (the protocol's atomicity requirement). Snapshots on
+the companion stream are not fenced. Plain stores send no producer headers and
+behave as before.
 
 ## Replay Patterns
 
